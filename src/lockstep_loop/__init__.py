@@ -42,4 +42,4 @@ __all__ = [
     "run_to_completion",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

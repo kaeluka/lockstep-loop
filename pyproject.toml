@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lockstep-loop"
-version = "0.1.0"
+version = "0.2.0"
 description = "Run one agent prompt across thousands of similar environments in lockstep, splitting conversations only where tool results diverge."
 readme = "README.md"
 requires-python = ">=3.10"

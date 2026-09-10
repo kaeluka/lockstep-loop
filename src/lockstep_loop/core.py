@@ -24,6 +24,9 @@ order they finish.  A slow provider (or tool) delays only its own branch.
 
 from __future__ import annotations
 
+import hashlib
+import json
+from collections import deque
 from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, TypeAlias
@@ -231,6 +234,59 @@ class BatchResult:
     """Final assistant message per environment (identical within a class)."""
 
 
+@dataclass
+class _Branch:
+    """Mutable internal state for one live conversation branch."""
+
+    branch_id: str
+    parent_id: str | None
+    group_key: str | None
+    """Edge label from the parent (None for the root)."""
+    env_ids: tuple[str, ...]
+    messages: list[Message]
+    split_depth: int
+    steps: int = 0
+    final_content: str | None = None
+    turn_calls: tuple[ToolCall, ...] = ()
+    turn_results: dict[str, dict[str, ToolResult]] = field(default_factory=dict)
+    """tool_call_id -> (env_id -> result) for the current assistant turn."""
+
+
+def _default_group_by(result: ToolResult) -> str:
+    if isinstance(result, str):
+        return result
+    return json.dumps(result, sort_keys=True, default=repr)
+
+
+def _render(result: ToolResult) -> str:
+    return result if isinstance(result, str) else json.dumps(result, sort_keys=True, default=repr)
+
+
+def _short_hash(key: tuple[str, ...]) -> str:
+    return hashlib.sha1(json.dumps(key).encode()).hexdigest()[:12]
+
+
+def _validate_tool_specs(
+    env_ids: tuple[str, ...], tools: Callable[[str], Sequence[Tool]]
+) -> tuple[ToolSpec, ...]:
+    """Extract tool specs; raise unless they are identical across environments."""
+    first: tuple[ToolSpec, ...] | None = None
+    for env in env_ids:
+        specs = tuple(
+            ToolSpec(name=t.name, description=t.description, parameters=dict(t.parameters))
+            for t in tools(env)
+        )
+        if first is None:
+            first = specs
+        elif specs != first:
+            raise ValueError(
+                f"tool specs of env {env!r} differ from env {env_ids[0]!r}; "
+                "tool specs must be identical across environments"
+            )
+    assert first is not None
+    return first
+
+
 def run_batch(
     *,
     prompt: str,
@@ -250,8 +306,8 @@ def run_batch(
         group_by: Canonicalizes a tool result into a group key.  Environments
             whose results share a key stay in one conversation; distinct keys
             split it.  ``None`` means "use the default canonicalizer":
-            volatile fields must be normalized away here, or near-identical
-            environments split on noise.
+            strings as-is, mappings as sorted JSON.  Normalize volatile
+            fields here, or near-identical environments split on noise.
         budget: Per-branch limits.
 
     Returns:
@@ -277,7 +333,209 @@ def run_batch(
           same equivalence class.
         * Classes only refine (split), never merge.
     """
-    raise NotImplementedError("run_batch is a skeleton; the loop is not implemented yet")
+    envs = tuple(env_ids)
+    if not envs:
+        raise ValueError("env_ids must be non-empty")
+    if len(set(envs)) != len(envs):
+        raise ValueError("env_ids must be unique")
+    specs = _validate_tool_specs(envs, tools)
+    return _loop(
+        prompt=prompt,
+        env_ids=envs,
+        specs=specs,
+        group_by=group_by if group_by is not None else _default_group_by,
+        budget=budget,
+    )
+
+
+def _loop(
+    *,
+    prompt: str,
+    env_ids: tuple[str, ...],
+    specs: tuple[ToolSpec, ...],
+    group_by: Callable[[ToolResult], str],
+    budget: Budget | None,
+) -> Generator[Request | None, Completion | None, BatchResult]:
+    seq = 0
+    branches: dict[str, _Branch] = {}
+    history: list[_Branch] = []  # every branch ever created, in creation order
+    finals: list[_Branch] = []
+    ready: deque[Request] = deque()
+    outstanding: dict[str, Request] = {}
+
+    root = _Branch(
+        branch_id="root",
+        parent_id=None,
+        group_key=None,
+        env_ids=env_ids,
+        messages=[Message(role="user", content=prompt)],
+        split_depth=0,
+    )
+    branches[root.branch_id] = root
+    history.append(root)
+
+    def stats_for(branch: _Branch) -> RequestStats:
+        nonlocal seq
+        seq += 1
+        return RequestStats(
+            depth=branch.steps,
+            split_depth=branch.split_depth,
+            env_count=len(branch.env_ids),
+            seq=seq,
+        )
+
+    def finish(branch: _Branch, content: str) -> None:
+        branch.final_content = content
+        del branches[branch.branch_id]
+        finals.append(branch)
+
+    def request_llm(branch: _Branch) -> None:
+        max_steps = budget.max_steps_per_branch if budget is not None else None
+        if max_steps is not None and branch.steps >= max_steps:
+            finish(branch, f"(budget exhausted after {branch.steps} steps)")
+            return
+        stats = stats_for(branch)
+        ready.append(
+            LlmRequest(
+                request_id=f"llm-{stats.seq}",
+                branch_id=branch.branch_id,
+                messages=tuple(branch.messages),
+                tools=specs,
+                stats=stats,
+            )
+        )
+
+    def request_tool(branch: _Branch, call: ToolCall) -> None:
+        stats = stats_for(branch)
+        ready.append(
+            ToolRequest(
+                request_id=f"tool-{stats.seq}",
+                branch_id=branch.branch_id,
+                tool_call=call,
+                env_ids=branch.env_ids,
+                stats=stats,
+            )
+        )
+
+    def handle_llm(request: LlmRequest, completion: LlmCompletion) -> None:
+        branch = branches[request.branch_id]
+        branch.steps += 1
+        branch.messages.append(
+            Message(
+                role="assistant", content=completion.content, tool_calls=completion.tool_calls
+            )
+        )
+        if not completion.tool_calls:
+            finish(branch, completion.content)
+            return
+        branch.turn_calls = completion.tool_calls
+        branch.turn_results = {}
+        for call in completion.tool_calls:
+            request_tool(branch, call)
+
+    def handle_tool(request: ToolRequest, completion: ToolCompletion) -> None:
+        branch = branches[request.branch_id]
+        returned = [env for env, _ in completion.results]
+        if set(returned) != set(request.env_ids) or len(returned) != len(request.env_ids):
+            raise ValueError(
+                f"ToolCompletion for {request.request_id} must return exactly one "
+                "result per env in the request"
+            )
+        branch.turn_results[request.tool_call.id] = dict(completion.results)
+        if len(branch.turn_results) < len(branch.turn_calls):
+            return  # other calls of this assistant turn are still in flight
+        advance_turn(branch)
+
+    def append_tool_messages(
+        messages: list[Message],
+        calls: tuple[ToolCall, ...],
+        results: dict[str, dict[str, ToolResult]],
+        representative_env: str,
+    ) -> None:
+        # Envs in one class share a canonicalized result per call.  Raw results
+        # may still differ under a lossy group_by; we take the representative's.
+        for call in calls:
+            result = results[call.id][representative_env]
+            messages.append(Message(role="tool", content=_render(result), tool_call_id=call.id))
+
+    def advance_turn(branch: _Branch) -> None:
+        # All calls of the turn have results on every env: refine the partition
+        # by the tuple of canonicalized results (one group key per call).
+        groups: dict[tuple[str, ...], list[str]] = {}
+        for env in branch.env_ids:
+            key = tuple(group_by(branch.turn_results[call.id][env]) for call in branch.turn_calls)
+            groups.setdefault(key, []).append(env)
+        if len(groups) == 1:
+            append_tool_messages(branch.messages, branch.turn_calls, branch.turn_results,
+                                 branch.env_ids[0])
+            branch.turn_calls = ()
+            branch.turn_results = {}
+            request_llm(branch)
+            return
+        for key, envs in groups.items():
+            child = _Branch(
+                branch_id=f"{branch.branch_id}/{_short_hash(key)}",
+                parent_id=branch.branch_id,
+                group_key=json.dumps(key),
+                env_ids=tuple(envs),
+                messages=list(branch.messages),
+                split_depth=branch.split_depth + 1,
+                steps=branch.steps,
+            )
+            append_tool_messages(child.messages, branch.turn_calls, branch.turn_results, envs[0])
+            branches[child.branch_id] = child
+            history.append(child)
+            request_llm(child)
+        del branches[branch.branch_id]
+
+    def finalize() -> BatchResult:
+        children_of: dict[str, dict[str, SplitNode]] = {}
+        root_node: SplitNode | None = None
+        for b in reversed(history):
+            node = SplitNode(env_ids=b.env_ids, children=children_of.get(b.branch_id, {}))
+            if b.parent_id is None:
+                root_node = node
+            else:
+                assert b.group_key is not None
+                children_of.setdefault(b.parent_id, {})[b.group_key] = node
+        assert root_node is not None
+        classes = tuple(EnvClass(id=b.branch_id, env_ids=b.env_ids) for b in finals)
+        results: dict[str, str] = {}
+        for b in finals:
+            assert b.final_content is not None
+            for env in b.env_ids:
+                results[env] = b.final_content
+        return BatchResult(tree=root_node, classes=classes, results=results)
+
+    request_llm(root)
+
+    incoming: Completion | None = None
+    while True:
+        if incoming is not None:
+            request = outstanding.pop(incoming.request_id, None)
+            if request is None:
+                raise ValueError(f"no outstanding request with id {incoming.request_id!r}")
+            if isinstance(request, LlmRequest):
+                if not isinstance(incoming, LlmCompletion):
+                    raise TypeError(
+                        f"LlmRequest {request.request_id} must be answered with LlmCompletion"
+                    )
+                handle_llm(request, incoming)
+            else:
+                if not isinstance(incoming, ToolCompletion):
+                    raise TypeError(
+                        f"ToolRequest {request.request_id} must be answered with ToolCompletion"
+                    )
+                handle_tool(request, incoming)
+            incoming = None
+        if ready:
+            next_request = ready.popleft()
+            outstanding[next_request.request_id] = next_request
+            incoming = yield next_request
+        elif outstanding:
+            incoming = yield None
+        else:
+            return finalize()
 
 
 def run_to_completion(
@@ -297,4 +555,38 @@ def run_to_completion(
     ``tools`` factory.  For parallel serving (the whole point of the
     protocol), pump ``run_batch`` yourself instead.
     """
-    raise NotImplementedError("run_to_completion is a skeleton; the loop is not implemented yet")
+    if complete_tool is None:
+        complete_tool = _local_tool_executor(tools)
+    gen = run_batch(
+        prompt=prompt, env_ids=env_ids, tools=tools, group_by=group_by, budget=budget
+    )
+    try:
+        request = next(gen)
+        while True:
+            while request is None:
+                request = gen.send(None)
+            completion: Completion
+            if isinstance(request, LlmRequest):
+                completion = complete_llm(request)
+            else:
+                completion = complete_tool(request)
+            request = gen.send(completion)
+    except StopIteration as stop:
+        result: BatchResult = stop.value
+        return result
+
+
+def _local_tool_executor(
+    tools: Callable[[str], Sequence[Tool]],
+) -> Callable[[ToolRequest], ToolCompletion]:
+    def execute(request: ToolRequest) -> ToolCompletion:
+        results: list[tuple[str, ToolResult]] = []
+        for env in request.env_ids:
+            impls = {t.name: t for t in tools(env)}
+            impl = impls.get(request.tool_call.name)
+            if impl is None:
+                raise ValueError(f"env {env!r} has no tool named {request.tool_call.name!r}")
+            results.append((env, impl(request.tool_call.args)))
+        return ToolCompletion(request_id=request.request_id, results=tuple(results))
+
+    return execute
