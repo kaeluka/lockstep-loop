@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol, TypeAlias
+from typing import Any, Protocol, TypeAlias
 
 #: What a tool returns for a single environment.
 ToolResult: TypeAlias = str | Mapping[str, Any]
@@ -107,7 +107,6 @@ def run_batch(
     env_ids: Sequence[str],
     tools: Callable[[str], Sequence[Tool]],
     group_by: Callable[[ToolResult], str] | None = None,
-    scheduler: Literal["dfs"] = "dfs",
     budget: Budget | None = None,
 ) -> BatchResult:
     """Run one prompt across many environments in lockstep.
@@ -123,8 +122,6 @@ def run_batch(
             split it.  ``None`` means "use the default canonicalizer"
             (planned): volatile fields must be normalized away here, or
             near-identical environments split on noise.
-        scheduler: Branch visit order.  Only ``"dfs"`` is planned: depth-first
-            keeps parent prefixes warm in provider prompt caches.
         budget: Per-branch limits.
 
     Returns:

@@ -32,7 +32,6 @@ result = run_batch(
     env_ids=["fork-1", "fork-2", "fork-3"],
     tools=lambda env_id: make_tools(env_id),  # impls vary, specs must not
     group_by=None,        # default canonicalizer (planned)
-    scheduler="dfs",
 )
 # result.tree, result.classes, result.results (env_id -> final message)
 ```
