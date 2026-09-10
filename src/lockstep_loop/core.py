@@ -53,7 +53,7 @@ class Tool(Protocol):
     def __call__(self, args: Mapping[str, Any]) -> ToolResult: ...
 
 
-@dataclass
+@dataclass(frozen=True)
 class Budget:
     """Limits for the run.
 
@@ -65,39 +65,43 @@ class Budget:
     max_steps_per_branch: int | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class SplitNode:
-    """A node in the prefix-sharing trie.
+    """An immutable node in the prefix-sharing trie.
 
     Represents the set of environments whose conversations are identical so
     far.  Children are keyed by the canonicalized tool-result group key that
     caused the split.  Will grow to carry conversation state, pending tool
     calls, and content hashes for incremental re-runs.
+
+    Nodes are never mutated: a split builds new child nodes and copies the
+    path from the split point back to the root (structural sharing).  Treat
+    ``children`` as read-only.
     """
 
-    env_ids: list[str]
-    children: dict[str, SplitNode] = field(default_factory=dict)
+    env_ids: tuple[str, ...]
+    children: Mapping[str, SplitNode] = field(default_factory=dict)
 
 
-@dataclass
+@dataclass(frozen=True)
 class EnvClass:
     """A final equivalence class of environments."""
 
     id: str
-    env_ids: list[str]
+    env_ids: tuple[str, ...]
 
 
-@dataclass
+@dataclass(frozen=True)
 class BatchResult:
     """Output of a completed ``run_batch`` invocation."""
 
     tree: SplitNode
     """The split trie; the persisted form that makes re-runs cheap."""
 
-    classes: list[EnvClass]
+    classes: tuple[EnvClass, ...]
     """Final partition of environments by full tool-call trace."""
 
-    results: dict[str, str]
+    results: Mapping[str, str]
     """Final assistant message per environment (identical within a class)."""
 
 
