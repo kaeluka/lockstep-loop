@@ -32,7 +32,7 @@ import hashlib
 import threading
 from collections import deque
 from collections.abc import Callable, Generator, Hashable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Generic, Literal, Protocol, TypeAlias, TypeVar, cast, overload
 
 #: Conversation payload type: message content, tool results, final answers.
@@ -44,9 +44,6 @@ P_co = TypeVar("P_co", covariant=True)
 
 class Tool(Protocol[P_co]):
     """A single environment's implementation of one tool.
-
-    Only ``run_to_completion``'s default executor needs concrete tools;
-    ``BatchLoop`` itself only ever sees ``ToolSpec`` metadata.
 
     Invariants (the caller's responsibility):
 
@@ -196,6 +193,33 @@ Completion: TypeAlias = LlmCompletion[P] | ToolCompletion[P]
 
 
 @dataclass(frozen=True)
+class SubagentTool(Generic[P]):
+    """Reserved tool the core executes itself by spawning a nested ``BatchLoop``.
+
+    When the model calls this tool, the loop spawns a child ``BatchLoop``
+    over the calling branch's environments instead of emitting a
+    ``ToolRequest``.  When the child finishes, its per-env final answers
+    are folded in as the tool results, so environments with equal answers
+    stay grouped — the "homogenize a cheap investigation" pattern.
+
+    ``__call__`` is intentionally absent: the core routes calls to this
+    name into child spawning, so a SubagentTool must never reach a tool
+    executor.  Detection is by ``isinstance`` at construction; dispatch at
+    call time is by name.
+    """
+
+    name: str
+    description: str
+    parameters: Mapping[str, Any]
+    build_prompt: Callable[[Mapping[str, Any]], P]
+    """Build the child loop's root prompt from the tool-call arguments."""
+    sub_tool_specs: Callable[[str], Sequence[ToolSpec]]
+    """Spec provider for the child loop's tools (one env id -> all specs)."""
+    max_depth: int = 1
+    """How many levels below this loop sub-agents may still spawn (children get max_depth-1)."""
+
+
+@dataclass(frozen=True)
 class Budget:
     """Limits for the run.
 
@@ -268,6 +292,15 @@ def _short_hash(key: tuple[Hashable, ...]) -> str:
     return hashlib.sha1(repr(key).encode()).hexdigest()[:12]
 
 
+@dataclass
+class _ChildLink(Generic[P]):
+    """A parent branch suspended on a spawned child loop."""
+
+    child: BatchLoop[P]
+    branch_id: str
+    call: ToolCall
+
+
 class BatchLoop(Generic[P]):
     """Orchestrates one prompt across many environments in lockstep.
 
@@ -314,19 +347,27 @@ class BatchLoop(Generic[P]):
         prompt: P,
         env_ids: Sequence[str],
         tool_specs: Sequence[ToolSpec],
+        subagent: SubagentTool[P] | None = None,
         group_by: Callable[[P], Hashable] | None = None,
         budget: Budget | None = None,
+        _id_prefix: str = "",
     ) -> None:
         envs = tuple(env_ids)
         if not envs:
             raise ValueError("env_ids must be non-empty")
         if len(set(envs)) != len(envs):
             raise ValueError("env_ids must be unique")
+        if subagent is not None and subagent.max_depth < 1:
+            raise ValueError("subagent.max_depth must be >= 1")
         self._specs = tuple(tool_specs)
+        self._subagent = subagent
+        self._id_prefix = _id_prefix
         self._group_by: Callable[[P], Hashable] = (
             group_by if group_by is not None else lambda v: cast(Hashable, v)
         )
         self._budget = budget
+        self._children: dict[str, _ChildLink[P]] = {}
+        self._child_ids: dict[str, BatchLoop[P]] = {}
 
         self._lock = threading.Lock()
         self._seq = 0
@@ -371,22 +412,26 @@ class BatchLoop(Generic[P]):
         and a tool executor never see each other's requests.
         """
         with self._lock:
+            self._rollup_children()
+            req = self._pop_children(kind)
+            if req is not None:
+                return req
             if kind == "llm":
-                req: Request[P] | None = (
+                request: Request[P] | None = (
                     self._ready_llm.popleft() if self._ready_llm else None
                 )
             elif kind == "tool":
-                req = self._ready_tool.popleft() if self._ready_tool else None
+                request = self._ready_tool.popleft() if self._ready_tool else None
             else:
-                req = self._pop_any()
-            if req is None:
+                request = self._pop_any()
+            if request is None:
                 return None
-            self._outstanding[req.request_id] = req
-            if isinstance(req, LlmRequest):
+            self._outstanding[request.request_id] = request
+            if isinstance(request, LlmRequest):
                 self._out_llm += 1
             else:
                 self._out_tool += 1
-            return req
+            return request
 
     def complete(self, completion: Completion[P]) -> None:
         """Deliver a result for an outstanding request.
@@ -396,6 +441,16 @@ class BatchLoop(Generic[P]):
         error paths leave the loop's state untouched.
         """
         with self._lock:
+            child = self._child_ids.get(completion.request_id)
+            if child is not None:
+                child.complete(completion)
+                del self._child_ids[completion.request_id]
+                if isinstance(completion, LlmCompletion):
+                    self._out_llm -= 1
+                else:
+                    self._out_tool -= 1
+                self._rollup_children()
+                return
             request = self._outstanding.get(completion.request_id)
             if request is None:
                 raise ValueError(
@@ -422,10 +477,15 @@ class BatchLoop(Generic[P]):
 
     @property
     def done(self) -> bool:
-        """True when nothing is runnable and nothing is outstanding."""
+        """True when nothing is runnable and nothing is outstanding (recursively)."""
         with self._lock:
+            self._rollup_children()
             return (
-                not self._ready_llm and not self._ready_tool and not self._outstanding
+                not self._ready_llm
+                and not self._ready_tool
+                and not self._outstanding
+                and not self._child_ids
+                and not self._children
             )
 
     @property
@@ -452,13 +512,65 @@ class BatchLoop(Generic[P]):
         Raises RuntimeError unless the loop is done.
         """
         with self._lock:
+            self._rollup_children()
             if not (
-                not self._ready_llm and not self._ready_tool and not self._outstanding
+                not self._ready_llm
+                and not self._ready_tool
+                and not self._outstanding
+                and not self._child_ids
+                and not self._children
             ):
                 raise RuntimeError("the loop is not done")
             return self._finalize()
 
     # -- internals (all called with self._lock held) --
+
+    def _pop_children(
+        self, kind: Literal["any", "llm", "tool"]
+    ) -> Request[P] | None:
+        """Pull one request from a live child loop (children first)."""
+        for link in self._children.values():
+            req: Request[P] | None = link.child.next_request(kind)
+            if req is not None:
+                self._child_ids[req.request_id] = link.child
+                if isinstance(req, LlmRequest):
+                    self._out_llm += 1
+                else:
+                    self._out_tool += 1
+                return req
+        return None
+
+    def _rollup_children(self) -> None:
+        """Fold finished children into their parent's suspended branch."""
+        for key, link in list(self._children.items()):
+            if link.child.done:
+                branch = self._branches[link.branch_id]
+                branch.turn_results[link.call.id] = dict(link.child.result().results)
+                del self._children[key]
+                if len(branch.turn_results) == len(branch.turn_calls):
+                    self._advance_turn(branch)
+
+    def _is_subagent_call(self, call: ToolCall) -> bool:
+        return self._subagent is not None and call.name == self._subagent.name
+
+    def _spawn_child(self, branch: _Branch[P], call: ToolCall) -> None:
+        sub = self._subagent
+        assert sub is not None
+        child_subagent: SubagentTool[P] | None = None
+        if sub.max_depth > 1:
+            child_subagent = replace(sub, max_depth=sub.max_depth - 1)
+        child: BatchLoop[P] = BatchLoop(
+            prompt=sub.build_prompt(call.args),
+            env_ids=branch.env_ids,
+            tool_specs=tuple(sub.sub_tool_specs(branch.env_ids[0])),
+            subagent=child_subagent,
+            group_by=self._group_by,
+            budget=self._budget,
+            _id_prefix=f"{self._id_prefix}sub:{branch.branch_id}/{call.id}/",
+        )
+        self._children[f"{branch.branch_id}:{call.id}"] = _ChildLink(
+            child=child, branch_id=branch.branch_id, call=call
+        )
 
     def _pop_any(self) -> Request[P] | None:
         llm_head = self._ready_llm[0] if self._ready_llm else None
@@ -496,7 +608,7 @@ class BatchLoop(Generic[P]):
         stats = self._stats_for(branch)
         self._ready_llm.append(
             LlmRequest(
-                request_id=f"llm-{stats.seq}",
+                request_id=f"{self._id_prefix}llm-{stats.seq}",
                 branch_id=branch.branch_id,
                 messages=tuple(branch.messages),
                 tools=self._specs,
@@ -508,7 +620,7 @@ class BatchLoop(Generic[P]):
         stats = self._stats_for(branch)
         self._ready_tool.append(
             ToolRequest(
-                request_id=f"tool-{stats.seq}",
+                request_id=f"{self._id_prefix}tool-{stats.seq}",
                 branch_id=branch.branch_id,
                 tool_call=call,
                 env_ids=branch.env_ids,
@@ -530,7 +642,10 @@ class BatchLoop(Generic[P]):
         branch.turn_calls = completion.tool_calls
         branch.turn_results = {}
         for call in completion.tool_calls:
-            self._request_tool(branch, call)
+            if self._is_subagent_call(call):
+                self._spawn_child(branch, call)
+            else:
+                self._request_tool(branch, call)
 
     def _handle_tool(self, request: ToolRequest, completion: ToolCompletion[P]) -> None:
         branch = self._branches[request.branch_id]
@@ -662,7 +777,7 @@ def run_to_completion(
     *,
     prompt: P,
     env_ids: Sequence[str],
-    tools: Callable[[str], Sequence[Tool[P]]],
+    tools: Callable[[str], Sequence[Tool[P] | SubagentTool[P]]],
     complete_llm: Callable[[LlmRequest[P]], LlmCompletion[P]],
     complete_tool: Callable[[ToolRequest], ToolCompletion[P]] | None = None,
     group_by: Callable[[P], Hashable] | None = None,
@@ -672,7 +787,9 @@ def run_to_completion(
 
     ``tools`` is a factory producing each environment's tool implementations;
     the first environment's specs describe the tools to the model, so specs
-    must be identical across environments.  ``complete_llm`` is the only
+    must be identical across environments.  Any ``SubagentTool`` in the list
+    is detected by ``isinstance`` and made the loop's subagent (the first one
+    wins); it never reaches the tool executor.  ``complete_llm`` is the only
     provider dependency: adapt any LLM API to it.  ``complete_tool`` defaults
     to executing tools directly via the ``tools`` factory.  For parallel
     serving, drive ``BatchLoop`` yourself instead.
@@ -680,14 +797,34 @@ def run_to_completion(
     envs = tuple(env_ids)
     if not envs:
         raise ValueError("env_ids must be non-empty")
-    specs = tuple(
-        ToolSpec(name=t.name, description=t.description, parameters=dict(t.parameters))
-        for t in tools(envs[0])
-    )
+    specs: list[ToolSpec] = []
+    subagent: SubagentTool[P] | None = None
+    for t in tools(envs[0]):
+        if isinstance(t, SubagentTool):
+            if subagent is None:
+                subagent = t
+                specs.append(
+                    ToolSpec(
+                        name=t.name,
+                        description=t.description,
+                        parameters=dict(t.parameters),
+                    )
+                )
+        else:
+            specs.append(
+                ToolSpec(
+                    name=t.name, description=t.description, parameters=dict(t.parameters)
+                )
+            )
     if complete_tool is None:
         complete_tool = _local_tool_executor(tools)
     loop: BatchLoop[P] = BatchLoop(
-        prompt=prompt, env_ids=envs, tool_specs=specs, group_by=group_by, budget=budget
+        prompt=prompt,
+        env_ids=envs,
+        tool_specs=specs,
+        subagent=subagent,
+        group_by=group_by,
+        budget=budget,
     )
     while not loop.done:
         request = loop.next_request()
@@ -701,12 +838,14 @@ def run_to_completion(
 
 
 def _local_tool_executor(
-    tools: Callable[[str], Sequence[Tool[P]]],
+    tools: Callable[[str], Sequence[Tool[P] | SubagentTool[P]]],
 ) -> Callable[[ToolRequest], ToolCompletion[P]]:
     def execute(request: ToolRequest) -> ToolCompletion[P]:
         results: list[tuple[str, P]] = []
         for env in request.env_ids:
-            impls = {t.name: t for t in tools(env)}
+            impls = {
+                t.name: t for t in tools(env) if not isinstance(t, SubagentTool)
+            }
             impl = impls.get(request.tool_call.name)
             if impl is None:
                 raise ValueError(f"env {env!r} has no tool named {request.tool_call.name!r}")

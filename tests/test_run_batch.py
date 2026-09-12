@@ -12,6 +12,7 @@ from lockstep_loop import (
     LlmCompletion,
     LlmRequest,
     Message,
+    SubagentTool,
     ToolCall,
     ToolCompletion,
     ToolRequest,
@@ -165,6 +166,78 @@ def test_custom_group_by_merges_unequal_values():
 
     assert [c.env_ids for c in result.classes] == [("a", "b")]
     assert result.results == {"a": "fin", "b": "fin"}
+
+
+def test_subagent_merges_by_answer():
+    subanswers = {"a": "yes", "b": "yes", "c": "no"}
+    subagent = SubagentTool(
+        name="investigate",
+        description="Run a mini-investigation.",
+        parameters={
+            "type": "object",
+            "properties": {"question": {"type": "string"}},
+            "required": ["question"],
+        },
+        build_prompt=lambda args: f"Answer: {args['question']}",
+        sub_tool_specs=lambda env: [
+            ToolSpec(name="probe", description="", parameters={"type": "object", "properties": {}})
+        ],
+        max_depth=1,
+    )
+
+    def make_tools(env: str):
+        return [
+            FakeTool("probe", "probe the env", {}, lambda args: subanswers[env]),
+            subagent,
+        ]
+
+    def llm(request: LlmRequest) -> LlmCompletion:
+        if request.messages[0].content == "main":
+            if len(request.messages) == 1:
+                return LlmCompletion(
+                    request_id=request.request_id,
+                    content="",
+                    tool_calls=(
+                        ToolCall(id="inv", name="investigate", args={"question": "q?"}),
+                    ),
+                )
+            return LlmCompletion(
+                request_id=request.request_id,
+                content=f"done:{request.messages[-1].content}",
+            )
+        # child loop: probes once, returns the tool result as its answer
+        if len(request.messages) == 1:
+            return LlmCompletion(
+                request_id=request.request_id,
+                content="",
+                tool_calls=(ToolCall(id="pr", name="probe", args={}),),
+            )
+        return LlmCompletion(
+            request_id=request.request_id, content=request.messages[-1].content
+        )
+
+    result = run_to_completion(
+        prompt="main",
+        env_ids=["a", "b", "c"],
+        tools=make_tools,
+        complete_llm=llm,
+    )
+
+    assert sorted(c.env_ids for c in result.classes) == [("a", "b"), ("c",)]
+    assert result.results == {"a": "done:yes", "b": "done:yes", "c": "done:no"}
+
+
+def test_subagent_max_depth_zero_rejected():
+    subagent = SubagentTool(
+        name="s",
+        description="",
+        parameters={},
+        build_prompt=lambda args: "p",
+        sub_tool_specs=lambda env: [],
+        max_depth=0,
+    )
+    with pytest.raises(ValueError, match="max_depth"):
+        BatchLoop(prompt="x", env_ids=["e"], tool_specs=[], subagent=subagent)
 
 
 def test_budget_stops_runaway_branch():
