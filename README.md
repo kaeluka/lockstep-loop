@@ -9,8 +9,9 @@ without generating the same token twice.
   conversation.
 - When the model makes a tool call, the call is evaluated on **every**
   environment still in the class (SIMD-style fan-out).
-- Results are canonicalized (`group_by`) and the class is refined — one
-  sub-conversation per distinct result key. Branches then advance
+- Results are compared by value equality (optionally canonicalized with a
+  caller-provided `group_by`) and the class is refined — one
+  sub-conversation per distinct result. Branches then advance
   independently as their completions arrive.
 - The process repeats per branch until done, yielding a prefix-sharing trie
   whose leaves are **equivalence classes of environments**: cost scales with
@@ -22,14 +23,20 @@ it is in (tool specs identical across environments).
 
 ## Status
 
-Working prototype. The core is provider-agnostic: `run_batch` is a generator
-that yields `LlmRequest` / `ToolRequest` objects and receives `LlmCompletion`
-/ `ToolCompletion` answers via `.send()` — out of order, as they arrive, so a
-slow provider or tool delays only its own branch. The caller owns all LLM and
-tool execution (and thus all scheduling); the library owns partition
-refinement and the trie. Requests carry a `stats` block (depth, split depth,
-env count, sequence) with facts the caller can compose into a serving policy,
-e.g. "deepest currently available branch first" for prompt-cache warmth.
+Working prototype. The core is a provider-agnostic orchestrator: `BatchLoop`
+owns partition refinement and the trie; the caller owns all LLM and tool
+execution. Pull work with `next_request(kind)` — `"llm"`, `"tool"`, or
+`"any"` — serve it however you like (any order, any concurrency), and feed
+results back with `complete()` as they arrive, so a slow provider or tool
+delays only its own branch. Requests carry a `stats` block (depth, split
+depth, env count, sequence) with facts the caller can compose into a serving
+policy, e.g. "deepest currently available branch first" for prompt-cache
+warmth. All methods are internally synchronized, so separate LLM and tool
+consumer loops can share one `BatchLoop`. A generator adapter (`run_batch`)
+remains for pump-style drivers. Payloads are opaque: the loop is generic in
+the content type, so multimodal conversations (content blocks, image bytes)
+work unchanged — tool results only need to be hashable for value-equality
+grouping.
 
 For the common serial case there is a convenience driver:
 
@@ -50,10 +57,18 @@ result = run_to_completion(
 # result.tree, result.classes, result.results (env_id -> final message)
 ```
 
-For parallel serving, pump `run_batch` yourself: prime with `next(gen)`,
-deliver completions with `gen.send(...)` in arrival order, drain queued
-requests with `gen.send(None)`; the loop ends when `send` raises
-`StopIteration` whose `value` is the `BatchResult`.
+For parallel serving, drive `BatchLoop` yourself:
+
+```python
+loop = BatchLoop(prompt=..., env_ids=..., tool_specs=[...])
+while not loop.done:
+    if (req := loop.next_request("any")) is None:
+        await any_completion_arrives()  # outstanding work, nothing runnable
+    else:
+        spawn_somewhere(req)
+# elsewhere, as completions arrive: loop.complete(completion)
+result = loop.result()
+```
 
 ## Development
 

@@ -1,6 +1,7 @@
 """lockstep-loop: coupled, prefix-sharing agent tool loop."""
 
 from lockstep_loop.core import (
+    BatchLoop,
     BatchResult,
     Budget,
     Completion,
@@ -15,13 +16,13 @@ from lockstep_loop.core import (
     ToolCall,
     ToolCompletion,
     ToolRequest,
-    ToolResult,
     ToolSpec,
     run_batch,
     run_to_completion,
 )
 
 __all__ = [
+    "BatchLoop",
     "BatchResult",
     "Budget",
     "Completion",
@@ -36,7 +37,6 @@ __all__ = [
     "ToolCall",
     "ToolCompletion",
     "ToolRequest",
-    "ToolResult",
     "ToolSpec",
     "run_batch",
     "run_to_completion",
