@@ -79,9 +79,9 @@ def test_split_on_divergent_results():
     # the whole point: the shared prefix cost one LLM call for three envs
     first_turns = [r for r in requests if len(r.messages) == 1]
     assert len(first_turns) == 1
-    assert first_turns[0].stats.env_count == 3
+    assert len(first_turns[0].env_ids) == 3
     second_turns = [r for r in requests if len(r.messages) == 3]
-    assert sorted(r.stats.env_count for r in second_turns) == [1, 2]
+    assert sorted(len(r.env_ids) for r in second_turns) == [1, 2]
 
 
 def test_multi_tool_turn_groups_by_result_tuple():

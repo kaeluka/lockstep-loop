@@ -122,19 +122,20 @@ class RequestStats:
     split_depth: int
     """Divergences on the path from the root to this branch."""
 
-    env_count: int
-    """Environments riding on this request's branch."""
-
     seq: int
     """Monotone issue counter, for deterministic tie-breaks."""
 
 
 @dataclass(frozen=True)
 class LlmRequest(Generic[P]):
-    """The loop needs one LLM completion for a branch."""
+    """The loop needs one LLM completion for a branch.
+
+    ``env_ids`` is the branch's equivalence class — the whole set of envs
+    this completion rides on."""
 
     request_id: str
     branch_id: str
+    env_ids: tuple[str, ...]
     messages: tuple[Message[P], ...]
     tools: tuple[ToolSpec, ...]
     stats: RequestStats
@@ -588,7 +589,6 @@ class BatchLoop(Generic[P]):
         return RequestStats(
             depth=branch.steps,
             split_depth=branch.split_depth,
-            env_count=len(branch.env_ids),
             seq=self._seq,
         )
 
@@ -610,6 +610,7 @@ class BatchLoop(Generic[P]):
             LlmRequest(
                 request_id=f"{self._id_prefix}llm-{stats.seq}",
                 branch_id=branch.branch_id,
+                env_ids=branch.env_ids,
                 messages=tuple(branch.messages),
                 tools=self._specs,
                 stats=stats,

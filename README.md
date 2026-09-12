@@ -28,8 +28,9 @@ owns partition refinement and the trie; the caller owns all LLM and tool
 execution. Pull work with `next_request(kind)` — `"llm"`, `"tool"`, or
 `"any"` — serve it however you like (any order, any concurrency), and feed
 results back with `complete()` as they arrive, so a slow provider or tool
-delays only its own branch. Requests carry a `stats` block (depth, split
-depth, env count, sequence) with facts the caller can compose into a serving
+delays only its own branch. Both request kinds carry their env set (the
+branch's equivalence class), and requests carry a `stats` block (depth,
+split depth, sequence) with facts the caller can compose into a serving
 policy, e.g. "deepest currently available branch first" for prompt-cache
 warmth. All methods are internally synchronized, so separate LLM and tool
 consumer loops can share one `BatchLoop`. A generator adapter (`run_batch`)
