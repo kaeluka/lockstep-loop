@@ -4,6 +4,7 @@ version = "0.2.0"
 edition = "2024"
 description = "Run one agent prompt across many similar environments in lockstep"
 readme = "README.md"
+license = "MIT"
 repository = "https://github.com/kaeluka/lockstep-loop"
 
 [dependencies]

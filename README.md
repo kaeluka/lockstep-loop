@@ -67,3 +67,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
+
+## License
+
+MIT © 2026 Stephan Brandauer. See [`LICENSE`](LICENSE).
