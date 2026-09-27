@@ -3,79 +3,67 @@
 Run a single agent prompt across thousands of similar, read-only environments
 without generating the same token twice.
 
-## How it works
+This repository contains two implementations of the same provider-agnostic
+partition-refinement loop:
 
-- All environments start in one equivalence class sharing **one** LLM
-  conversation.
-- When the model makes a tool call, the call is evaluated on **every**
-  environment still in the class (SIMD-style fan-out).
-- Results are compared by value equality (optionally canonicalized with a
-  caller-provided `group_by`) and the class is refined — one
-  sub-conversation per distinct result. Branches then advance
-  independently as their completions arrive.
-- The process repeats per branch until done, yielding a prefix-sharing trie
-  whose leaves are **equivalence classes of environments**: cost scales with
-  the number of distinct tool-call traces, not the number of environments.
+| Implementation | Location | Package |
+| --- | --- | --- |
+| Python ≥ 3.10 | [`python/`](python/) | `lockstep-loop` |
+| Rust | [`rust/`](rust/) | `lockstep-loop` |
 
-Two invariants make this sound: tools must be **pure** (results depend only
-on environment + arguments), and the model must never see which environment
-it is in (tool specs identical across environments).
+Neither implementation calls an LLM or owns infrastructure. The caller pulls
+provider-neutral LLM and tool requests, executes them with any scheduler or
+provider, and returns completions in any order.
 
-## Status
+## The idea
 
-Working prototype. The core is a provider-agnostic orchestrator: `BatchLoop`
-owns partition refinement and the trie; the caller owns all LLM and tool
-execution. Pull work with `next_request(kind)` — `"llm"`, `"tool"`, or
-`"any"` — serve it however you like (any order, any concurrency), and feed
-results back with `complete()` as they arrive, so a slow provider or tool
-delays only its own branch. Both request kinds carry their env set (the
-branch's equivalence class), and requests carry a `stats` block (depth,
-split depth, sequence) with facts the caller can compose into a serving
-policy, e.g. "deepest currently available branch first" for prompt-cache
-warmth. All methods are internally synchronized, so separate LLM and tool
-consumer loops can share one `BatchLoop`. A generator adapter (`run_batch`)
-remains for pump-style drivers. Payloads are opaque: the loop is generic in
-the content type, so multimodal conversations (content blocks, image bytes)
-work unchanged — tool results only need to be hashable for value-equality
-grouping.
+- All environments begin in one equivalence class and share one conversation.
+- A model tool call fans out over every environment still in that class.
+- Environments with equal tool-result tuples stay together; differing results
+  split the class into independent conversations.
+- Multiple tool calls in one assistant turn are independent requests and may
+  execute concurrently; refinement waits for the whole turn.
+- A reserved subagent tool can spawn a nested lockstep loop and fold its final
+  per-environment answers back into the parent turn.
+- The result is a prefix-sharing split trie plus the final equivalence classes.
 
-For the common serial case there is a convenience driver:
+Cost therefore scales with the number of distinct tool-result traces rather
+than directly with the number of environments.
 
-```python
-from lockstep_loop import LlmCompletion, run_to_completion
+The soundness requirements are the same in both implementations: tools must be
+read-only/pure, tool specifications must be identical across environments, and
+the model must not be shown environment identities. Requests do expose their
+environment set to the caller for scheduling, accounting, and rate limiting.
 
-def complete_llm(req):  # the only provider seam
-    resp = my_provider.chat(messages=req.messages, tools=req.tools)
-    return LlmCompletion(request_id=req.request_id, content=resp.text,
-                         tool_calls=resp.tool_calls)
+## Repository layout
 
-result = run_to_completion(
-    prompt="summarize what src/pkgA contains",
-    env_ids=["fork-1", "fork-2", "fork-3"],
-    tools=make_tools,          # env_id -> tool impls (specs must be identical)
-    complete_llm=complete_llm,
-)
-# result.tree, result.classes, result.results (env_id -> final message)
+```text
+python/   Python package, tests, and local examples
+rust/     Rust crate and integration tests
 ```
 
-For parallel serving, drive `BatchLoop` yourself:
+The APIs follow the same vocabulary (`BatchLoop`, `LlmRequest`, `ToolRequest`,
+completions, budgets, split trie, subagent), while retaining language-native
+serving models:
 
-```python
-loop = BatchLoop(prompt=..., env_ids=..., tool_specs=[...])
-while not loop.done:
-    if (req := loop.next_request("any")) is None:
-        await any_completion_arrives()  # outstanding work, nothing runnable
-    else:
-        spawn_somewhere(req)
-# elsewhere, as completions arrive: loop.complete(completion)
-result = loop.result()
-```
+- Python methods are internally synchronized.
+- Rust methods use `&mut self`; callers can wrap a loop in their preferred
+  mutex when cross-thread access is needed.
+- Rust budgets take a caller-supplied exhaustion function because an opaque
+  generic payload cannot safely be fabricated from a string sentinel.
 
 ## Development
 
 ```sh
+# Python
+cd python
 uv sync
 uv run pytest
 uv run mypy src
 uv run ruff check .
+
+# Rust (from the repository root)
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
 ```
