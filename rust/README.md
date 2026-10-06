@@ -40,6 +40,33 @@ let result = loop_.result()?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+## Subagents and inherited sessions
+
+`SubagentTool` starts a nested lockstep loop over the calling branch's environments.
+Children start fresh by default. Opt into conversation inheritance with the
+builder (or the public `inherit_session` field):
+
+```rust
+let fork = SubagentTool::new(
+    fork_spec,
+    |args| args["task"].as_str().unwrap().to_owned(),
+    child_tool_specs,
+    1, // maximum nesting depth
+).with_inherit_session(true);
+```
+
+Each child inherits the parent history **before the calling assistant turn**,
+then appends its generated prompt as a user message. Multiple calls in one turn
+inherit the same prefix, excluding the calling turn and all sibling calls and
+results. Earlier completed tool turns remain in the history. Child tool specs
+still come from their configured factory; provider-side session state is not copied.
+
+The existing driver serves children in any order. The parent waits for all calls
+in the turn, including ordinary tools, then inserts separate tool results in call
+order and refines its environment groups by the result tuple. Only final answers
+return to the parent, not child transcripts. Descendants retain the inheritance
+setting up to `max_depth`. Model routing and prefix caching are caller concerns.
+
 ## Payloads and grouping
 
 Conversation content and tool results are generic in `P`. `BatchLoop::new`

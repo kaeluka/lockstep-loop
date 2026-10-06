@@ -24,7 +24,10 @@ provider, and returns completions in any order.
 - Multiple tool calls in one assistant turn are independent requests and may
   execute concurrently; refinement waits for the whole turn.
 - A reserved subagent tool can spawn a nested lockstep loop and fold its final
-  per-environment answers back into the parent turn.
+  per-environment answers back into the parent turn. With `inherit_session`
+  enabled, each child inherits the conversation before the calling assistant
+  turn and appends its own user prompt. Multiple calls in one turn fork from
+  the same prefix and join as separate tool results in call order.
 - The result is a prefix-sharing split trie plus the final equivalence classes.
 
 Cost therefore scales with the number of distinct tool-result traces rather

@@ -238,6 +238,10 @@ impl<P> Debug for Budget<P> {
 pub struct SubagentTool<P> {
     pub spec: ToolSpec,
     pub max_depth: usize,
+    /// Inherit the parent's history before the calling assistant turn, then
+    /// append the child prompt as a user message. Sibling calls and their
+    /// results are excluded; child tool specifications remain independent.
+    pub inherit_session: bool,
     build_prompt: Arc<PromptBuilder<P>>,
     sub_tool_specs: Arc<SubToolSpecFactory>,
 }
@@ -252,15 +256,24 @@ impl<P> SubagentTool<P> {
         Self {
             spec,
             max_depth,
+            inherit_session: false,
             build_prompt: Arc::new(build_prompt),
             sub_tool_specs: Arc::new(sub_tool_specs),
         }
+    }
+
+    /// Opt into inheriting the conversation prefix when spawning children.
+    /// By default, children start with only their own user prompt.
+    pub fn with_inherit_session(mut self, inherit_session: bool) -> Self {
+        self.inherit_session = inherit_session;
+        self
     }
 
     fn with_max_depth(&self, max_depth: usize) -> Self {
         Self {
             spec: self.spec.clone(),
             max_depth,
+            inherit_session: self.inherit_session,
             build_prompt: Arc::clone(&self.build_prompt),
             sub_tool_specs: Arc::clone(&self.sub_tool_specs),
         }
@@ -278,6 +291,7 @@ impl<P> Debug for SubagentTool<P> {
         f.debug_struct("SubagentTool")
             .field("spec", &self.spec)
             .field("max_depth", &self.max_depth)
+            .field("inherit_session", &self.inherit_session)
             .finish_non_exhaustive()
     }
 }
@@ -441,7 +455,7 @@ where
 {
     /// Construct a loop that groups tool results by value equality.
     pub fn new(config: LoopConfig<P>) -> Result<Self, LoopError> {
-        Self::build(config, Arc::new(Clone::clone), String::new())
+        Self::build(config, Arc::new(Clone::clone), String::new(), Vec::new())
     }
 }
 
@@ -455,13 +469,14 @@ where
         config: LoopConfig<P>,
         group_by: impl Fn(&P) -> K + Send + Sync + 'static,
     ) -> Result<Self, LoopError> {
-        Self::build(config, Arc::new(group_by), String::new())
+        Self::build(config, Arc::new(group_by), String::new(), Vec::new())
     }
 
     fn build(
         config: LoopConfig<P>,
         group_by: Arc<GroupFunction<P, K>>,
         id_prefix: String,
+        mut prefix: Vec<Message<P>>,
     ) -> Result<Self, LoopError> {
         if config.env_ids.is_empty() {
             return Err(LoopError::EmptyEnvIds);
@@ -480,10 +495,11 @@ where
             return Err(LoopError::InvalidSubagentDepth);
         }
 
+        prefix.push(Message::user(config.prompt));
         let root = Branch {
             branch_id: "root".to_owned(),
             env_ids: config.env_ids.clone(),
-            messages: vec![Message::user(config.prompt)],
+            messages: prefix,
             split_depth: 0,
             steps: 0,
             turn_calls: Vec::new(),
@@ -841,6 +857,13 @@ where
             config,
             Arc::clone(&self.group_by),
             format!("{}sub:{}/{}/", self.id_prefix, branch.branch_id, call.id),
+            // Exclude the entire calling assistant turn, including all sibling
+            // calls, so the inherited history has no unanswered tool calls.
+            if subagent.inherit_session {
+                branch.messages[..branch.messages.len() - 1].to_vec()
+            } else {
+                Vec::new()
+            },
         )
         .expect("child config is derived from a valid parent config");
         self.children.insert(

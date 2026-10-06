@@ -218,6 +218,12 @@ class SubagentTool(Generic[P]):
     """Spec provider for the child loop's tools (one env id -> all specs)."""
     max_depth: int = 1
     """How many levels below this loop sub-agents may still spawn (children get max_depth-1)."""
+    inherit_session: bool = False
+    """Prepend the parent's history before the calling assistant turn to the child prompt.
+
+    Multiple calls in one turn inherit the same prefix, never sibling calls
+    or their results. Child tool specifications still come from sub_tool_specs.
+    """
 
 
 @dataclass(frozen=True)
@@ -352,6 +358,7 @@ class BatchLoop(Generic[P]):
         group_by: Callable[[P], Hashable] | None = None,
         budget: Budget | None = None,
         _id_prefix: str = "",
+        _prefix: Sequence[Message[P]] = (),
     ) -> None:
         envs = tuple(env_ids)
         if not envs:
@@ -386,7 +393,7 @@ class BatchLoop(Generic[P]):
             parent_id=None,
             group_key=None,
             env_ids=envs,
-            messages=[Message(role="user", content=prompt)],
+            messages=[*_prefix, Message(role="user", content=prompt)],
             split_depth=0,
         )
         self._branches[root.branch_id] = root
@@ -568,6 +575,9 @@ class BatchLoop(Generic[P]):
             group_by=self._group_by,
             budget=self._budget,
             _id_prefix=f"{self._id_prefix}sub:{branch.branch_id}/{call.id}/",
+            # The last message is the entire calling assistant turn. Exclude
+            # it so no child inherits unanswered tool calls (including siblings).
+            _prefix=branch.messages[:-1] if sub.inherit_session else (),
         )
         self._children[f"{branch.branch_id}:{call.id}"] = _ChildLink(
             child=child, branch_id=branch.branch_id, call=call

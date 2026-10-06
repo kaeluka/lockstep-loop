@@ -71,6 +71,53 @@ while not loop.done:
 result = loop.result()
 ```
 
+## Subagents and inherited sessions
+
+`SubagentTool` runs a nested lockstep loop over the calling branch's environments.
+By default its conversation starts fresh with `user(build_prompt(args))`.
+Set `inherit_session=True` to prepend the parent's conversation **before the
+calling assistant turn**:
+
+```python
+from lockstep_loop import SubagentTool, ToolSpec
+
+fork = SubagentTool(
+    name="fork",
+    description="Investigate a task using the current conversation context.",
+    parameters={
+        "type": "object",
+        "properties": {"task": {"type": "string"}},
+        "required": ["task"],
+    },
+    build_prompt=lambda args: args["task"],
+    sub_tool_specs=lambda env: [
+        ToolSpec("read_file", "Read a file", {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }),
+    ],
+    inherit_session=True,
+)
+# Include fork in the tools factory used by run_to_completion, or pass
+# subagent=fork to BatchLoop and include its ToolSpec in tool_specs.
+```
+
+If the model calls `fork(task="do x")` and `fork(task="do y")` in one turn,
+children start with the same inherited prefix plus `user("do x")` or
+`user("do y")`. They do not inherit the calling turn, sibling calls, or sibling
+results. Child tools still come from `sub_tool_specs`; inheritance copies
+conversation messages, not tool configuration or provider-side session state.
+Previously completed tool turns remain in the inherited history.
+
+The same driver serves child requests, which may finish in any order. The parent
+waits for all calls in its turn (including ordinary tools), then records one tool
+result per call in original call order. Each child's final per-environment answer
+is its tool result; parent environments are grouped by the tuple of those results.
+Child transcripts are not added to the parent. `max_depth` limits recursive
+spawning, and descendants retain the inheritance setting. Prefix caching and
+model selection remain the caller/provider's responsibility.
+
 ## Development
 
 From this `python/` directory:
