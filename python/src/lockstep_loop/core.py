@@ -28,7 +28,6 @@ unless a ``group_by`` canonicalizer is given.
 
 from __future__ import annotations
 
-import hashlib
 import threading
 from collections import deque
 from collections.abc import Callable, Generator, Hashable, Mapping, Sequence
@@ -237,8 +236,8 @@ class SplitNode:
     """An immutable node in the prefix-sharing trie.
 
     Represents the set of environments whose conversations are identical so
-    far.  Children are keyed by the tool-result group key that caused the
-    split.
+    far. Children use opaque, collision-free split labels. Actual tool evidence
+    and replay continuations live in ``History``, not this partition summary.
 
     Nodes are never mutated: a split builds new child nodes and copies the
     path from the split point back to the root (structural sharing).  Treat
@@ -258,17 +257,91 @@ class EnvClass:
 
 
 @dataclass(frozen=True)
+class OutputRecord(Generic[P]):
+    """Exact tool evidence, in assistant call order (never a grouping key)."""
+
+    tool_output: P
+
+
+@dataclass(frozen=True)
+class EnvObservation(Generic[P]):
+    env_id: str
+    outputs: tuple[OutputRecord[P], ...]
+
+
+@dataclass(frozen=True)
+class Observation(Generic[P]):
+    """Representative conversation content and all actual per-env observations."""
+
+    representative: tuple[OutputRecord[P], ...]
+    evidence: tuple[EnvObservation[P], ...]
+    continuation: HistoryNode[P]
+
+
+@dataclass(frozen=True)
+class HistoryNode(Generic[P]):
+    assistant: Message[P] | None = None
+    env_ids: tuple[str, ...] = ()
+    observations: tuple[Observation[P], ...] = ()
+
+
+@dataclass(frozen=True)
+class History(Generic[P]):
+    """Storage-neutral snapshot. Payloads/args/schemas are borrowed immutable values.
+
+    The caller must not mutate them, including through requests or snapshots.
+    ``contract`` attests tool semantics, grouping policy and provider settings;
+    it is a caller-managed version, not a hash computed by this library.
+    Replay additionally checks prompt and tool-spec equality.
+    """
+
+    contract: str
+    prompt: P
+    tools: tuple[ToolSpec, ...]
+    custom_grouping: bool
+    root: HistoryNode[P] = field(default_factory=HistoryNode)
+
+
+def _history_node(root: HistoryNode[P], path: tuple[int, ...]) -> HistoryNode[P]:
+    for index in path:
+        root = root.observations[index].continuation
+    return root
+
+
+def _replace_history_node(
+    root: HistoryNode[P], path: tuple[int, ...], node: HistoryNode[P]
+) -> HistoryNode[P]:
+    ancestors = []
+    for index in path:
+        ancestors.append((root, index))
+        root = root.observations[index].continuation
+    for ancestor, index in reversed(ancestors):
+        updated = replace(ancestor.observations[index], continuation=node)
+        node = replace(
+            ancestor,
+            observations=(
+                *ancestor.observations[:index],
+                updated,
+                *ancestor.observations[index + 1 :],
+            ),
+        )
+    return node
+
+
+@dataclass(frozen=True)
 class BatchResult(Generic[P]):
     """Output of a completed ``BatchLoop``."""
 
     tree: SplitNode
-    """The split trie; the persisted form that makes re-runs cheap."""
+    """Legacy partition summary; use history for replay."""
 
     classes: tuple[EnvClass, ...]
     """Final partition of environments by full tool-call trace."""
 
     results: Mapping[str, P]
     """Final assistant message per environment (identical within a class)."""
+
+    history: History[P] | None = None
 
 
 @dataclass
@@ -283,14 +356,11 @@ class _Branch(Generic[P]):
     messages: list[Message[P]]
     split_depth: int
     steps: int = 0
+    history_path: tuple[int, ...] = ()
     final_content: P | None = None
     turn_calls: tuple[ToolCall, ...] = ()
     turn_results: dict[str, dict[str, P]] = field(default_factory=dict)
     """tool_call_id -> (env_id -> result) for the current assistant turn."""
-
-
-def _short_hash(key: tuple[Hashable, ...]) -> str:
-    return hashlib.sha1(repr(key).encode()).hexdigest()[:12]
 
 
 @dataclass
@@ -351,6 +421,8 @@ class BatchLoop(Generic[P]):
         subagent: SubagentTool[P] | None = None,
         group_by: Callable[[P], Hashable] | None = None,
         budget: Budget | None = None,
+        history_contract: str | None = None,
+        history: History[P] | None = None,
         _id_prefix: str = "",
     ) -> None:
         envs = tuple(env_ids)
@@ -361,6 +433,25 @@ class BatchLoop(Generic[P]):
         if subagent is not None and subagent.max_depth < 1:
             raise ValueError("subagent.max_depth must be >= 1")
         self._specs = tuple(tool_specs)
+        if history is not None and history_contract is None:
+            raise ValueError("replay requires an explicit history_contract")
+        if history_contract is not None:
+            if not history_contract:
+                raise ValueError("history_contract must be non-empty")
+            if subagent is not None or budget is not None:
+                raise ValueError("recorded history does not yet support subagents or budgets")
+            if history is not None and (
+                history.contract != history_contract
+                or history.prompt != prompt
+                or history.tools != self._specs
+                or history.custom_grouping != (group_by is not None)
+            ):
+                raise ValueError("incompatible history contract, prompt, tools or grouping mode")
+            history = history or History(
+                history_contract, prompt, self._specs, group_by is not None
+            )
+        self._recorded = history
+        self._next_branch = 0
         self._subagent = subagent
         self._id_prefix = _id_prefix
         self._group_by: Callable[[P], Hashable] = (
@@ -373,7 +464,7 @@ class BatchLoop(Generic[P]):
         self._lock = threading.Lock()
         self._seq = 0
         self._branches: dict[str, _Branch[P]] = {}
-        self._history: list[_Branch[P]] = []  # every branch ever created, in order
+        self._partition: list[_Branch[P]] = []  # legacy per-run partition summary
         self._finals: list[_Branch[P]] = []
         self._ready_llm: deque[LlmRequest[P]] = deque()
         self._ready_tool: deque[ToolRequest] = deque()
@@ -386,11 +477,11 @@ class BatchLoop(Generic[P]):
             parent_id=None,
             group_key=None,
             env_ids=envs,
-            messages=[Message(role="user", content=prompt)],
+            messages=[Message(role="user", content=history.prompt if history else prompt)],
             split_depth=0,
         )
         self._branches[root.branch_id] = root
-        self._history.append(root)
+        self._partition.append(root)
         self._request_llm(root)
 
     @overload
@@ -402,9 +493,7 @@ class BatchLoop(Generic[P]):
     @overload
     def next_request(self, kind: Literal["any"] = "any") -> Request[P] | None: ...
 
-    def next_request(
-        self, kind: Literal["any", "llm", "tool"] = "any"
-    ) -> Request[P] | None:
+    def next_request(self, kind: Literal["any", "llm", "tool"] = "any") -> Request[P] | None:
         """Pop one runnable request, or None if none of that kind is runnable.
 
         None is not a termination signal — work may still be outstanding, or
@@ -418,9 +507,7 @@ class BatchLoop(Generic[P]):
             if req is not None:
                 return req
             if kind == "llm":
-                request: Request[P] | None = (
-                    self._ready_llm.popleft() if self._ready_llm else None
-                )
+                request: Request[P] | None = self._ready_llm.popleft() if self._ready_llm else None
             elif kind == "tool":
                 request = self._ready_tool.popleft() if self._ready_tool else None
             else:
@@ -437,9 +524,10 @@ class BatchLoop(Generic[P]):
     def complete(self, completion: Completion[P]) -> None:
         """Deliver a result for an outstanding request.
 
-        Raises ValueError for unknown or already-answered request ids and
-        TypeError when the completion type does not match the request.  Both
-        error paths leave the loop's state untouched.
+        Unknown/answered IDs, duplicate call IDs and invalid environment result
+        sets raise ValueError; wrong completion kinds raise TypeError. Validation
+        (including tool grouping) runs before fulfillment, leaving pending work
+        recoverable. Caller callbacks must be pure; side effects are not rolled back.
         """
         with self._lock:
             child = self._child_ids.get(completion.request_id)
@@ -454,27 +542,39 @@ class BatchLoop(Generic[P]):
                 return
             request = self._outstanding.get(completion.request_id)
             if request is None:
-                raise ValueError(
-                    f"no outstanding request with id {completion.request_id!r}"
-                )
+                raise ValueError(f"no outstanding request with id {completion.request_id!r}")
             if isinstance(request, LlmRequest):
                 if not isinstance(completion, LlmCompletion):
                     raise TypeError(
-                        f"LlmRequest {request.request_id} must be answered "
-                        "with LlmCompletion"
+                        f"LlmRequest {request.request_id} must be answered with LlmCompletion"
                     )
+                ids = [call.id for call in completion.tool_calls]
+                if len(set(ids)) != len(ids):
+                    raise ValueError("duplicate tool call id in one assistant turn")
+                self._handle_llm(request, completion)
                 del self._outstanding[completion.request_id]
                 self._out_llm -= 1
-                self._handle_llm(request, completion)
             else:
                 if not isinstance(completion, ToolCompletion):
                     raise TypeError(
-                        f"ToolRequest {request.request_id} must be answered "
-                        "with ToolCompletion"
+                        f"ToolRequest {request.request_id} must be answered with ToolCompletion"
                     )
+                self._handle_tool(request, completion)
                 del self._outstanding[completion.request_id]
                 self._out_tool -= 1
-                self._handle_tool(request, completion)
+
+    @property
+    def history(self) -> History[P] | None:
+        """Capture an immutable, structurally shared root, including fulfilled turns."""
+        with self._lock:
+            return self._recorded
+
+    def _set_history_node(self, path: tuple[int, ...], node: HistoryNode[P]) -> None:
+        assert self._recorded is not None
+        self._recorded = replace(
+            self._recorded,
+            root=_replace_history_node(self._recorded.root, path, node),
+        )
 
     @property
     def done(self) -> bool:
@@ -526,9 +626,7 @@ class BatchLoop(Generic[P]):
 
     # -- internals (all called with self._lock held) --
 
-    def _pop_children(
-        self, kind: Literal["any", "llm", "tool"]
-    ) -> Request[P] | None:
+    def _pop_children(self, kind: Literal["any", "llm", "tool"]) -> Request[P] | None:
         """Pull one request from a live child loop (children first)."""
         for link in self._children.values():
             req: Request[P] | None = link.child.next_request(kind)
@@ -598,6 +696,11 @@ class BatchLoop(Generic[P]):
         self._finals.append(branch)
 
     def _request_llm(self, branch: _Branch[P]) -> None:
+        if self._recorded is not None:
+            node = _history_node(self._recorded.root, branch.history_path)
+            if node.assistant is not None:
+                self._accept_assistant(branch, node.assistant)
+                return
         max_steps = self._budget.max_steps_per_branch if self._budget else None
         if max_steps is not None and branch.steps >= max_steps:
             self._finish(
@@ -631,18 +734,30 @@ class BatchLoop(Generic[P]):
 
     def _handle_llm(self, request: LlmRequest[P], completion: LlmCompletion[P]) -> None:
         branch = self._branches[request.branch_id]
-        branch.steps += 1
-        branch.messages.append(
-            Message(
-                role="assistant", content=completion.content, tool_calls=completion.tool_calls
-            )
+        self._accept_assistant(
+            branch,
+            Message(role="assistant", content=completion.content, tool_calls=completion.tool_calls),
         )
-        if not completion.tool_calls:
-            self._finish(branch, completion.content)
+
+    def _accept_assistant(self, branch: _Branch[P], message: Message[P]) -> None:
+        if self._recorded is not None:
+            node = _history_node(self._recorded.root, branch.history_path)
+            self._set_history_node(
+                branch.history_path,
+                replace(
+                    node,
+                    assistant=node.assistant if node.assistant is not None else message,
+                    env_ids=(*node.env_ids, *branch.env_ids),
+                ),
+            )
+        branch.steps += 1
+        branch.messages.append(message)
+        if not message.tool_calls:
+            self._finish(branch, message.content)
             return
-        branch.turn_calls = completion.tool_calls
+        branch.turn_calls = message.tool_calls
         branch.turn_results = {}
-        for call in completion.tool_calls:
+        for call in message.tool_calls:
             if self._is_subagent_call(call):
                 self._spawn_child(branch, call)
             else:
@@ -656,46 +771,101 @@ class BatchLoop(Generic[P]):
                 f"ToolCompletion for {request.request_id} must return exactly one "
                 "result per env in the request"
             )
-        branch.turn_results[request.tool_call.id] = dict(completion.results)
-        if len(branch.turn_results) < len(branch.turn_calls):
-            return  # other calls of this assistant turn are still in flight
-        self._advance_turn(branch)
+        # All fallible grouping/lookup happens before committing even this partial result.
+        for _, output in completion.results:
+            hash(self._group_by(output))
+        candidate = {**branch.turn_results, request.tool_call.id: dict(completion.results)}
+        plan = None
+        if len(candidate) == len(branch.turn_calls):
+            plan = self._plan_turn(branch, candidate)
+        branch.turn_results = candidate
+        if plan is not None:
+            self._advance_turn(branch, plan)
 
-    def _advance_turn(self, branch: _Branch[P]) -> None:
-        # All calls of the turn have results on every env: refine the partition
-        # by the tuple of results (one group key per call).
+    def _plan_turn(
+        self, branch: _Branch[P], results: dict[str, dict[str, P]]
+    ) -> list[tuple[list[str], int | None]]:
         groups: dict[tuple[Hashable, ...], list[str]] = {}
         for env in branch.env_ids:
-            key = tuple(
-                self._group_by(branch.turn_results[call.id][env])
-                for call in branch.turn_calls
-            )
+            key = tuple(self._group_by(results[c.id][env]) for c in branch.turn_calls)
             groups.setdefault(key, []).append(env)
-        if len(groups) == 1:
-            self._append_tool_messages(
-                branch.messages, branch.turn_calls, branch.turn_results, branch.env_ids[0]
-            )
-            branch.turn_calls = ()
-            branch.turn_results = {}
-            self._request_llm(branch)
-            return
+        node = _history_node(self._recorded.root, branch.history_path) if self._recorded else None
+        plan: list[tuple[list[str], int | None]] = []
         for key, envs in groups.items():
-            child: _Branch[P] = _Branch(
-                branch_id=f"{branch.branch_id}/{_short_hash(key)}",
-                parent_id=branch.branch_id,
-                group_key=str(key),
-                env_ids=tuple(envs),
-                messages=list(branch.messages),
-                split_depth=branch.split_depth + 1,
-                steps=branch.steps,
-            )
-            self._append_tool_messages(
-                child.messages, branch.turn_calls, branch.turn_results, envs[0]
-            )
-            self._branches[child.branch_id] = child
-            self._history.append(child)
-            self._request_llm(child)
-        del self._branches[branch.branch_id]
+            match = None
+            if node is not None:
+                for index, edge in enumerate(node.observations):
+                    if key == tuple(self._group_by(o.tool_output) for o in edge.representative):
+                        match = index
+                        break
+            plan.append((envs, match))
+        return plan
+
+    def _advance_turn(
+        self, branch: _Branch[P], plan: list[tuple[list[str], int | None]] | None = None
+    ) -> None:
+        if plan is None:
+            plan = self._plan_turn(branch, branch.turn_results)
+        split = len(plan) > 1
+        for envs, match in plan:
+            path = branch.history_path
+            messages = list(branch.messages)
+            if self._recorded is not None:
+                node = _history_node(self._recorded.root, path)
+                evidence = tuple(
+                    EnvObservation(
+                        env,
+                        tuple(
+                            OutputRecord(branch.turn_results[c.id][env]) for c in branch.turn_calls
+                        ),
+                    )
+                    for env in envs
+                )
+                edges = list(node.observations)
+                if match is None:
+                    match = len(edges)
+                    edges.append(Observation(evidence[0].outputs, evidence, HistoryNode()))
+                else:
+                    edges[match] = replace(
+                        edges[match], evidence=(*edges[match].evidence, *evidence)
+                    )
+                self._set_history_node(path, replace(node, observations=tuple(edges)))
+                # Reuse the historical representative, not today's lossy-equivalent output.
+                for call, output in zip(
+                    branch.turn_calls, edges[match].representative, strict=True
+                ):
+                    messages.append(
+                        Message(role="tool", content=output.tool_output, tool_call_id=call.id)
+                    )
+                path = (*path, match)
+            else:
+                self._append_tool_messages(
+                    messages, branch.turn_calls, branch.turn_results, envs[0]
+                )
+            if split:
+                self._next_branch += 1
+                label = f"b{self._next_branch}"
+                child: _Branch[P] = _Branch(
+                    branch_id=f"{branch.branch_id}/{label}",
+                    parent_id=branch.branch_id,
+                    group_key=label,
+                    env_ids=tuple(envs),
+                    messages=messages,
+                    split_depth=branch.split_depth + 1,
+                    steps=branch.steps,
+                    history_path=path,
+                )
+                self._branches[child.branch_id] = child
+                self._partition.append(child)
+                self._request_llm(child)
+            else:
+                branch.messages = messages
+                branch.history_path = path
+                branch.turn_calls = ()
+                branch.turn_results = {}
+                self._request_llm(branch)
+        if split:
+            del self._branches[branch.branch_id]
 
     @staticmethod
     def _append_tool_messages(
@@ -715,7 +885,7 @@ class BatchLoop(Generic[P]):
     def _finalize(self) -> BatchResult[P]:
         children_of: dict[str, dict[str, SplitNode]] = {}
         root_node: SplitNode | None = None
-        for b in reversed(self._history):
+        for b in reversed(self._partition):
             node = SplitNode(env_ids=b.env_ids, children=children_of.get(b.branch_id, {}))
             if b.parent_id is None:
                 root_node = node
@@ -726,10 +896,9 @@ class BatchLoop(Generic[P]):
         classes = tuple(EnvClass(id=b.branch_id, env_ids=b.env_ids) for b in self._finals)
         results: dict[str, P] = {}
         for b in self._finals:
-            assert b.final_content is not None
             for env in b.env_ids:
-                results[env] = b.final_content
-        return BatchResult(tree=root_node, classes=classes, results=results)
+                results[env] = cast(P, b.final_content)
+        return BatchResult(tree=root_node, classes=classes, results=results, history=self._recorded)
 
 
 def run_batch(
@@ -813,9 +982,7 @@ def run_to_completion(
                 )
         else:
             specs.append(
-                ToolSpec(
-                    name=t.name, description=t.description, parameters=dict(t.parameters)
-                )
+                ToolSpec(name=t.name, description=t.description, parameters=dict(t.parameters))
             )
     if complete_tool is None:
         complete_tool = _local_tool_executor(tools)
@@ -844,9 +1011,7 @@ def _local_tool_executor(
     def execute(request: ToolRequest) -> ToolCompletion[P]:
         results: list[tuple[str, P]] = []
         for env in request.env_ids:
-            impls = {
-                t.name: t for t in tools(env) if not isinstance(t, SubagentTool)
-            }
+            impls = {t.name: t for t in tools(env) if not isinstance(t, SubagentTool)}
             impl = impls.get(request.tool_call.name)
             if impl is None:
                 raise ValueError(f"env {env!r} has no tool named {request.tool_call.name!r}")

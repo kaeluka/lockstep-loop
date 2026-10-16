@@ -5,7 +5,13 @@
 //! class splits only when tool results differ. The caller owns all LLM and
 //! tool execution and may complete requests in any order.
 
+mod history;
+pub use history::{
+    EnvObservation, History, HistoryNode, HistoryOptions, Observation, OutputRecord,
+};
+
 use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::{self, Debug};
@@ -20,7 +26,7 @@ type GroupFunction<P, K> = dyn Fn(&P) -> K + Send + Sync;
 type ToolFunction<P> = dyn Fn(&Value) -> P + Send + Sync;
 
 /// Provider-neutral tool description.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
@@ -38,7 +44,7 @@ impl ToolSpec {
 }
 
 /// A tool invocation requested by the model.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -55,7 +61,7 @@ impl ToolCall {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
     User,
     Assistant,
@@ -63,7 +69,7 @@ pub enum Role {
 }
 
 /// Provider-neutral conversation message. Payloads are opaque to the loop.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Message<P> {
     pub role: Role,
     pub content: P,
@@ -290,6 +296,7 @@ pub struct LoopConfig<P> {
     pub tool_specs: Vec<ToolSpec>,
     pub subagent: Option<SubagentTool<P>>,
     pub budget: Option<Budget<P>>,
+    pub history: Option<HistoryOptions<P>>,
 }
 
 impl<P> LoopConfig<P> {
@@ -300,7 +307,31 @@ impl<P> LoopConfig<P> {
             tool_specs,
             subagent: None,
             budget: None,
+            history: None,
         }
+    }
+
+    /// Enable recording; the caller versions the complete reuse contract.
+    pub fn with_recording(mut self, contract: impl Into<String>) -> Self {
+        self.history = Some(HistoryOptions {
+            contract: contract.into(),
+            previous: None,
+            prompt_eq: None,
+        });
+        self
+    }
+
+    /// Reuse a snapshot under an explicitly attested compatible contract.
+    pub fn with_replay(mut self, previous: History<P>, contract: impl Into<String>) -> Self
+    where
+        P: PartialEq,
+    {
+        self.history = Some(HistoryOptions {
+            contract: contract.into(),
+            previous: Some(previous),
+            prompt_eq: Some(PartialEq::eq),
+        });
+        self
     }
 
     pub fn with_subagent(mut self, subagent: SubagentTool<P>) -> Self {
@@ -316,6 +347,7 @@ impl<P> LoopConfig<P> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SplitEdge {
+    /// Opaque, collision-free split label; actual evidence lives in `History`.
     pub group_key: String,
     pub node: SplitNode,
 }
@@ -338,10 +370,15 @@ pub struct BatchResult<P> {
     pub tree: SplitNode,
     pub classes: Vec<EnvClass>,
     pub results: BTreeMap<String, P>,
+    pub history: Option<History<P>>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LoopError {
+    #[error("incompatible history contract, prompt, tools or grouping mode")]
+    IncompatibleHistory,
+    #[error("recorded history does not yet support subagents or budgets")]
+    UnsupportedHistory,
     #[error("env_ids must be non-empty")]
     EmptyEnvIds,
     #[error("env_ids must be unique; duplicate {0:?}")]
@@ -375,6 +412,7 @@ struct Branch<P> {
     messages: Vec<Message<P>>,
     split_depth: usize,
     steps: usize,
+    history_path: Vec<usize>,
     turn_calls: Vec<ToolCall>,
     turn_results: HashMap<String, BTreeMap<String, P>>,
 }
@@ -426,7 +464,8 @@ pub struct BatchLoop<P, K = P> {
     seq: u64,
     next_branch: u64,
     branches: HashMap<String, Branch<P>>,
-    history: Vec<BranchRecord>,
+    partition: Vec<BranchRecord>, // legacy per-run partition summary
+    recorded: Option<History<P>>,
     finals: Vec<FinalBranch<P>>,
     ready_llm: VecDeque<LlmRequest<P>>,
     ready_tool: VecDeque<ToolRequest>,
@@ -441,7 +480,7 @@ where
 {
     /// Construct a loop that groups tool results by value equality.
     pub fn new(config: LoopConfig<P>) -> Result<Self, LoopError> {
-        Self::build(config, Arc::new(Clone::clone), String::new())
+        Self::build(config, Arc::new(Clone::clone), String::new(), false)
     }
 }
 
@@ -455,13 +494,14 @@ where
         config: LoopConfig<P>,
         group_by: impl Fn(&P) -> K + Send + Sync + 'static,
     ) -> Result<Self, LoopError> {
-        Self::build(config, Arc::new(group_by), String::new())
+        Self::build(config, Arc::new(group_by), String::new(), true)
     }
 
     fn build(
         config: LoopConfig<P>,
         group_by: Arc<GroupFunction<P, K>>,
         id_prefix: String,
+        custom_grouping: bool,
     ) -> Result<Self, LoopError> {
         if config.env_ids.is_empty() {
             return Err(LoopError::EmptyEnvIds);
@@ -480,12 +520,46 @@ where
             return Err(LoopError::InvalidSubagentDepth);
         }
 
+        let recorded = if let Some(options) = config.history {
+            if config.subagent.is_some() || config.budget.is_some() {
+                return Err(LoopError::UnsupportedHistory);
+            }
+            if options.contract.is_empty() {
+                return Err(LoopError::IncompatibleHistory);
+            }
+            if let Some(previous) = options.previous {
+                if previous.contract != options.contract
+                    || !options
+                        .prompt_eq
+                        .is_some_and(|eq| eq(&previous.prompt, &config.prompt))
+                    || previous.tools != config.tool_specs
+                    || previous.custom_grouping != custom_grouping
+                {
+                    return Err(LoopError::IncompatibleHistory);
+                }
+                Some(previous)
+            } else {
+                Some(History {
+                    contract: options.contract,
+                    prompt: config.prompt.clone(),
+                    tools: config.tool_specs.clone(),
+                    custom_grouping,
+                    root: Arc::new(HistoryNode::default()),
+                })
+            }
+        } else {
+            None
+        };
+        let prompt = recorded
+            .as_ref()
+            .map_or(config.prompt, |h| h.prompt.clone());
         let root = Branch {
             branch_id: "root".to_owned(),
             env_ids: config.env_ids.clone(),
-            messages: vec![Message::user(config.prompt)],
+            messages: vec![Message::user(prompt)],
             split_depth: 0,
             steps: 0,
+            history_path: Vec::new(),
             turn_calls: Vec::new(),
             turn_results: HashMap::new(),
         };
@@ -504,7 +578,8 @@ where
             seq: 0,
             next_branch: 0,
             branches: HashMap::new(),
-            history: vec![root_record],
+            partition: vec![root_record],
+            recorded,
             finals: Vec::new(),
             ready_llm: VecDeque::new(),
             ready_tool: VecDeque::new(),
@@ -614,6 +689,11 @@ where
             return Err(LoopError::NotDone);
         }
         Ok(self.finalize())
+    }
+
+    /// A structurally shared snapshot; builders and pending requests are not persisted.
+    pub fn history(&self) -> Option<History<P>> {
+        self.recorded.clone()
     }
 
     fn validate_completion(
@@ -738,6 +818,14 @@ where
     }
 
     fn schedule_branch(&mut self, branch: Branch<P>) {
+        if let Some(message) = self
+            .recorded
+            .as_ref()
+            .and_then(|h| h.node(&branch.history_path).assistant.clone())
+        {
+            self.accept_assistant(branch, message);
+            return;
+        }
         if let Some(budget) = &self.budget
             && branch.steps >= budget.max_steps_per_branch
         {
@@ -777,21 +865,30 @@ where
     }
 
     fn handle_llm(&mut self, request: LlmRequest<P>, completion: LlmCompletion<P>) {
-        let mut branch = self
+        let branch = self
             .branches
             .remove(&request.branch_id)
             .expect("LLM request must reference an active branch");
+        self.accept_assistant(
+            branch,
+            Message::assistant(completion.content, completion.tool_calls),
+        );
+    }
+
+    fn accept_assistant(&mut self, mut branch: Branch<P>, message: Message<P>) {
+        if let Some(history) = &mut self.recorded {
+            let node = history.node_mut(&branch.history_path);
+            node.assistant.get_or_insert_with(|| message.clone());
+            node.env_ids.extend(branch.env_ids.clone());
+        }
         branch.steps += 1;
-        branch.messages.push(Message::assistant(
-            completion.content.clone(),
-            completion.tool_calls.clone(),
-        ));
-        if completion.tool_calls.is_empty() {
-            self.finish_branch(branch, completion.content);
+        branch.messages.push(message.clone());
+        if message.tool_calls.is_empty() {
+            self.finish_branch(branch, message.content);
             return;
         }
 
-        branch.turn_calls = completion.tool_calls;
+        branch.turn_calls = message.tool_calls;
         branch.turn_results.clear();
         for call in branch.turn_calls.clone() {
             if self
@@ -836,11 +933,13 @@ where
             tool_specs: (subagent.sub_tool_specs)(&branch.env_ids[0]),
             subagent: child_subagent,
             budget: self.budget.clone(),
+            history: None,
         };
         let child = Self::build(
             config,
             Arc::clone(&self.group_by),
             format!("{}sub:{}/{}/", self.id_prefix, branch.branch_id, call.id),
+            true,
         )
         .expect("child config is derived from a valid parent config");
         self.children.insert(
@@ -871,43 +970,79 @@ where
             groups.entry(key).or_default().push(env.clone());
         }
 
-        if groups.len() == 1 {
-            let representative = branch.env_ids[0].clone();
-            Self::append_tool_messages(
-                &mut branch.messages,
-                &branch.turn_calls,
-                &branch.turn_results,
-                &representative,
-            );
-            branch.turn_calls.clear();
-            branch.turn_results.clear();
-            self.schedule_branch(branch);
-            return;
-        }
-
+        let split = groups.len() > 1;
         for (key, env_ids) in groups {
+            let mut messages = branch.messages.clone();
+            let mut history_path = branch.history_path.clone();
+            if let Some(history) = &mut self.recorded {
+                let node = history.node_mut(&history_path);
+                let evidence: Vec<_> = env_ids
+                    .iter()
+                    .map(|env| EnvObservation {
+                        env_id: env.clone(),
+                        outputs: branch
+                            .turn_calls
+                            .iter()
+                            .map(|c| OutputRecord {
+                                tool_output: branch.turn_results[&c.id][env].clone(),
+                            })
+                            .collect(),
+                    })
+                    .collect();
+                let matched = node.observations.iter().position(|edge| {
+                    let old_key: Vec<K> = edge
+                        .representative
+                        .iter()
+                        .map(|o| (self.group_by)(&o.tool_output))
+                        .collect();
+                    old_key == key
+                });
+                let index = matched.unwrap_or(node.observations.len());
+                if matched.is_none() {
+                    node.observations.push(Observation {
+                        representative: evidence[0].outputs.clone(),
+                        evidence: Vec::new(),
+                        continuation: Arc::new(HistoryNode::default()),
+                    });
+                }
+                let edge = &mut node.observations[index];
+                edge.evidence.extend(evidence);
+                for (call, output) in branch.turn_calls.iter().zip(&edge.representative) {
+                    messages.push(Message::tool(output.tool_output.clone(), call.id.clone()));
+                }
+                history_path.push(index);
+            } else {
+                Self::append_tool_messages(
+                    &mut messages,
+                    &branch.turn_calls,
+                    &branch.turn_results,
+                    &env_ids[0],
+                );
+            }
+            if !split {
+                branch.messages = messages;
+                branch.history_path = history_path;
+                branch.turn_calls.clear();
+                branch.turn_results.clear();
+                self.schedule_branch(branch);
+                return;
+            }
             self.next_branch += 1;
             let branch_id = format!("{}/b{}", branch.branch_id, self.next_branch);
-            let mut messages = branch.messages.clone();
-            Self::append_tool_messages(
-                &mut messages,
-                &branch.turn_calls,
-                &branch.turn_results,
-                &env_ids[0],
-            );
             let child = Branch {
                 branch_id: branch_id.clone(),
                 env_ids: env_ids.clone(),
                 messages,
                 split_depth: branch.split_depth + 1,
                 steps: branch.steps,
+                history_path,
                 turn_calls: Vec::new(),
                 turn_results: HashMap::new(),
             };
-            self.history.push(BranchRecord {
+            self.partition.push(BranchRecord {
                 branch_id,
                 parent_id: Some(branch.branch_id.clone()),
-                group_key: Some(format!("{key:?}")),
+                group_key: Some(format!("b{}", self.next_branch)),
                 env_ids,
             });
             self.schedule_branch(child);
@@ -933,7 +1068,7 @@ where
     fn finalize(&self) -> BatchResult<P> {
         let mut children_of: HashMap<String, Vec<SplitEdge>> = HashMap::new();
         let mut root = None;
-        for record in self.history.iter().rev() {
+        for record in self.partition.iter().rev() {
             let mut children = children_of.remove(&record.branch_id).unwrap_or_default();
             children.reverse();
             let node = SplitNode {
@@ -971,9 +1106,10 @@ where
             }
         }
         BatchResult {
-            tree: root.expect("history always contains a root"),
+            tree: root.expect("partition always contains a root"),
             classes,
             results,
+            history: self.recorded.clone(),
         }
     }
 }
