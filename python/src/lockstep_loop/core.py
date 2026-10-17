@@ -34,6 +34,19 @@ from collections.abc import Callable, Generator, Hashable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Generic, Literal, Protocol, TypeAlias, TypeVar, cast, overload
 
+from .history import (
+    EnvObservation,
+    History,
+    HistoryDescriptor,
+    HistoryNode,
+    Observation,
+    OutputRecord,
+    RecordStore,
+    SubagentContract,
+    SubagentHistory,
+    UserContinuation,
+)
+
 #: Conversation payload type: message content, tool results, final answers.
 P = TypeVar("P")
 
@@ -236,8 +249,9 @@ class SplitNode:
     """An immutable node in the prefix-sharing trie.
 
     Represents the set of environments whose conversations are identical so
-    far. Children use opaque, collision-free split labels. Actual tool evidence
-    and replay continuations live in ``History``, not this partition summary.
+    far. Children retain result-group representations as labels, disambiguated
+    on representation collisions. Exact evidence and continuations live in
+    ``History``, not this partition summary.
 
     Nodes are never mutated: a split builds new child nodes and copies the
     path from the split point back to the root (structural sharing).  Treat
@@ -254,78 +268,6 @@ class EnvClass:
 
     id: str
     env_ids: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class OutputRecord(Generic[P]):
-    """Exact tool evidence, in assistant call order (never a grouping key)."""
-
-    tool_output: P
-
-
-@dataclass(frozen=True)
-class EnvObservation(Generic[P]):
-    env_id: str
-    outputs: tuple[OutputRecord[P], ...]
-
-
-@dataclass(frozen=True)
-class Observation(Generic[P]):
-    """Representative conversation content and all actual per-env observations."""
-
-    representative: tuple[OutputRecord[P], ...]
-    evidence: tuple[EnvObservation[P], ...]
-    continuation: HistoryNode[P]
-
-
-@dataclass(frozen=True)
-class HistoryNode(Generic[P]):
-    assistant: Message[P] | None = None
-    env_ids: tuple[str, ...] = ()
-    observations: tuple[Observation[P], ...] = ()
-
-
-@dataclass(frozen=True)
-class History(Generic[P]):
-    """Storage-neutral snapshot. Payloads/args/schemas are borrowed immutable values.
-
-    The caller must not mutate them, including through requests or snapshots.
-    ``contract`` attests tool semantics, grouping policy and provider settings;
-    it is a caller-managed version, not a hash computed by this library.
-    Replay additionally checks prompt and tool-spec equality.
-    """
-
-    contract: str
-    prompt: P
-    tools: tuple[ToolSpec, ...]
-    custom_grouping: bool
-    root: HistoryNode[P] = field(default_factory=HistoryNode)
-
-
-def _history_node(root: HistoryNode[P], path: tuple[int, ...]) -> HistoryNode[P]:
-    for index in path:
-        root = root.observations[index].continuation
-    return root
-
-
-def _replace_history_node(
-    root: HistoryNode[P], path: tuple[int, ...], node: HistoryNode[P]
-) -> HistoryNode[P]:
-    ancestors = []
-    for index in path:
-        ancestors.append((root, index))
-        root = root.observations[index].continuation
-    for ancestor, index in reversed(ancestors):
-        updated = replace(ancestor.observations[index], continuation=node)
-        node = replace(
-            ancestor,
-            observations=(
-                *ancestor.observations[:index],
-                updated,
-                *ancestor.observations[index + 1 :],
-            ),
-        )
-    return node
 
 
 @dataclass(frozen=True)
@@ -423,6 +365,7 @@ class BatchLoop(Generic[P]):
         budget: Budget | None = None,
         history_contract: str | None = None,
         history: History[P] | None = None,
+        record_store: RecordStore[P] | None = None,
         _id_prefix: str = "",
     ) -> None:
         envs = tuple(env_ids)
@@ -433,23 +376,52 @@ class BatchLoop(Generic[P]):
         if subagent is not None and subagent.max_depth < 1:
             raise ValueError("subagent.max_depth must be >= 1")
         self._specs = tuple(tool_specs)
+        sub_contract = (
+            SubagentContract(
+                ToolSpec(subagent.name, subagent.description, subagent.parameters),
+                subagent.max_depth,
+            )
+            if subagent
+            else None
+        )
+        if history is not None and history.descriptor.requires_user_policy:
+            raise ValueError("user continuation selection/inheritance policy required")
         if history is not None and history_contract is None:
             raise ValueError("replay requires an explicit history_contract")
         if history_contract is not None:
             if not history_contract:
                 raise ValueError("history_contract must be non-empty")
-            if subagent is not None or budget is not None:
-                raise ValueError("recorded history does not yet support subagents or budgets")
+            if budget is not None:
+                raise ValueError("recorded history does not yet support budgets")
             if history is not None and (
                 history.contract != history_contract
-                or history.prompt != prompt
-                or history.tools != self._specs
-                or history.custom_grouping != (group_by is not None)
+                or history.descriptor.prompt != prompt
+                or history.descriptor.tools != self._specs
+                or history.descriptor.custom_grouping != (group_by is not None)
+                or history.descriptor.subagent != sub_contract
             ):
-                raise ValueError("incompatible history contract, prompt, tools or grouping mode")
-            history = history or History(
-                history_contract, prompt, self._specs, group_by is not None
-            )
+                raise ValueError(
+                    "incompatible history contract, prompt, tools, grouping "
+                    "or subagent configuration"
+                )
+            if history is None:
+                store = record_store if record_store is not None else RecordStore[P]()
+                history = History(
+                    HistoryDescriptor(
+                        history_contract,
+                        prompt,
+                        self._specs,
+                        group_by is not None,
+                        store.put(HistoryNode()),
+                        sub_contract,
+                    ),
+                    store,
+                )
+            elif record_store is not None and record_store is not history.store:
+                raise ValueError("replay uses the snapshot's record store")
+        elif record_store is not None:
+            raise ValueError("record_store requires history_contract")
+        self._custom_grouping = group_by is not None
         self._recorded = history
         self._next_branch = 0
         self._subagent = subagent
@@ -477,7 +449,9 @@ class BatchLoop(Generic[P]):
             parent_id=None,
             group_key=None,
             env_ids=envs,
-            messages=[Message(role="user", content=history.prompt if history else prompt)],
+            messages=[
+                Message(role="user", content=history.descriptor.prompt if history else prompt)
+            ],
             split_depth=0,
         )
         self._branches[root.branch_id] = root
@@ -532,6 +506,10 @@ class BatchLoop(Generic[P]):
         with self._lock:
             child = self._child_ids.get(completion.request_id)
             if child is not None:
+                # A child final answer becomes a parent tool output. Validate its
+                # grouping contract before fulfilling the child's final request.
+                if isinstance(completion, LlmCompletion) and not completion.tool_calls:
+                    hash(self._group_by(completion.content))
                 child.complete(completion)
                 del self._child_ids[completion.request_id]
                 if isinstance(completion, LlmCompletion):
@@ -567,14 +545,39 @@ class BatchLoop(Generic[P]):
     def history(self) -> History[P] | None:
         """Capture an immutable, structurally shared root, including fulfilled turns."""
         with self._lock:
+            self._sync_child_histories()
             return self._recorded
+
+    def append_user_message(self, content: P) -> History[P]:
+        """Fork an OPEN continuation after resolving one environment by replay.
+
+        No endpoint/session ID is returned or accepted. This does not execute
+        feedback or choose inheritance: replay of the new edge requires policy
+        not implemented yet, and raises explicitly. The old snapshot is unchanged.
+        """
+        with self._lock:
+            if self._recorded is None or len(self._finals) != 1 or self._branches:
+                raise ValueError("resolve a recorded single-environment run first")
+            branch = self._finals[0]
+            if len(branch.env_ids) != 1:
+                raise ValueError("user continuations require one resolved environment")
+            node = self._recorded._node(branch.history_path)
+            edge = UserContinuation(
+                Message(role="user", content=content),
+                self._recorded.store.put(HistoryNode()),
+                resolved_env_id=branch.env_ids[0],
+            )
+            snapshot = self._recorded._replace_node(
+                branch.history_path,
+                replace(node, user_continuations=(*node.user_continuations, edge)),
+            )
+            return replace(
+                snapshot, descriptor=replace(snapshot.descriptor, requires_user_policy=True)
+            )
 
     def _set_history_node(self, path: tuple[int, ...], node: HistoryNode[P]) -> None:
         assert self._recorded is not None
-        self._recorded = replace(
-            self._recorded,
-            root=_replace_history_node(self._recorded.root, path, node),
-        )
+        self._recorded = self._recorded._replace_node(path, node)
 
     @property
     def done(self) -> bool:
@@ -639,15 +642,47 @@ class BatchLoop(Generic[P]):
                 return req
         return None
 
+    def _sync_child_histories(self) -> None:
+        if self._recorded is None:
+            return
+        for link in self._children.values():
+            history = link.child.history
+            assert history is not None
+            branch = self._branches[link.branch_id]
+            node = self._recorded._node(branch.history_path)
+            entries = list(node.subagents)
+            index = next((i for i, e in enumerate(entries) if e.call_id == link.call.id), None)
+            entry = SubagentHistory(link.call.id, history.descriptor)
+            if index is None:
+                entries.append(entry)
+            elif entries[index].history.root == history.descriptor.root:
+                continue
+            else:
+                entries[index] = entry
+            self._set_history_node(branch.history_path, replace(node, subagents=tuple(entries)))
+
     def _rollup_children(self) -> None:
         """Fold finished children into their parent's suspended branch."""
-        for key, link in list(self._children.items()):
-            if link.child.done:
+        while True:
+            finished = [(key, link) for key, link in self._children.items() if link.child.done]
+            self._sync_child_histories()
+            if not finished:
+                return
+            for key, link in finished:
                 branch = self._branches[link.branch_id]
-                branch.turn_results[link.call.id] = dict(link.child.result().results)
+                results = dict(link.child.result().results)
+                candidate = {**branch.turn_results, link.call.id: results}
+                plan = (
+                    self._plan_turn(branch, candidate)
+                    if len(candidate) == len(branch.turn_calls)
+                    else None
+                )
+                branch.turn_results = candidate
                 del self._children[key]
-                if len(branch.turn_results) == len(branch.turn_calls):
-                    self._advance_turn(branch)
+                if plan is not None:
+                    self._advance_turn(branch, plan)
+            # Replayed parent turns may spawn children already finished by replay.
+            # Settle those too, without producing a false stalled frontier.
 
     def _is_subagent_call(self, call: ToolCall) -> bool:
         return self._subagent is not None and call.name == self._subagent.name
@@ -658,14 +693,27 @@ class BatchLoop(Generic[P]):
         child_subagent: SubagentTool[P] | None = None
         if sub.max_depth > 1:
             child_subagent = replace(sub, max_depth=sub.max_depth - 1)
+        previous = None
+        if self._recorded is not None:
+            node = self._recorded._node(branch.history_path)
+            entry = next((e for e in node.subagents if e.call_id == call.id), None)
+            if entry is not None:
+                previous = History(entry.history, self._recorded.store)
         child: BatchLoop[P] = BatchLoop(
             prompt=sub.build_prompt(call.args),
             env_ids=branch.env_ids,
-            tool_specs=tuple(sub.sub_tool_specs(branch.env_ids[0])),
+            tool_specs=tuple(
+                spec
+                for spec in sub.sub_tool_specs(branch.env_ids[0])
+                if child_subagent is not None or spec.name != sub.name
+            ),
             subagent=child_subagent,
-            group_by=self._group_by,
+            group_by=self._group_by if self._custom_grouping else None,
             budget=self._budget,
-            _id_prefix=f"{self._id_prefix}sub:{branch.branch_id}/{call.id}/",
+            history_contract=self._recorded.contract if self._recorded else None,
+            history=previous,
+            record_store=self._recorded.store if self._recorded else None,
+            _id_prefix=f"{self._id_prefix}sub:{branch.branch_id}/{call.id}/turn-{branch.steps}/",
         )
         self._children[f"{branch.branch_id}:{call.id}"] = _ChildLink(
             child=child, branch_id=branch.branch_id, call=call
@@ -697,7 +745,9 @@ class BatchLoop(Generic[P]):
 
     def _request_llm(self, branch: _Branch[P]) -> None:
         if self._recorded is not None:
-            node = _history_node(self._recorded.root, branch.history_path)
+            node = self._recorded._node(branch.history_path)
+            if node.user_continuations:
+                raise ValueError("user continuation selection/inheritance policy required")
             if node.assistant is not None:
                 self._accept_assistant(branch, node.assistant)
                 return
@@ -741,7 +791,7 @@ class BatchLoop(Generic[P]):
 
     def _accept_assistant(self, branch: _Branch[P], message: Message[P]) -> None:
         if self._recorded is not None:
-            node = _history_node(self._recorded.root, branch.history_path)
+            node = self._recorded._node(branch.history_path)
             self._set_history_node(
                 branch.history_path,
                 replace(
@@ -784,13 +834,15 @@ class BatchLoop(Generic[P]):
 
     def _plan_turn(
         self, branch: _Branch[P], results: dict[str, dict[str, P]]
-    ) -> list[tuple[list[str], int | None]]:
+    ) -> list[tuple[list[str], int | None, str]]:
         groups: dict[tuple[Hashable, ...], list[str]] = {}
         for env in branch.env_ids:
             key = tuple(self._group_by(results[c.id][env]) for c in branch.turn_calls)
             groups.setdefault(key, []).append(env)
-        node = _history_node(self._recorded.root, branch.history_path) if self._recorded else None
-        plan: list[tuple[list[str], int | None]] = []
+        node = self._recorded._node(branch.history_path) if self._recorded else None
+        plan: list[tuple[list[str], int | None, str]] = []
+        labels: set[str] = set()
+        reserved = {str(key) for key in groups} if len(groups) > 1 else set()
         for key, envs in groups.items():
             match = None
             if node is not None:
@@ -798,20 +850,27 @@ class BatchLoop(Generic[P]):
                     if key == tuple(self._group_by(o.tool_output) for o in edge.representative):
                         match = index
                         break
-            plan.append((envs, match))
+            label = str(key) if len(groups) > 1 else ""
+            if label in labels:
+                suffix = 2
+                while f"{label} [collision {suffix}]" in labels | reserved:
+                    suffix += 1
+                label = f"{label} [collision {suffix}]"
+            labels.add(label)
+            plan.append((envs, match, label))
         return plan
 
     def _advance_turn(
-        self, branch: _Branch[P], plan: list[tuple[list[str], int | None]] | None = None
+        self, branch: _Branch[P], plan: list[tuple[list[str], int | None, str]] | None = None
     ) -> None:
         if plan is None:
             plan = self._plan_turn(branch, branch.turn_results)
         split = len(plan) > 1
-        for envs, match in plan:
+        for envs, match, group_label in plan:
             path = branch.history_path
             messages = list(branch.messages)
             if self._recorded is not None:
-                node = _history_node(self._recorded.root, path)
+                node = self._recorded._node(path)
                 evidence = tuple(
                     EnvObservation(
                         env,
@@ -824,7 +883,11 @@ class BatchLoop(Generic[P]):
                 edges = list(node.observations)
                 if match is None:
                     match = len(edges)
-                    edges.append(Observation(evidence[0].outputs, evidence, HistoryNode()))
+                    edges.append(
+                        Observation(
+                            evidence[0].outputs, evidence, self._recorded.store.put(HistoryNode())
+                        )
+                    )
                 else:
                     edges[match] = replace(
                         edges[match], evidence=(*edges[match].evidence, *evidence)
@@ -848,7 +911,7 @@ class BatchLoop(Generic[P]):
                 child: _Branch[P] = _Branch(
                     branch_id=f"{branch.branch_id}/{label}",
                     parent_id=branch.branch_id,
-                    group_key=label,
+                    group_key=group_label,
                     env_ids=tuple(envs),
                     messages=messages,
                     split_depth=branch.split_depth + 1,

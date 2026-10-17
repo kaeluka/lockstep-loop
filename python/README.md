@@ -103,37 +103,78 @@ PYTHONPATH=src python examples/history_replay.py
 # unchanged: 0 LLM calls; changed: 1; both paths reusable
 ```
 
-It records a non-splitting tool turn, serializes/restores history with `pickle`,
-replays a new environment without LLM work, and branches on changed observations.
-Pickle is only for **trusted** data. You can instead encode the public frozen
-`History`, `HistoryNode`, `Observation`, `EnvObservation` and `OutputRecord`
-records with your own payload codec. Core code performs no storage I/O.
+It records a non-splitting turn, persists **individual shallow records** plus a
+`HistoryDescriptor`, lazily restores, and branches on changed observations. It
+publishes records before descriptors, checks insert-only collisions, and reuses
+both new and old published roots. Pickle is only for **trusted** data. Substitute
+your own codecs/backend; do not pickle a live `History`/resolver.
 
-Inspect `snapshot.root.assistant`, `root.observations[i].representative`,
-`observations[i].evidence[j].outputs[k].tool_output`, and each observation's
-`continuation`. Output order matches the assistant's call order. Full payloads
-and call arguments survive; grouping keys never replace them. With `group_by`,
-actual per-environment outputs remain separate from the historical representative
-used in the model conversation. Snapshot extension uses immutable path copying,
-not mutation of previously captured roots.
+```python
+# Save each record with your own codec, then publish the descriptor atomically:
+for reference, record in snapshot.store.records().items():
+    backend.insert_immutable(reference, encode_node(record))
+published = encode_descriptor(snapshot.descriptor)
+
+# Fresh writer namespace (UUID default); no traversal or matching in this callback:
+store = RecordStore(load=lambda ref: decode_node(backend.read(ref)))
+restored = History(decode_descriptor(published), store)
+```
+
+`RecordStore(namespace=..., load=...)` is an in-memory append-only write set/cache,
+not a backend. `BatchLoop(record_store=store, history_contract=...)` uses a chosen
+store for a new recording; replay uses the store attached to `History`. Allocate
+a globally unique namespace per persistent writer. New records use exact
+`NodeRef(namespace, index)` addresses, never hashes. Persist only local writes;
+the new root may still reference old backend records. Loader errors/missing or
+corrupt records are fatal, not completion-validation errors. See the
+[complete persistence protocol](../README.md#individually-addressable-records-and-lazy-persistence).
+
+Inspect `snapshot.root.assistant`, `root.observations[i].representative`, and
+`observations[i].evidence[j].outputs[k].tool_output`. Load a continuation with
+`snapshot.load(edge.continuation)`; its `NodeRef` is only a storage address.
+Output order matches call order. Full payloads/arguments survive; custom grouping
+keeps exact per-environment evidence separate from historical representative
+context. Snapshot extension path-copies records, leaving prior roots unchanged.
+
+**Subagents are recorded and replayed**, including mixed ordinary/subagent turns,
+concurrent child calls and configured nesting depth. `node.subagents` entries
+contain the assistant call ID and a child descriptor: inspect one with
+`History(entry.history, snapshot.store)`. Child tool observations are rerun; only
+child final answers enter the parent's result tuple. Divergent child traces with
+identical answers do not split the parent. Active child snapshots retain fulfilled
+turns, not partial tool collections.
 
 **Compatibility:** replay requires the same explicit non-empty contract, equal
-prompt, equal ordered tool specs, and the same default/custom grouping mode.
-Version the contract for changes to grouping/tool semantics or provider/adapter
+prompt, equal ordered tool specs, the same default/custom grouping mode and equal
+subagent spec/depth. Version the contract for changes to subagent callbacks,
+grouping/tool semantics or provider/adapter
 settings. Equality cannot detect a changed implementation behind an unchanged
 schema. Payloads, arguments and schemas are **borrowed immutable values**: do not
 mutate nested contents through any alias after handing them to the loop. Convert
 mutable provider objects to stable values or make your own copies first.
 
-**Limits:** direct `BatchLoop` only; recording rejects subagents and budgets.
-History must be fully loaded: lazy storage loading is deferred. Partial tool
-collections/queues are builders, not persisted crash-recovery state. Valid
-persisted histories are trusted, with no promised cross-version wire format.
-Validation failures leave requests outstanding for correction; duplicate fulfilled
-completions cannot overwrite history. Branch IDs are run-local (now collision-free
-counters rather than truncated hashes); Python split-edge labels are likewise
-opaque identifiers. No feedback/assets/DAG scheduling is included. See the
-[shared design and limitations](../README.md#immutable-recorded-history-and-incremental-replay).
+**User continuations:** resolve a snapshot against **one stable environment** by
+ordinary replay, then call `resolved_loop.append_user_message(content)`. The
+returned new snapshot preserves the old assistant answer and adds a
+`UserContinuation(message, continuation)` pointing to an open `HistoryNode`.
+The prior snapshot/other investigations are unchanged, even if they published the
+same answer. No public session ID or endpoint handle is introduced. The record
+model permits later tools, the same answer again, and more user messages.
+Selection/inheritance across environments is **not decided**: descriptors with
+user continuations have `requires_user_policy=True` and replay raises explicitly
+rather than silently inheriting or ignoring feedback. This is representation and
+append support, not feedback routing/execution.
+
+**Limits:** direct `BatchLoop` only; recording still rejects budgets. No core
+storage I/O, async loader, eviction/GC, independent-root merge, or crash recovery.
+Stores retain local writes and cached loads; deep path copying can have quadratic
+write volume. Pending tool collections/queues are not persisted. Valid imported
+records are trusted; no stable cross-version wire format is promised. Invalid
+completions leave requests correctable, including nested routes. Branch IDs use
+collision-free run-local counters; legacy tree labels retain `str(result_tuple)`.
+Python mapping label collisions append ` [collision N]` without dropping groups
+or changing noncolliding labels. Assets/DAG scheduling/UI remain out of scope.
+See the [shared design and limitations](../README.md#immutable-recorded-history-and-incremental-replay).
 
 ## Development
 

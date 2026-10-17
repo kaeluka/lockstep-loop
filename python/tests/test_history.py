@@ -8,8 +8,10 @@ import pytest
 from lockstep_loop import (
     BatchLoop,
     Budget,
+    History,
     LlmCompletion,
     LlmRequest,
+    RecordStore,
     SubagentTool,
     ToolCall,
     ToolCompletion,
@@ -78,8 +80,9 @@ def test_non_splitting_checkpoints_replay_branch_and_preserve_snapshots():
         empty.root.assistant = old.root.assistant
     assert old.root.assistant.content == "think 0"
     first = old.root.observations[0]
-    second = first.continuation.observations[0]
-    assert second.continuation.assistant.content == "two"
+    first_next = old.load(first.continuation)
+    second = first_next.observations[0]
+    assert old.load(second.continuation).assistant.content == "two"
     assert result.tree.children == {}  # both checkpoints used to be invisible
 
     replay, llms = drive(make_loop(("new",), old), {"new": old_values})
@@ -94,10 +97,10 @@ def test_non_splitting_checkpoints_replay_branch_and_preserve_snapshots():
     assert len(llms) == 1
     assert llms[0].stats.depth == 2
     assert llms[0].messages[-1].content == "CHANGED"
-    edges = changed.history.root.observations[0].continuation.observations
+    edges = changed.history.load(changed.history.root.observations[0].continuation).observations
     assert len(edges) == 2
     assert edges[0] is second  # untouched old path is structurally shared
-    assert len(first.continuation.observations) == 1
+    assert len(first_next.observations) == 1
     for value in (old_values, changed_values):
         _, llms = drive(make_loop(("again",), changed.history), {"again": value})
         assert llms == []
@@ -130,7 +133,11 @@ def test_lossy_grouping_keeps_exact_bytes_and_historical_representative():
     edge = result.history.root.observations[0]
     assert edge.representative[1].tool_output == b"two "
     assert edge.evidence[1].outputs[1].tool_output == b"two"
-    restored = pickle.loads(pickle.dumps(result.history))
+    encoded = {ref: pickle.dumps(node) for ref, node in result.history.store.records().items()}
+    restored = History(
+        pickle.loads(pickle.dumps(result.history.descriptor)),
+        RecordStore(load=lambda ref: pickle.loads(encoded[ref])),
+    )
     replay, requests = drive(
         make_loop(("c",), restored, group_by=bytes.strip), {"c": ((b"one\n", b"two\n"),)}, turns=1
     )
@@ -241,9 +248,10 @@ def test_reverse_branch_completions_keep_siblings_and_never_merge():
         loop.complete(LlmCompletion(request.request_id, "same final"))
     result = loop.result()
     assert len(result.classes) == 2  # identical final answers cannot merge classes
-    assert all(e.continuation.assistant is None for e in before.root.observations)
+    assert all(before.load(e.continuation).assistant is None for e in before.root.observations)
     assert all(
-        e.continuation.assistant.content == "same final" for e in result.history.root.observations
+        result.history.load(e.continuation).assistant.content == "same final"
+        for e in result.history.root.observations
     )
 
 

@@ -57,15 +57,17 @@ snapshot with `with_replay(history, expected_contract)`; constructors still use
 `BatchLoop::new` (exact equality) or `BatchLoop::with_group_by` (explicit lossy
 policy). Existing loops without these options behave as before. Code using
 `LoopConfig` or `BatchResult` struct literals must add `history: None`; existing
-constructor-based code is unchanged. Legacy split-edge `group_key` strings are
-now opaque, collision-free labels rather than debug renderings of group keys.
+constructor-based code is unchanged. Legacy `group_key` labels retain debug
+renderings of result tuples. Equal renderings are allowed on distinct edges in
+the result's `Vec`; internal branch IDs remain collision-free.
 
 ```rust
 let config = LoopConfig::new(prompt.clone(), vec!["revision-1".into()], specs.clone())
-    .with_recording("inspect-v1/tools-v1/exact-grouping/provider-v1");
+    .with_recording("inspect-v1/tools-v1/exact-grouping/provider-v1")
+    .with_record_store(RecordStore::new("caller-reserved-writer-namespace"));
 let mut loop_ = BatchLoop::new(config)?;
 // Serve normal requests/completions.
-let snapshot = loop_.history().unwrap(); // cheap structurally shared root
+let snapshot = loop_.history().unwrap(); // immutable root, including active children
 // Also available as loop_.result()?.history after completion.
 let replay_config = LoopConfig::new(prompt, vec!["revision-2".into()], specs)
     .with_replay(snapshot, "inspect-v1/tools-v1/exact-grouping/provider-v1");
@@ -80,41 +82,86 @@ cargo run -p lockstep-loop --example history_replay
 # unchanged: 0 LLM calls; changed: 1; both paths reusable
 ```
 
-It uses caller-side `serde_json::to_vec`/`from_slice` to round-trip `History<String>`;
-all storage and codecs belong to the caller. History records derive Serde when
-`P` supports it. There is no core storage I/O or stable cross-language/version wire
-format. Load valid snapshots from this version, not arbitrary/malformed graphs.
+It uses ordinary `serde_json::to_vec`/`from_slice` for **each shallow record** and
+`HistoryDescriptor<String>`, not a recursively encoded `History`. No recursion
+limit adjustment is needed for deep histories. Storage/codecs are caller-owned.
 
-`History` contains the prompt, ordered specs, contract and `Arc<HistoryNode<P>>`
-root. Nodes contain full assistant messages, environment visits and observation
-edges. Each edge contains ordered representative `OutputRecord { tool_output }`
-values, exact per-environment `EnvObservation` evidence, and an `Arc` continuation.
-Reconstruct the model conversation by alternating assistant messages with
-representative tool messages in call order. Lossy grouping never discards the
-actual unequal evidence, and replay keeps the original representative context.
-Copy-on-write updates share unchanged subtrees; captured roots cannot be changed
-by extending a loop. Public owned records can be edited for caller codecs, but
-that creates a different value, not permission to mutate payload aliases.
+`History { descriptor, store }` pairs a small envelope with its resolver.
+`HistoryNode` is the one internal/public record model. Its observation edges use
+`NodeRef { namespace, index }` addresses, ordered representative
+`OutputRecord { tool_output }` values and exact per-environment evidence. Use
+`history.root()` and `history.load(&edge.continuation)` to inspect nodes. Lossy
+grouping keeps the original representative context without discarding actual
+outputs. Immutable path-copying updates preserve old records/references. Editing
+owned clones creates different values; payload aliases must remain immutable.
+
+For persistence, iterate `history.store.records()` and encode each `(NodeRef,
+Arc<HistoryNode<P>>)` individually. Insert immutable records first (reject address
+collisions), then atomically publish `history.descriptor`. Restore with:
+
+```rust
+let history = History {
+    descriptor: serde_json::from_slice::<HistoryDescriptor<String>>(&published)?,
+    store: RecordStore::with_loader("fresh-reserved-writer-namespace", move |reference| {
+        // Caller loader: read/decode ONE immutable record; no replay/matching here.
+        Arc::new(serde_json::from_slice(&backend[reference]).unwrap())
+    }),
+};
+```
+
+A namespace must be unique for every independent writable store in the persistent
+storage domain. Reserve one using your own UUID/sequence/transaction scheme;
+these are **storage names, not public conversation identities**. The default
+store is convenient for process-local execution only. Durable recordings should
+use `with_record_store(RecordStore::new(namespace))`; restored stores need a fresh
+namespace. Cloning a store shares its allocator/cache. Record references use
+exact address equality, not hashes/debug strings. Loaders must be synchronous,
+non-reentrant and total for valid references; failures/panics are fatal and
+require restarting from a saved descriptor. Records/descriptors derive Serde when
+`P` supports it; live resolver handles do not. No stable cross-language/version
+wire format or validation of arbitrary imported graphs is promised. See the
+[load/update/publish protocol](../README.md#individually-addressable-records-and-lazy-persistence).
+
+**Nested subagents:** `HistoryNode.subagents` entries associate an assistant call
+ID with a full child descriptor. Inspect using `History { descriptor:
+entry.history.clone(), store: history.store.clone() }`. Core replay reruns child
+tools lazily, supports mixed ordinary/subagent calls and configured nesting depth,
+and folds child final answers into parent matching. Parent classes do not split
+merely because child traces differ when their answers agree. Active-child
+snapshots preserve fulfilled turns without serializing pending tool builders.
 
 **Compatibility:** contract IDs must be non-empty and equal; prompt equality,
-ordered tool specs, and default/custom grouping mode are also checked. The
+ordered tool specs, default/custom grouping mode and subagent spec/depth are also
+checked. Child contracts are checked on entry. The
 `with_replay` builder requires `P: PartialEq` for prompt checking (recording alone
 does not). The caller versions tool implementation semantics, custom grouping,
-and provider/adapter settings in the contract. Closures cannot be introspected.
+subagent prompt/spec-building callbacks, and provider/adapter settings in the
+contract. Closures cannot be introspected.
 Payload `Clone` must have immutable value semantics: interior-mutable aliases must
 not change submitted facts. Grouping, equality and hashing must be deterministic;
 callback panics are not recoverable validation errors.
 
-**Limits:** recording rejects configured subagents and budgets; use direct
-`BatchLoop`, not convenience drivers. Histories are fully loaded in memory; lazy
-loading is deferred. Pending requests/partial tool tuples are not persisted, so
-reusing a partial snapshot restarts tools, not in-flight execution. Validation
-errors do leave outstanding requests correctable, and fulfilled completions
-cannot overwrite history. `stats.depth` includes reused turns; `split_depth` is
-local to the new execution. There is no feedback/assets/DAG scheduling or merging
-of independently extended roots. See the
+**User continuations:** replay a snapshot against **one stable environment** to
+resolve an investigation, then `loop_.append_user_message(content)?` returns a
+new snapshot with the old assistant answer plus a user-message edge to an OPEN
+node. It does not mutate the prior root or select by answer value. The model can
+represent more investigation, the same answer, and further user messages. There
+is no public session ID or endpoint handle. Feedback selection/inheritance across
+environments remains a policy decision: descriptors containing these edges carry
+`requires_user_policy=true`, and replay returns `UserContinuationPolicyRequired`
+rather than inventing a policy. Representation and append are supported; feedback
+execution/routing, assets, DAG scheduling and UI are not.
+
+**Limits:** recording still rejects budgets; use direct `BatchLoop`, not convenience
+drivers. No core storage I/O, async loader, eviction/GC, or independent-root merge.
+Stores retain local writes/cached loads; deep path copying can have quadratic
+write volume. Pending requests/partial tuples are not persisted, so tools restart
+on replay: this is not in-flight crash recovery. Invalid completions remain
+correctable, including nested routes. `stats.depth` includes reused turns;
+`split_depth` is local to the new execution. See the
 [shared design and limitations](../README.md#immutable-recorded-history-and-incremental-replay).
 
-See `tests/loop.rs` and `tests/history.rs` for regression tests covering partition
-refinement, arbitrary completion order, exact evidence, snapshots, persistence,
-replay divergence, and compatibility.
+See `tests/loop.rs`, `tests/history.rs` and `tests/history_foundation.rs` for
+regressions including 256-turn shallow-record persistence with default JSON
+limits, lazy traversal, nested evidence/equal parent answers, open user
+continuations, immutable snapshots, arbitrary completion order and compatibility.

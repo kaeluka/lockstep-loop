@@ -7,6 +7,7 @@ from lockstep_loop import (
     History,
     LlmCompletion,
     LlmRequest,
+    RecordStore,
     ToolCall,
     ToolCompletion,
     ToolSpec,
@@ -47,19 +48,42 @@ def investigate(env: str, observation: str, history: History[str] | None = None)
     return result.history, llm_calls, result.results[env]
 
 
+def persist(history, backend):
+    # Each node is SHALLOW: continuation/subagent references are addresses.
+    # Store immutable records first; only then atomically publish the descriptor.
+    for reference, node in history.store.records().items():
+        encoded = pickle.dumps(node)
+        if reference in backend:
+            assert backend[reference] == encoded  # never overwrite a different record
+        else:
+            backend[reference] = encoded
+    return pickle.dumps(history.descriptor)
+
+
+def restore(descriptor, backend):
+    # No traversal here: core loads just the selected path, including children.
+    # Each RecordStore gets a fresh writer namespace (UUID by default in Python).
+    store = RecordStore(load=lambda reference: pickle.loads(backend[reference]))
+    return History(pickle.loads(descriptor), store)
+
+
 if __name__ == "__main__":
     old, calls, _ = investigate("yesterday", "clean")
     assert calls == 2
-    # Caller-side codec. Persist these bytes wherever you choose.
-    # Never unpickle untrusted data. No stable cross-version pickle format is promised.
-    restored = pickle.loads(pickle.dumps(old))
+    # Caller-owned backend and codecs. Never unpickle untrusted bytes.
+    backend = {}
+    old_descriptor = persist(old, backend)
+    restored = restore(old_descriptor, backend)
     _, calls, answer = investigate("today", "clean", restored)
     assert (calls, answer) == (0, "Status: clean")
     extended, calls, _ = investigate("tomorrow", "dirty", restored)
     assert calls == 1
     assert len(old.root.observations) == 1
     assert len(extended.root.observations) == 2
+    extended_descriptor = persist(extended, backend)
     for status in ("clean", "dirty"):
-        _, calls, _ = investigate("later", status, extended)
+        _, calls, _ = investigate("later", status, restore(extended_descriptor, backend))
         assert calls == 0
+    _, calls, _ = investigate("old snapshot", "clean", restore(old_descriptor, backend))
+    assert calls == 0
     print("unchanged: 0 LLM calls; changed: 1; both paths reusable")
