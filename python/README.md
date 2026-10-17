@@ -1,7 +1,10 @@
 # lockstep-loop for Python
 
-Run a single agent prompt across thousands of similar, read-only environments
-without generating the same token twice.
+Share an investigation across similar, read-only environments, branching only
+when observations differ. [Start with the visual guide](../docs/concepts.md).
+
+Conceptually, an agent is its prompt, reuse contract, and accumulated investigation
+trie; the current API calls a recorded agent snapshot `History`.
 
 ## How it works
 
@@ -14,8 +17,9 @@ without generating the same token twice.
   sub-conversation per distinct result. Branches then advance
   independently as their completions arrive.
 - The process repeats per branch until done, yielding a prefix-sharing trie
-  whose leaves are **equivalence classes of environments**: cost scales with
-  the number of distinct tool-call traces, not the number of environments.
+  whose leaves are **equivalence classes of environments**. LLM work follows
+  distinct observation paths; tools still run per environment. Equal final
+  answers do not merge previously split classes.
 
 Two invariants make this sound: tools must be **pure** (results depend only
 on environment + arguments), and the model must never see which environment
@@ -39,7 +43,9 @@ the content type, so multimodal conversations (content blocks, image bytes)
 work unchanged — tool results only need to be hashable for value-equality
 grouping.
 
-For the common serial case there is a convenience driver:
+For the common serial case there is a convenience driver. This integration sketch
+assumes your `my_provider` adapter and `make_tools` factory; it is not standalone.
+Convert provider tool calls to `lockstep_loop.ToolCall` values before completion:
 
 ```python
 from lockstep_loop import LlmCompletion, run_to_completion
@@ -58,7 +64,7 @@ result = run_to_completion(
 # result.tree, result.classes, result.results (env_id -> final message)
 ```
 
-For parallel serving, drive `BatchLoop` yourself:
+For parallel serving, drive `BatchLoop` yourself (scheduling sketch):
 
 ```python
 loop = BatchLoop(prompt=..., env_ids=..., tool_specs=[...])
@@ -127,7 +133,7 @@ a globally unique namespace per persistent writer. New records use exact
 `NodeRef(namespace, index)` addresses, never hashes. Persist only local writes;
 the new root may still reference old backend records. Loader errors/missing or
 corrupt records are fatal, not completion-validation errors. See the
-[complete persistence protocol](../README.md#individually-addressable-records-and-lazy-persistence).
+[complete persistence protocol](../docs/history-reference.md#individually-addressable-records-and-lazy-persistence).
 
 Inspect `snapshot.root.assistant`, `root.observations[i].representative`, and
 `observations[i].evidence[j].outputs[k].tool_output`. Load a continuation with
@@ -236,7 +242,7 @@ Callbacks may read it reentrantly and see only the committed pre-transition root
 reentrant advancement is rejected. Caller side effects, warmed loader caches and
 unreachable append-only records are not rolled back. Explicit terminal
 failures, such as `FeedbackResolutionError`, retain their cancellation semantics.
-See the [transaction boundary](../README.md#transactional-child-preparation-and-callback-failures).
+See the [transaction boundary](../docs/history-reference.md#transactional-child-preparation-and-callback-failures).
 
 **Limits:** direct `BatchLoop` only; recording still rejects budgets. No core
 storage I/O, async loader, eviction/GC, independent-root merge, or crash recovery.
@@ -246,8 +252,10 @@ records are trusted; no stable cross-version wire format is promised. Invalid
 completions leave requests correctable, including nested routes. Branch IDs use
 collision-free run-local counters; legacy tree labels retain `str(result_tuple)`.
 Python mapping label collisions append ` [collision N]` without dropping groups
-or changing noncolliding labels. Assets/DAG scheduling/UI remain out of scope.
-See the [shared design and limitations](../README.md#immutable-recorded-history-and-incremental-replay).
+or changing noncolliding labels. Dedicated asset/publication APIs, DAG scheduling,
+and UI remain out of scope. Current subagents use one configured reserved tool;
+independent child-cache lookup across changed parent prompts is not implemented.
+See the [shared design and limitations](../docs/history-reference.md#immutable-recorded-history-and-incremental-replay).
 
 ## Development
 
