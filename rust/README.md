@@ -4,41 +4,54 @@ Provider-agnostic lockstep orchestration for running one LLM conversation over
 many similar, read-only environments and splitting it only when tool results
 diverge.
 
-The crate never calls an LLM. Drive [`BatchLoop`] directly for arbitrary
-scheduling, or use `run_to_completion` for a serial local-tool driver.
+[Start with the visual guide](../docs/concepts.md). Conceptually, an agent contains
+its prompt, reuse contract, and accumulated investigation trie; the recorded agent
+snapshot type is currently `History`.
+
+The crate never calls an LLM. Drive `BatchLoop` directly for arbitrary scheduling,
+or use `run_to_completion` for a serial local-tool driver. Shared reasoning saves
+LLM work; tools still execute per environment. Classes never remerge within a run.
+
+This complete, provider-free example immediately answers a no-tool investigation:
 
 ```rust
 use lockstep_loop::{
     Completion, LlmCompletion, LoopConfig, BatchLoop, Request, RequestKind,
 };
 
-let mut loop_ = BatchLoop::new(LoopConfig::new(
-    "inspect the repository".to_owned(),
-    vec!["fork-a".to_owned(), "fork-b".to_owned()],
-    vec![],
-))?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut loop_ = BatchLoop::new(LoopConfig::new(
+        "inspect the repository".to_owned(),
+        vec!["fork-a".to_owned(), "fork-b".to_owned()],
+        vec![],
+    ))?;
 
-while !loop_.is_done() {
-    match loop_.next_request(RequestKind::Any) {
-        Some(Request::Llm(request)) => {
-            // Adapt `request.messages` and `request.tools` to any provider.
-            loop_.complete(Completion::Llm(LlmCompletion::final_answer(
-                request.request_id,
-                "done".to_owned(),
-            )))?;
+    while !loop_.is_done() {
+        match loop_.next_request(RequestKind::Any) {
+            Some(Request::Llm(request)) => {
+                // Replace this stand-in with your provider adapter.
+                loop_.complete(Completion::Llm(LlmCompletion::final_answer(
+                    request.request_id,
+                    "done".to_owned(),
+                )))?;
+            }
+            // This stand-in requests no tools and completes work synchronously.
+            _ => unreachable!("no tool calls or outstanding asynchronous work"),
         }
-        Some(Request::Tool(request)) => {
-            // Execute request.tool_call once for every request.env_ids entry,
-            // then return one result per environment.
-            todo!()
-        }
-        None => wait_for_an_outstanding_completion(),
     }
-}
 
-let result = loop_.result()?;
-# Ok::<(), Box<dyn std::error::Error>>(())
+    let result = loop_.result()?;
+    assert_eq!(result.results["fork-a"], "done");
+    Ok(())
+}
 ```
+
+With real tools, handle `Request::Tool` by executing its call once per
+`request.env_ids` entry, then return a `ToolCompletion` containing every result.
+In asynchronous drivers, `None` means no request is currently runnable, not done;
+wait for outstanding completions and use `is_done()` for termination.
+The snippets below illustrate integration; use the linked examples for complete
+imports, tool setup, and persistence backends.
 
 ## Payloads and grouping
 
@@ -121,7 +134,7 @@ non-reentrant and total for valid references; failures/panics are fatal and
 require restarting from a saved descriptor. Records/descriptors derive Serde when
 `P` supports it; live resolver handles do not. No stable cross-language/version
 wire format or validation of arbitrary imported graphs is promised. See the
-[load/update/publish protocol](../README.md#individually-addressable-records-and-lazy-persistence).
+[load/update/publish protocol](../docs/history-reference.md#individually-addressable-records-and-lazy-persistence).
 
 **Nested subagents:** `HistoryNode.subagents` entries associate an assistant call
 ID with a full child descriptor. Inspect using `History { descriptor:
@@ -150,7 +163,7 @@ answer or partially starting the rejected assistant turn. Preceding valid tool
 evidence may remain in the working snapshot; old snapshots stay immutable. Caller
 side effects and orphan append-only preparation records are not rolled back.
 Discard the live loop after an arbitrary callback panic. See the
-[transaction boundary](../README.md#transactional-child-preparation-and-callback-failures).
+[transaction boundary](../docs/history-reference.md#transactional-child-preparation-and-callback-failures).
 
 ### Feedback and shared-path resumption
 
@@ -222,8 +235,11 @@ Stores retain local writes/cached loads; deep path copying can have quadratic
 write volume. Pending requests/partial tuples are not persisted, so tools restart
 on replay: this is not in-flight crash recovery. Invalid completions remain
 correctable, including nested routes. `stats.depth` includes reused turns;
-`split_depth` is local to the new execution. See the
-[shared design and limitations](../README.md#immutable-recorded-history-and-incremental-replay).
+`split_depth` is local to the new execution. Current subagents use one configured
+reserved tool; independent child-cache lookup across changed parent prompts is
+not implemented. Dedicated asset/publication APIs, DAG scheduling, and UI are not
+implemented. See the
+[shared design and limitations](../docs/history-reference.md#immutable-recorded-history-and-incremental-replay).
 
 See `tests/loop.rs`, `tests/history.rs`, `tests/history_foundation.rs`,
 `tests/request_routing.rs` and `tests/feedback.rs` for
