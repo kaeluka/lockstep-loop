@@ -59,7 +59,7 @@ def state(loop):
             for b in loop._partition
         ),
         tuple((key, state(link.child)) for key, link in loop._children.items()),
-        tuple((key, child._id_prefix) for key, child in loop._child_ids.items()),
+        tuple((key, link.child._id_prefix) for key, link in loop._child_ids.items()),
         loop.outstanding_llm,
         loop.outstanding_tool,
         loop.error,

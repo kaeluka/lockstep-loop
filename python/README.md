@@ -227,9 +227,14 @@ fulfilled or its ordinary requests are queued. A callback exception preserves th
 pending request, history root, queues/routes, branch messages/steps and counters;
 retry with a corrected completion. This also covers callbacks reached by a tool
 completion, nested child rollup or polling cached work. Commit uses the prepared
-children without rerunning factories. Python stages mutable runtime builders while
-sharing immutable records and opaque payloads. Caller side effects, warmed loader
-caches and unreachable append-only records are not rolled back. Explicit terminal
+children without rerunning factories. An undo journal touches only affected
+builders/entries, sharing immutable history and retaining partition/final entries;
+there is no whole-execution, sibling, or historical-message copying. Queue pulls
+and `done` checks with no rollup work do not visit conversations. Child history
+links are maintained incrementally, so `history` does not flush mutable state.
+Callbacks may read it reentrantly and see only the committed pre-transition root;
+reentrant advancement is rejected. Caller side effects, warmed loader caches and
+unreachable append-only records are not rolled back. Explicit terminal
 failures, such as `FeedbackResolutionError`, retain their cancellation semantics.
 See the [transaction boundary](../README.md#transactional-child-preparation-and-callback-failures).
 
@@ -245,6 +250,18 @@ or changing noncolliding labels. Assets/DAG scheduling/UI remain out of scope.
 See the [shared design and limitations](../README.md#immutable-recorded-history-and-incremental-replay).
 
 ## Development
+
+Non-timing guards in `tests/test_transition_cost.py` check that individual serving
+operations do not traverse/copy sibling or historical conversations. To reproduce
+the shared-tool-call / all-distinct-results / immediate-final-answer workload:
+
+```sh
+PYTHONPATH=src python benchmarks/split_completion.py --repeats 3
+```
+
+This reports 100/400/1000-environment timings including construction and the plain
+`while not loop.done: next_request(); complete(...)` serving loop. Result validation
+is outside the timer. Recording is disabled, and no external executors are used.
 
 From this `python/` directory:
 

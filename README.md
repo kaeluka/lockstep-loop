@@ -226,15 +226,35 @@ its ordinary tool requests. A mixed ordinary/valid-child/invalid-child turn cann
 leave a partially issued investigation. Successful prepared children are used
 directly: factories are not called again at commit.
 
-Python stages mutable execution builders across the whole advancement, including
-nested completion routing, parent rollup, and replay entered after a tool tuple.
-A callback exception leaves the root, queues/routes, messages/steps, issue counters
-and pending requests unchanged. Correct the completion or callback and retry the
+Python journals only the **touched** builders, scalar fields and container entries
+across an advancement, including nested completion routing, parent rollup, and
+replay entered after a tool tuple. It does not clone executions, sibling branches,
+finalized conversations, or message lists. Immutable history is shared, and the
+partition/final lists retain their existing entries. A no-rollup `done` check and
+queue pull do not visit conversations; materializing the final result still
+necessarily visits its partition.
+
+A callback exception restores the root, queues/routes, messages/steps, issue
+counters and pending requests. Correct the completion or callback and retry the
 same pending request. Polling (`next_request`, `done`, `result`) can also advance
-cached children and has the same exception guarantee. Closed history and opaque
-payloads are shared, not deep-copied; staging copies mutable runtime builders.
-Explicit stored terminal failures (such as feedback resolution misses) still
-commit their documented cancellation rather than leaving work pending.
+cached children and has the same exception guarantee. Child serving order is
+restored on rollback without cloning children. Explicit stored terminal failures
+(such as feedback resolution misses) still commit their documented cancellation.
+
+Child history roots are linked incrementally during transitions. The `history`
+property is a read of the **committed** immutable root, not an operation that
+flushes working child state. A callback may inspect it reentrantly: it sees the
+pre-transition root until success, never a partially updated root that might
+roll back. Reentrant advancement from callbacks is rejected.
+
+Python's structural cost tests forbid traversing/copying sibling and historical
+conversation containers during single pulls/completions (with and without
+recording), without relying on timing thresholds. The split/finalize workload can
+also be measured from `python/` (100/400/1000 environments, no recording):
+
+```sh
+PYTHONPATH=src python benchmarks/split_completion.py --repeats 3
+```
 
 Rust reports library-detected nested incompatibility as `IncompatibleHistory`,
 not a panic. A constructor rejects it directly; a later transition enters the

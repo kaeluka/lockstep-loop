@@ -31,7 +31,6 @@ from __future__ import annotations
 import threading
 from collections import deque
 from collections.abc import Callable, Generator, Hashable, Mapping, Sequence
-from copy import copy
 from dataclasses import dataclass, field, replace
 from typing import Any, Generic, Literal, Protocol, TypeAlias, TypeVar, cast, overload
 
@@ -52,6 +51,7 @@ from .history import (
 #: Conversation payload type: message content, tool results, final answers.
 P = TypeVar("P")
 _R = TypeVar("_R")
+_T = TypeVar("_T")
 
 #: Covariant variant for the ``Tool`` protocol (P only appears in return position).
 P_co = TypeVar("P_co", covariant=True)
@@ -326,13 +326,119 @@ class _Branch(Generic[P]):
     """tool_call_id -> (env_id -> result) for the current assistant turn."""
 
 
-@dataclass
+@dataclass(frozen=True)
 class _ChildLink(Generic[P]):
     """A parent branch suspended on a spawned child loop."""
 
     child: BatchLoop[P]
     branch_id: str
     call: ToolCall
+    ordinal: int
+
+
+class _Transition(Generic[P]):
+    """Undo only touched builders/entries; never copy an execution or its history.
+
+    One journal follows a completion through nested routing and parent rollup.
+    Until commit, public history reads return the pre-transition immutable root.
+    """
+
+    def __init__(self) -> None:
+        self.undo: list[Callable[[], None]] = []
+        self.loops: list[BatchLoop[P]] = []
+        self.roots: dict[int, History[P] | None] = {}
+        self.branches: set[int] = set()
+        self.removed_children: dict[int, BatchLoop[P]] = {}
+
+    def attach(self, loop: BatchLoop[P]) -> None:
+        if loop._transaction is self:
+            return
+        assert loop._transaction is None
+        loop._transaction = self
+        self.loops.append(loop)
+
+    def watch_loop(self, loop: BatchLoop[P]) -> None:
+        if id(loop) in self.roots:
+            return
+        self.roots[id(loop)] = loop._recorded
+        before = (
+            loop._recorded,
+            loop._seq,
+            loop._next_branch,
+            loop._next_child,
+            loop._out_llm,
+            loop._out_tool,
+            loop._feedback,
+            loop._resolve_only,
+            loop._resolution_base,
+            loop._error,
+        )
+
+        def restore() -> None:
+            (
+                loop._recorded,
+                loop._seq,
+                loop._next_branch,
+                loop._next_child,
+                loop._out_llm,
+                loop._out_tool,
+                loop._feedback,
+                loop._resolve_only,
+                loop._resolution_base,
+                loop._error,
+            ) = before
+
+        self.undo.append(restore)
+
+    def watch_branch(self, branch: _Branch[P]) -> None:
+        if id(branch) in self.branches:
+            return
+        self.branches.add(id(branch))
+        # Messages only append, or are replaced with a new list on refinement.
+        # Results dictionaries are likewise replaced, never edited in place.
+        before = (
+            branch.messages,
+            branch.steps,
+            branch.history_path,
+            branch.final_content,
+            branch.turn_calls,
+            branch.turn_results,
+        )
+        length = len(branch.messages)
+
+        def restore() -> None:
+            (
+                branch.messages,
+                branch.steps,
+                branch.history_path,
+                branch.final_content,
+                branch.turn_calls,
+                branch.turn_results,
+            ) = before
+            del branch.messages[length:]
+
+        self.undo.append(restore)
+
+    def rollback(self) -> None:
+        for restore in reversed(self.undo):
+            restore()
+        # Child iteration order is serving order. Restoring deleted dict entries
+        # alone would move them to the end. Reorder references ONLY on rollback,
+        # using internal invocation ordinals (never provider IDs).
+        for loop in self.removed_children.values():
+            ordered = sorted(loop._children.items(), key=lambda item: item[1].ordinal)
+            loop._children.clear()
+            loop._children.update(ordered)
+
+    def close(self) -> None:
+        for loop in self.loops:
+            loop._transaction = None
+        self.undo.clear()
+        self.loops.clear()
+        # Keep the immutable root anchors until this journal itself is released:
+        # an inspection may already hold a reference to it while we detach loops.
+        self.branches.clear()
+        self.removed_children.clear()
 
 
 class BatchLoop(Generic[P]):
@@ -462,10 +568,11 @@ class BatchLoop(Generic[P]):
         )
         self._budget = budget
         self._children: dict[str, _ChildLink[P]] = {}
-        self._child_ids: dict[str, BatchLoop[P]] = {}
+        self._child_ids: dict[str, _ChildLink[P]] = {}
 
-        self._lock = threading.Lock()
-        self._staged = False
+        self._lock = threading.RLock()
+        self._transaction: _Transition[P] | None = None
+        self._advancing = False
         self._seq = 0
         self._branches: dict[str, _Branch[P]] = {}
         self._partition: list[_Branch[P]] = []  # legacy per-run partition summary
@@ -488,7 +595,7 @@ class BatchLoop(Generic[P]):
         )
         self._branches[root.branch_id] = root
         self._partition.append(root)
-        self._request_llm(root)
+        self._run_atomic(lambda: self._request_llm(root))
         if not _defer_failure:
             self._raise_if_failed()
 
@@ -509,9 +616,8 @@ class BatchLoop(Generic[P]):
         Separate consumer modules can each pull their own kind; an LLM pool
         and a tool executor never see each other's requests.
         """
-        with self._lock:
-            if not self._staged:
-                return self._run_atomic(lambda staged: staged.next_request(kind))
+
+        def advance() -> Request[P] | None:
             self._rollup_children()
             if self._error is not None:
                 return None
@@ -519,19 +625,26 @@ class BatchLoop(Generic[P]):
             if req is not None:
                 return req
             if kind == "llm":
-                request: Request[P] | None = self._ready_llm.popleft() if self._ready_llm else None
+                request: Request[P] | None = (
+                    self._popleft(self._ready_llm) if self._ready_llm else None
+                )
             elif kind == "tool":
-                request = self._ready_tool.popleft() if self._ready_tool else None
+                request = self._popleft(self._ready_tool) if self._ready_tool else None
             else:
                 request = self._pop_any()
             if request is None:
                 return None
-            self._outstanding[request.request_id] = request
+            self._put(self._outstanding, request.request_id, request)
+            self._watch_loop()
             if isinstance(request, LlmRequest):
                 self._out_llm += 1
             else:
                 self._out_tool += 1
             return request
+
+        with self._lock:
+            # Without child rollup this is only a FIFO pull: no caller code runs.
+            return self._run_atomic(advance, journal=bool(self._children))
 
     def complete(self, completion: Completion[P]) -> None:
         """Deliver a result for an outstanding request.
@@ -546,23 +659,24 @@ class BatchLoop(Generic[P]):
         failures instead cancel pending work and result() raises their error.
         Caller side effects and unreachable append-only store writes are not rolled back.
         """
-        with self._lock:
-            if not self._staged:
-                return self._run_atomic(lambda staged: staged.complete(completion))
+
+        def advance() -> None:
             self._raise_if_failed()
-            child = self._child_ids.get(completion.request_id)
-            if child is not None:
+            link = self._child_ids.get(completion.request_id)
+            if link is not None:
+                child = link.child
                 # A child final answer becomes a parent tool output. Validate its
                 # grouping contract before fulfilling the child's final request.
                 if isinstance(completion, LlmCompletion) and not completion.tool_calls:
                     hash(self._group_by(completion.content))
                 try:
-                    child.complete(completion)
+                    self._in_child(link, lambda child: child.complete(completion))
                 except (FeedbackResolutionError, InvalidHistoryError):
                     if child.error is not None:
                         self._fail(child.error)
                     raise
-                del self._child_ids[completion.request_id]
+                self._delete(self._child_ids, completion.request_id)
+                self._watch_loop()
                 if isinstance(completion, LlmCompletion):
                     self._out_llm -= 1
                 else:
@@ -583,7 +697,8 @@ class BatchLoop(Generic[P]):
                     raise ValueError("duplicate tool call id in one assistant turn")
                 self._handle_llm(request, completion)
                 self._raise_if_failed()
-                del self._outstanding[completion.request_id]
+                self._delete(self._outstanding, completion.request_id)
+                self._watch_loop()
                 self._out_llm -= 1
             else:
                 if not isinstance(completion, ToolCompletion):
@@ -592,68 +707,89 @@ class BatchLoop(Generic[P]):
                     )
                 self._handle_tool(request, completion)
                 self._raise_if_failed()
-                del self._outstanding[completion.request_id]
+                self._delete(self._outstanding, completion.request_id)
+                self._watch_loop()
                 self._out_tool -= 1
 
-    def _fork_runtime(self) -> BatchLoop[P]:
-        """Stage mutable builders only; immutable facts/payloads remain shared.
+        with self._lock:
+            self._run_atomic(advance)
 
-        A completion can finish a child, refine its parent, then replay more
-        assistant turns. All those transitions belong to the same transaction.
-        """
-        staged = copy(self)
-        staged._lock = threading.Lock()
-        staged._staged = True
-        branches = {
-            id(b): replace(
-                b,
-                messages=list(b.messages),
-                turn_results={call: dict(values) for call, values in b.turn_results.items()},
-            )
-            for b in self._partition
-        }
-        staged._partition = [branches[id(b)] for b in self._partition]
-        staged._branches = {key: branches[id(b)] for key, b in self._branches.items()}
-        staged._finals = [branches[id(b)] for b in self._finals]
-        staged._ready_llm = deque(self._ready_llm)
-        staged._ready_tool = deque(self._ready_tool)
-        staged._outstanding = dict(self._outstanding)
-        staged._children = {
-            key: replace(link, child=link.child._fork_runtime())
-            for key, link in self._children.items()
-        }
-        children = {
-            id(link.child): staged._children[key].child for key, link in self._children.items()
-        }
-        staged._child_ids = {key: children[id(child)] for key, child in self._child_ids.items()}
-        return staged
-
-    def _end_staging(self) -> None:
-        self._staged = False
-        for link in self._children.values():
-            link.child._end_staging()
-
-    def _adopt_runtime(self, staged: BatchLoop[P]) -> None:
-        # Publishing prepared builders invokes no caller callbacks. Retain the
-        # original lock, including threads already waiting on that exact lock.
-        staged._end_staging()
-        self.__dict__.update(
-            {key: value for key, value in staged.__dict__.items() if key != "_lock"}
-        )
-
-    def _run_atomic(self, action: Callable[[BatchLoop[P]], _R]) -> _R:
-        staged = self._fork_runtime()
+    def _run_atomic(self, action: Callable[[], _R], *, journal: bool = True) -> _R:
+        if self._advancing:
+            raise RuntimeError("callbacks may inspect history, but must not reenter advancement")
+        self._advancing = True
         try:
-            result = action(staged)
-        except (FeedbackResolutionError, InvalidHistoryError):
-            # Explicit terminal failures are committed cancellations, not failed
-            # validation. Callback exceptions without a stored error are retriable.
-            if staged._error is not None:
-                self._adopt_runtime(staged)
-            raise
-        # All other exceptions discard staged runtime; append-only store writes
-        # and callback side effects are not rolled back or replayed at commit.
-        self._adopt_runtime(staged)
+            if self._transaction is not None or not journal:
+                # A child participates in its parent's journal; pure queue/state
+                # operations at the root need no undo log at all.
+                return action()
+            transaction: _Transition[P] = _Transition()
+            transaction.attach(self)
+            try:
+                return action()
+            except (FeedbackResolutionError, InvalidHistoryError):
+                # Explicit terminal failures commit cancellation; exceptions raised
+                # by caller code without a stored loop error remain recoverable.
+                if self._error is None:
+                    transaction.rollback()
+                raise
+            except BaseException:
+                transaction.rollback()
+                raise
+            finally:
+                transaction.close()
+        finally:
+            self._advancing = False
+
+    def _watch_loop(self) -> None:
+        if self._transaction is not None:
+            self._transaction.watch_loop(self)
+
+    def _watch_branch(self, branch: _Branch[P]) -> None:
+        if self._transaction is not None:
+            self._transaction.watch_branch(branch)
+
+    def _put(self, mapping: dict[str, _T], key: str, value: _T) -> None:
+        if self._transaction is not None:
+            existed = key in mapping
+            old = mapping.get(key)
+
+            def restore() -> None:
+                if existed:
+                    mapping[key] = cast(_T, old)
+                else:
+                    del mapping[key]
+
+            self._transaction.undo.append(restore)
+        mapping[key] = value
+
+    def _delete(self, mapping: dict[str, _T], key: str) -> None:
+        old = mapping.pop(key)
+        if self._transaction is not None:
+            self._transaction.undo.append(lambda: mapping.__setitem__(key, old))
+
+    def _append(self, values: list[_T] | deque[_T], value: _T) -> None:
+        values.append(value)
+        if self._transaction is not None:
+
+            def restore() -> None:
+                values.pop()
+
+            self._transaction.undo.append(restore)
+
+    def _popleft(self, values: deque[_T]) -> _T:
+        value = values.popleft()
+        if self._transaction is not None:
+            self._transaction.undo.append(lambda: values.appendleft(value))
+        return value
+
+    def _in_child(self, link: _ChildLink[P], action: Callable[[BatchLoop[P]], _R]) -> _R:
+        if self._transaction is not None:
+            self._transaction.attach(link.child)
+        before = link.child._recorded
+        result = action(link.child)
+        if link.child._error is None and link.child._recorded is not before:
+            self._sync_child_history(link)
         return result
 
     @property
@@ -667,23 +803,53 @@ class BatchLoop(Generic[P]):
             raise self._error
 
     def _fail(self, error: _ExecutionError) -> None:
+        self._watch_loop()
+        if self._transaction is not None:
+            before = (
+                self._ready_llm,
+                self._ready_tool,
+                self._outstanding,
+                self._child_ids,
+                self._children,
+                self._branches,
+                self._finals,
+            )
+
+            def restore() -> None:
+                (
+                    self._ready_llm,
+                    self._ready_tool,
+                    self._outstanding,
+                    self._child_ids,
+                    self._children,
+                    self._branches,
+                    self._finals,
+                ) = before
+
+            self._transaction.undo.append(restore)
         self._error = error
         if self._resolution_base is not None:
             self._recorded = self._resolution_base
-        self._ready_llm.clear()
-        self._ready_tool.clear()
-        self._outstanding.clear()
-        self._child_ids.clear()
-        self._children.clear()
-        self._branches.clear()
-        self._finals.clear()
+        self._ready_llm = deque()
+        self._ready_tool = deque()
+        self._outstanding = {}
+        self._child_ids = {}
+        self._children = {}
+        self._branches = {}
+        self._finals = []
         self._out_llm = self._out_tool = 0
 
     @property
     def history(self) -> History[P] | None:
-        """Capture an immutable, structurally shared root, including fulfilled turns."""
+        """Capture the committed immutable root, even during a caller callback.
+
+        Child roots are linked incrementally on advancement, not by this getter.
+        A reentrant read must never expose a root that might still roll back.
+        """
         with self._lock:
-            self._sync_child_histories()
+            transaction = self._transaction
+            if transaction is not None:
+                return transaction.roots.get(id(self), self._recorded)
             return self._recorded
 
     def append_user_message(self, content: P) -> History[P]:
@@ -695,6 +861,10 @@ class BatchLoop(Generic[P]):
         enforce replay-only resolution before resumption. No endpoint ID exists.
         """
         with self._lock:
+            if self._advancing:
+                raise RuntimeError(
+                    "callbacks may inspect history, but must not reenter advancement"
+                )
             self._raise_if_failed()
             if self._recorded is None or len(self._finals) != 1 or self._branches:
                 raise ValueError("resolve a recorded single-environment run first")
@@ -715,22 +885,28 @@ class BatchLoop(Generic[P]):
 
     def _set_history_node(self, path: _HistoryPath, node: HistoryNode[P]) -> None:
         assert self._recorded is not None
+        self._watch_loop()
         self._recorded = self._recorded._replace_node(path, node)
 
     @property
     def done(self) -> bool:
         """True on success or terminal failure; result() raises on failure."""
-        with self._lock:
-            if not self._staged:
-                return self._run_atomic(lambda staged: staged.done)
+
+        def advance() -> bool:
             self._rollup_children()
-            return (
-                not self._ready_llm
-                and not self._ready_tool
-                and not self._outstanding
-                and not self._child_ids
-                and not self._children
-            )
+            return self._quiescent()
+
+        with self._lock:
+            return self._run_atomic(advance, journal=bool(self._children))
+
+    def _quiescent(self) -> bool:
+        return (
+            not self._ready_llm
+            and not self._ready_tool
+            and not self._outstanding
+            and not self._child_ids
+            and not self._children
+        )
 
     @property
     def outstanding_llm(self) -> int:
@@ -756,9 +932,8 @@ class BatchLoop(Generic[P]):
         Raises RuntimeError unless the loop is done, or the stored terminal
         execution error when resolution failed. No partial revised result is published.
         """
-        with self._lock:
-            if not self._staged:
-                return self._run_atomic(lambda staged: staged.result())
+
+        def advance() -> BatchResult[P]:
             self._rollup_children()
             self._raise_if_failed()
             if not (
@@ -771,14 +946,23 @@ class BatchLoop(Generic[P]):
                 raise RuntimeError("the loop is not done")
             return self._finalize()
 
+        with self._lock:
+            return self._run_atomic(advance)
+
     # -- internals (all called with self._lock held) --
 
     def _pop_children(self, kind: Literal["any", "llm", "tool"]) -> Request[P] | None:
         """Pull one request from a live child loop (children first)."""
         for link in self._children.values():
-            req: Request[P] | None = link.child.next_request(kind)
+            child = link.child
+            if not child._children and not (
+                (kind != "tool" and child._ready_llm) or (kind != "llm" and child._ready_tool)
+            ):
+                continue
+            req = self._in_child(link, lambda child: child.next_request(kind))
             if req is not None:
-                self._child_ids[req.request_id] = link.child
+                self._put(self._child_ids, req.request_id, link)
+                self._watch_loop()
                 if isinstance(req, LlmRequest):
                     self._out_llm += 1
                 else:
@@ -786,47 +970,59 @@ class BatchLoop(Generic[P]):
                 return req
         return None
 
-    def _sync_child_histories(self) -> None:
+    def _sync_child_history(self, link: _ChildLink[P]) -> None:
         if self._recorded is None:
             return
-        for link in self._children.values():
-            history = link.child.history
-            assert history is not None
-            branch = self._branches[link.branch_id]
-            node = self._recorded._node(branch.history_path)
-            entries = list(node.subagents)
-            index = next((i for i, e in enumerate(entries) if e.call_id == link.call.id), None)
-            entry = SubagentHistory(link.call.id, history.descriptor)
-            if index is None:
-                entries.append(entry)
-            elif entries[index].history.root == history.descriptor.root:
-                continue
-            else:
-                entries[index] = entry
-            self._set_history_node(branch.history_path, replace(node, subagents=tuple(entries)))
+        # Internal transition code uses the working child root. Public history
+        # reads deliberately return the committed root while a journal is active.
+        history = link.child._recorded
+        assert history is not None
+        branch = self._branches[link.branch_id]
+        node = self._recorded._node(branch.history_path)
+        entries = list(node.subagents)
+        index = next((i for i, e in enumerate(entries) if e.call_id == link.call.id), None)
+        entry = SubagentHistory(link.call.id, history.descriptor)
+        if index is None:
+            entries.append(entry)
+        elif entries[index].history.root == history.descriptor.root:
+            return
+        else:
+            entries[index] = entry
+        self._set_history_node(branch.history_path, replace(node, subagents=tuple(entries)))
 
     def _rollup_children(self) -> None:
         """Fold finished children into their parent's suspended branch."""
-        while self._error is None:
-            finished = [(key, link) for key, link in self._children.items() if link.child.done]
-            for _, link in finished:
-                if link.child.error is not None:
-                    self._fail(link.child.error)
+        while self._children and self._error is None:
+            finished = []
+            for key, link in self._children.items():
+                # Leaf polling cannot advance anything. Do not journal or visit
+                # that child's conversations just to inspect its queue state.
+                done = (
+                    self._in_child(link, lambda child: child.done)
+                    if link.child._children
+                    else link.child._quiescent()
+                )
+                if link.child._error is not None:
+                    self._fail(link.child._error)
                     return
-            self._sync_child_histories()
+                if done:
+                    finished.append((key, link))
             if not finished:
                 return
             for key, link in finished:
                 branch = self._branches[link.branch_id]
-                results = dict(link.child.result().results)
+                results = dict(self._in_child(link, lambda child: child.result()).results)
                 candidate = {**branch.turn_results, link.call.id: results}
                 plan = (
                     self._plan_turn(branch, candidate)
                     if len(candidate) == len(branch.turn_calls)
                     else None
                 )
+                self._watch_branch(branch)
                 branch.turn_results = candidate
-                del self._children[key]
+                if self._transaction is not None:
+                    self._transaction.removed_children[id(self)] = self
+                self._delete(self._children, key)
                 if plan is not None:
                     self._advance_turn(branch, plan)
                     if self._error is not None:
@@ -838,7 +1034,7 @@ class BatchLoop(Generic[P]):
         return self._subagent is not None and call.name == self._subagent.name
 
     def _prepare_child(
-        self, branch: _Branch[P], call: ToolCall, child_key: str
+        self, branch: _Branch[P], call: ToolCall, child_key: str, ordinal: int
     ) -> _ChildLink[P] | _ExecutionError:
         """Build once; distinguish detected failure from an exception in caller code."""
         sub = self._subagent
@@ -874,20 +1070,21 @@ class BatchLoop(Generic[P]):
         )
         if child._error is not None:
             return child._error
-        return _ChildLink(child=child, branch_id=branch.branch_id, call=call)
+        return _ChildLink(child=child, branch_id=branch.branch_id, call=call, ordinal=ordinal)
 
     def _pop_any(self) -> Request[P] | None:
         llm_head = self._ready_llm[0] if self._ready_llm else None
         tool_head = self._ready_tool[0] if self._ready_tool else None
         if llm_head is None:
-            return self._ready_tool.popleft() if self._ready_tool else None
+            return self._popleft(self._ready_tool) if self._ready_tool else None
         if tool_head is None:
-            return self._ready_llm.popleft()
+            return self._popleft(self._ready_llm)
         if llm_head.stats.seq <= tool_head.stats.seq:
-            return self._ready_llm.popleft()
-        return self._ready_tool.popleft()
+            return self._popleft(self._ready_llm)
+        return self._popleft(self._ready_tool)
 
     def _stats_for(self, branch: _Branch[P]) -> RequestStats:
+        self._watch_loop()
         self._seq += 1
         return RequestStats(
             depth=branch.steps,
@@ -896,9 +1093,10 @@ class BatchLoop(Generic[P]):
         )
 
     def _finish(self, branch: _Branch[P], content: P) -> None:
+        self._watch_branch(branch)
         branch.final_content = content
-        del self._branches[branch.branch_id]
-        self._finals.append(branch)
+        self._delete(self._branches, branch.branch_id)
+        self._append(self._finals, branch)
 
     def _request_llm(self, branch: _Branch[P]) -> None:
         if self._error is not None:
@@ -932,7 +1130,8 @@ class BatchLoop(Generic[P]):
             )
             return
         stats = self._stats_for(branch)
-        self._ready_llm.append(
+        self._append(
+            self._ready_llm,
             LlmRequest(
                 request_id=f"{self._id_prefix}llm-{stats.seq}",
                 branch_id=branch.branch_id,
@@ -940,19 +1139,20 @@ class BatchLoop(Generic[P]):
                 messages=tuple(branch.messages),
                 tools=self._specs,
                 stats=stats,
-            )
+            ),
         )
 
     def _request_tool(self, branch: _Branch[P], call: ToolCall) -> None:
         stats = self._stats_for(branch)
-        self._ready_tool.append(
+        self._append(
+            self._ready_tool,
             ToolRequest(
                 request_id=f"{self._id_prefix}tool-{stats.seq}",
                 branch_id=branch.branch_id,
                 tool_call=call,
                 env_ids=branch.env_ids,
                 stats=stats,
-            )
+            ),
         )
 
     def _handle_llm(self, request: LlmRequest[P], completion: LlmCompletion[P]) -> None:
@@ -973,11 +1173,12 @@ class BatchLoop(Generic[P]):
                 # children, or enqueue its ordinary calls either.
                 next_child += 1
                 key = f"sub:{next_child}/"
-                child = self._prepare_child(branch, call, key)
+                child = self._prepare_child(branch, call, key, next_child)
                 if isinstance(child, (FeedbackResolutionError, InvalidHistoryError)):
                     self._fail(child)
                     return False
                 prepared[call.id] = (key, child)
+        self._watch_branch(branch)
         if self._recorded is not None:
             node = self._recorded._node(branch.history_path)
             self._set_history_node(
@@ -1012,11 +1213,13 @@ class BatchLoop(Generic[P]):
             return False
         branch.turn_calls = message.tool_calls
         branch.turn_results = {}
+        self._watch_loop()
         self._next_child = next_child
         for call in message.tool_calls:
             if call.id in prepared:
                 key, link = prepared[call.id]
-                self._children[key] = link
+                self._put(self._children, key, link)
+                self._sync_child_history(link)
             else:
                 self._request_tool(branch, call)
         return False
@@ -1036,6 +1239,7 @@ class BatchLoop(Generic[P]):
         plan = None
         if len(candidate) == len(branch.turn_calls):
             plan = self._plan_turn(branch, candidate)
+        self._watch_branch(branch)
         branch.turn_results = candidate
         if plan is not None:
             self._advance_turn(branch, plan)
@@ -1117,6 +1321,7 @@ class BatchLoop(Generic[P]):
                     messages, branch.turn_calls, branch.turn_results, envs[0]
                 )
             if split:
+                self._watch_loop()
                 self._next_branch += 1
                 label = f"b{self._next_branch}"
                 child: _Branch[P] = _Branch(
@@ -1129,8 +1334,8 @@ class BatchLoop(Generic[P]):
                     steps=branch.steps,
                     history_path=path,
                 )
-                self._branches[child.branch_id] = child
-                self._partition.append(child)
+                self._put(self._branches, child.branch_id, child)
+                self._append(self._partition, child)
                 self._request_llm(child)
             else:
                 branch.messages = messages
@@ -1141,7 +1346,7 @@ class BatchLoop(Generic[P]):
             if self._error is not None:
                 return
         if split:
-            del self._branches[branch.branch_id]
+            self._delete(self._branches, branch.branch_id)
 
     @staticmethod
     def _append_tool_messages(
