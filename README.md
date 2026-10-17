@@ -141,10 +141,9 @@ by exact namespace/index equality; hashes/debug strings never substitute for
 record or observation equality.
 
 Loaders are synchronous and must resolve valid immutable records without
-re-entering the store. Missing/corrupt records, loader exceptions/panics and
-contract-violating callbacks are fatal infrastructure/configuration errors:
-discard that execution and retry from a saved descriptor with a healthy loader.
-They are not a transactional storage-recovery protocol. Arbitrary imported graphs
+re-entering the store. Missing/corrupt records and loader exceptions/panics are
+infrastructure failures: retry from a saved descriptor with a healthy loader.
+Runtime transaction guarantees below are not a storage-recovery protocol. Arbitrary imported graphs
 are not validated; restore valid snapshots from this version. No stable
 cross-language/version wire format is promised. Stores currently retain all
 writes and loaded records; no eviction/GC is built in. Path copying can produce
@@ -218,6 +217,36 @@ nested investigations replay during resolution, and new subagents can run after
 injection. There is no crash-safe exactly-once claim: “once” is per live operation.
 Independent feedback snapshots are not automatically reconciled. Assets, DAG
 scheduling and UI remain out of scope.
+
+### Transactional child preparation and callback failures
+
+Both implementations prepare **all** child prompts, materialized specs and child
+constructors before fulfilling an assistant turn, recording its message, or issuing
+its ordinary tool requests. A mixed ordinary/valid-child/invalid-child turn cannot
+leave a partially issued investigation. Successful prepared children are used
+directly: factories are not called again at commit.
+
+Python stages mutable execution builders across the whole advancement, including
+nested completion routing, parent rollup, and replay entered after a tool tuple.
+A callback exception leaves the root, queues/routes, messages/steps, issue counters
+and pending requests unchanged. Correct the completion or callback and retry the
+same pending request. Polling (`next_request`, `done`, `result`) can also advance
+cached children and has the same exception guarantee. Closed history and opaque
+payloads are shared, not deep-copied; staging copies mutable runtime builders.
+Explicit stored terminal failures (such as feedback resolution misses) still
+commit their documented cancellation rather than leaving work pending.
+
+Rust reports library-detected nested incompatibility as `IncompatibleHistory`,
+not a panic. A constructor rejects it directly; a later transition enters the
+normal terminal error state with no half-started assistant turn or stranded
+requests. Validated preceding tool evidence may already be recorded, but no
+partial result is returned. Arbitrary Rust callback panics are **not** recovered;
+discard the live loop if one occurs.
+
+Neither language rolls back caller side effects or append-only store allocations.
+Preparation/staging may leave unreachable records and warmed loader caches; only
+the published snapshot root defines fulfilled history. Retried operations may
+call factories again after a failure. Callbacks must not mutate borrowed payloads.
 
 ### Other limits
 

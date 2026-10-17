@@ -221,6 +221,18 @@ There is no automatic rewriting/classification, scope switch or environment
 binding. Budgets remain rejected for recorded execution, including both resolution
 and the new continuation. “Once” is per live operation, not crash-safe publication.
 
+**Transactional callback preparation:** all child prompt/spec factories (including
+spec iterators) and child constructors run before the parent assistant turn is
+fulfilled or its ordinary requests are queued. A callback exception preserves the
+pending request, history root, queues/routes, branch messages/steps and counters;
+retry with a corrected completion. This also covers callbacks reached by a tool
+completion, nested child rollup or polling cached work. Commit uses the prepared
+children without rerunning factories. Python stages mutable runtime builders while
+sharing immutable records and opaque payloads. Caller side effects, warmed loader
+caches and unreachable append-only records are not rolled back. Explicit terminal
+failures, such as `FeedbackResolutionError`, retain their cancellation semantics.
+See the [transaction boundary](../README.md#transactional-child-preparation-and-callback-failures).
+
 **Limits:** direct `BatchLoop` only; recording still rejects budgets. No core
 storage I/O, async loader, eviction/GC, independent-root merge, or crash recovery.
 Stores retain local writes and cached loads; deep path copying can have quadratic

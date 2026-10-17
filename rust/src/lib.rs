@@ -683,9 +683,11 @@ where
     }
 
     /// Deliver a completion for any outstanding root or nested request.
-    /// Validation errors leave pending requests correctable. A resolution miss or
-    /// invalid user continuation is instead terminal: pending work is cancelled,
-    /// is_done() becomes true, and result()/error() report the stored failure.
+    /// Validation errors leave pending requests correctable. Child factories and
+    /// constructors prepare once before the assistant turn is fulfilled. Detected
+    /// nested incompatibility, a resolution miss, or invalid user continuation is
+    /// terminal: pending work is cancelled, is_done() becomes true, and result()/
+    /// error() report the failure. Arbitrary callback panics are not recovered.
     pub fn complete(&mut self, completion: Completion<P>) -> Result<(), LoopError> {
         if let Some(error) = &self.error {
             return Err(error.clone());
@@ -715,7 +717,6 @@ where
             .cloned()
             .ok_or_else(|| LoopError::UnknownRequest(request_id.clone()))?;
         self.validate_completion(&request, &completion)?;
-        self.outstanding.remove(&request_id);
 
         match (request, completion) {
             (Request::Llm(request), Completion::Llm(completion)) => {
@@ -726,6 +727,7 @@ where
             }
             _ => unreachable!("completion kind was validated"),
         }
+        self.outstanding.remove(&request_id);
         self.error.clone().map_or(Ok(()), Err)
     }
 
@@ -1065,8 +1067,9 @@ where
     fn handle_llm(&mut self, request: LlmRequest<P>, completion: LlmCompletion<P>) {
         let branch = self
             .branches
-            .remove(&request.branch_id)
-            .expect("LLM request must reference an active branch");
+            .get(&request.branch_id)
+            .expect("LLM request must reference an active branch")
+            .clone();
         if let Some(branch) = self.accept_assistant(
             branch,
             Message::assistant(completion.content, completion.tool_calls),
@@ -1080,6 +1083,33 @@ where
         mut branch: Branch<P>,
         message: Message<P>,
     ) -> Option<Branch<P>> {
+        // Prepare every child before fulfilling this assistant turn, including
+        // ordinary requests earlier in the same mixed turn. Use these exact
+        // prepared children after commit; never call their factories twice.
+        let mut prepared = IndexMap::new();
+        let mut next_child = self.next_child;
+        for call in &message.tool_calls {
+            if self
+                .subagent
+                .as_ref()
+                .is_some_and(|sub| sub.spec.name == call.name)
+            {
+                next_child = next_child
+                    .checked_add(1)
+                    .expect("child invocation counter exhausted");
+                let key = format!("sub:{next_child}/");
+                match self.prepare_child(&branch, call.clone(), &key) {
+                    Ok(child) => {
+                        prepared.insert(call.id.clone(), (key, child));
+                    }
+                    Err(error) => {
+                        self.fail(error);
+                        return None;
+                    }
+                }
+            }
+        }
+        self.branches.remove(&branch.branch_id);
         if let Some(history) = &mut self.recorded {
             let mut node = history.node(&branch.history_path).as_ref().clone();
             node.assistant.get_or_insert_with(|| message.clone());
@@ -1115,18 +1145,12 @@ where
 
         branch.turn_calls = message.tool_calls;
         branch.turn_results.clear();
+        self.next_child = next_child;
         for call in branch.turn_calls.clone() {
-            if self
-                .subagent
-                .as_ref()
-                .is_some_and(|subagent| call.name == subagent.spec.name)
-            {
-                self.spawn_child(&branch, call);
+            if let Some((key, child)) = prepared.shift_remove(&call.id) {
+                self.children.insert(key, child);
             } else {
                 self.request_tool(&branch, call);
-            }
-            if self.error.is_some() {
-                return None;
             }
         }
         self.branches.insert(branch.branch_id.clone(), branch);
@@ -1152,7 +1176,12 @@ where
         }
     }
 
-    fn spawn_child(&mut self, branch: &Branch<P>, call: ToolCall) {
+    fn prepare_child(
+        &self,
+        branch: &Branch<P>,
+        call: ToolCall,
+        child_key: &str,
+    ) -> Result<ChildLink<P, K>, LoopError> {
         let subagent = self
             .subagent
             .as_ref()
@@ -1181,8 +1210,7 @@ where
                 .as_ref()
                 .is_none_or(|h| h.previous.is_none())
         {
-            self.fail(LoopError::FeedbackResolutionMiss);
-            return;
+            return Err(LoopError::FeedbackResolutionMiss);
         }
         let tool_specs = (subagent.sub_tool_specs)(&branch.env_ids[0])
             .into_iter()
@@ -1197,41 +1225,20 @@ where
             history: history_options,
             feedback: None,
         };
-        // Routing paths contain only internal counters, never opaque provider
-        // call IDs. The counter spans all branches/turns: retired invocations
-        // cannot be confused with later calls, even when their call IDs repeat.
-        self.next_child = self
-            .next_child
-            .checked_add(1)
-            .expect("child invocation counter exhausted");
-        let child_key = format!("sub:{}/", self.next_child);
+        // The locally reserved key uses only internal invocation counters, not
+        // opaque provider IDs, and is published only after all children prepare.
         let child = Self::build(
             config,
             Arc::clone(&self.group_by),
             format!("{}{child_key}", self.id_prefix),
             self.custom_grouping,
             self.resolve_only,
-        );
-        let child = match child {
-            Ok(child) => child,
-            Err(
-                error @ (LoopError::FeedbackResolutionMiss | LoopError::InvalidUserContinuation),
-            ) => {
-                self.fail(error);
-                return;
-            }
-            Err(error) => {
-                panic!("subagent callback violated the recorded compatibility contract: {error}")
-            }
-        };
-        self.children.insert(
-            child_key,
-            ChildLink {
-                child: Box::new(child),
-                branch_id: branch.branch_id.clone(),
-                call,
-            },
-        );
+        )?;
+        Ok(ChildLink {
+            child: Box::new(child),
+            branch_id: branch.branch_id.clone(),
+            call,
+        })
     }
 
     fn advance_turn(&mut self, mut branch: Branch<P>) {

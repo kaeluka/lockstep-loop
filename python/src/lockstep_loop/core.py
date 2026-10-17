@@ -31,6 +31,7 @@ from __future__ import annotations
 import threading
 from collections import deque
 from collections.abc import Callable, Generator, Hashable, Mapping, Sequence
+from copy import copy
 from dataclasses import dataclass, field, replace
 from typing import Any, Generic, Literal, Protocol, TypeAlias, TypeVar, cast, overload
 
@@ -50,6 +51,7 @@ from .history import (
 
 #: Conversation payload type: message content, tool results, final answers.
 P = TypeVar("P")
+_R = TypeVar("_R")
 
 #: Covariant variant for the ``Tool`` protocol (P only appears in return position).
 P_co = TypeVar("P_co", covariant=True)
@@ -388,6 +390,7 @@ class BatchLoop(Generic[P]):
         feedback: Feedback[P] | None = None,
         _id_prefix: str = "",
         _resolve_only: bool = False,
+        _defer_failure: bool = False,
     ) -> None:
         envs = tuple(env_ids)
         if not envs:
@@ -462,6 +465,7 @@ class BatchLoop(Generic[P]):
         self._child_ids: dict[str, BatchLoop[P]] = {}
 
         self._lock = threading.Lock()
+        self._staged = False
         self._seq = 0
         self._branches: dict[str, _Branch[P]] = {}
         self._partition: list[_Branch[P]] = []  # legacy per-run partition summary
@@ -485,7 +489,8 @@ class BatchLoop(Generic[P]):
         self._branches[root.branch_id] = root
         self._partition.append(root)
         self._request_llm(root)
-        self._raise_if_failed()
+        if not _defer_failure:
+            self._raise_if_failed()
 
     @overload
     def next_request(self, kind: Literal["llm"]) -> LlmRequest[P] | None: ...
@@ -505,6 +510,8 @@ class BatchLoop(Generic[P]):
         and a tool executor never see each other's requests.
         """
         with self._lock:
+            if not self._staged:
+                return self._run_atomic(lambda staged: staged.next_request(kind))
             self._rollup_children()
             if self._error is not None:
                 return None
@@ -532,11 +539,16 @@ class BatchLoop(Generic[P]):
         Unknown/answered IDs, duplicate call IDs and invalid environment result
         sets raise ValueError; wrong completion kinds raise TypeError. Validation
         (including tool grouping) runs before fulfillment, leaving pending work
-        recoverable. FeedbackResolutionError/InvalidHistoryError instead indicate
-        terminal execution failure: pending work is cancelled and result() raises
-        the stored error. Caller callbacks must be pure; side effects are not rolled back.
+        recoverable. Child factories/constructors are prepared once before an
+        assistant turn is recorded. Callback exceptions during advancement leave
+        runtime builders, history roots and pending work unchanged; publishing a
+        prepared transition does not rerun callbacks. Explicit stored terminal
+        failures instead cancel pending work and result() raises their error.
+        Caller side effects and unreachable append-only store writes are not rolled back.
         """
         with self._lock:
+            if not self._staged:
+                return self._run_atomic(lambda staged: staged.complete(completion))
             self._raise_if_failed()
             child = self._child_ids.get(completion.request_id)
             if child is not None:
@@ -582,6 +594,67 @@ class BatchLoop(Generic[P]):
                 self._raise_if_failed()
                 del self._outstanding[completion.request_id]
                 self._out_tool -= 1
+
+    def _fork_runtime(self) -> BatchLoop[P]:
+        """Stage mutable builders only; immutable facts/payloads remain shared.
+
+        A completion can finish a child, refine its parent, then replay more
+        assistant turns. All those transitions belong to the same transaction.
+        """
+        staged = copy(self)
+        staged._lock = threading.Lock()
+        staged._staged = True
+        branches = {
+            id(b): replace(
+                b,
+                messages=list(b.messages),
+                turn_results={call: dict(values) for call, values in b.turn_results.items()},
+            )
+            for b in self._partition
+        }
+        staged._partition = [branches[id(b)] for b in self._partition]
+        staged._branches = {key: branches[id(b)] for key, b in self._branches.items()}
+        staged._finals = [branches[id(b)] for b in self._finals]
+        staged._ready_llm = deque(self._ready_llm)
+        staged._ready_tool = deque(self._ready_tool)
+        staged._outstanding = dict(self._outstanding)
+        staged._children = {
+            key: replace(link, child=link.child._fork_runtime())
+            for key, link in self._children.items()
+        }
+        children = {
+            id(link.child): staged._children[key].child for key, link in self._children.items()
+        }
+        staged._child_ids = {key: children[id(child)] for key, child in self._child_ids.items()}
+        return staged
+
+    def _end_staging(self) -> None:
+        self._staged = False
+        for link in self._children.values():
+            link.child._end_staging()
+
+    def _adopt_runtime(self, staged: BatchLoop[P]) -> None:
+        # Publishing prepared builders invokes no caller callbacks. Retain the
+        # original lock, including threads already waiting on that exact lock.
+        staged._end_staging()
+        self.__dict__.update(
+            {key: value for key, value in staged.__dict__.items() if key != "_lock"}
+        )
+
+    def _run_atomic(self, action: Callable[[BatchLoop[P]], _R]) -> _R:
+        staged = self._fork_runtime()
+        try:
+            result = action(staged)
+        except (FeedbackResolutionError, InvalidHistoryError):
+            # Explicit terminal failures are committed cancellations, not failed
+            # validation. Callback exceptions without a stored error are retriable.
+            if staged._error is not None:
+                self._adopt_runtime(staged)
+            raise
+        # All other exceptions discard staged runtime; append-only store writes
+        # and callback side effects are not rolled back or replayed at commit.
+        self._adopt_runtime(staged)
+        return result
 
     @property
     def error(self) -> _ExecutionError | None:
@@ -648,6 +721,8 @@ class BatchLoop(Generic[P]):
     def done(self) -> bool:
         """True on success or terminal failure; result() raises on failure."""
         with self._lock:
+            if not self._staged:
+                return self._run_atomic(lambda staged: staged.done)
             self._rollup_children()
             return (
                 not self._ready_llm
@@ -682,6 +757,8 @@ class BatchLoop(Generic[P]):
         execution error when resolution failed. No partial revised result is published.
         """
         with self._lock:
+            if not self._staged:
+                return self._run_atomic(lambda staged: staged.result())
             self._rollup_children()
             self._raise_if_failed()
             if not (
@@ -760,7 +837,10 @@ class BatchLoop(Generic[P]):
     def _is_subagent_call(self, call: ToolCall) -> bool:
         return self._subagent is not None and call.name == self._subagent.name
 
-    def _spawn_child(self, branch: _Branch[P], call: ToolCall) -> None:
+    def _prepare_child(
+        self, branch: _Branch[P], call: ToolCall, child_key: str
+    ) -> _ChildLink[P] | _ExecutionError:
+        """Build once; distinguish detected failure from an exception in caller code."""
         sub = self._subagent
         assert sub is not None
         child_subagent: SubagentTool[P] | None = None
@@ -773,35 +853,28 @@ class BatchLoop(Generic[P]):
             if entry is not None:
                 previous = History(entry.history, self._recorded.store)
         if self._resolve_only and previous is None:
-            self._fail(FeedbackResolutionError("no recorded subagent conversation"))
-            return
-        # Only internal counters form routing paths. Opaque provider call IDs
-        # may contain any of our delimiters; never interpolate them into addresses.
-        # This counter spans all branches/turns, so old invocation IDs stay retired.
-        self._next_child += 1
-        child_key = f"sub:{self._next_child}/"
-        try:
-            child: BatchLoop[P] = BatchLoop(
-                prompt=sub.build_prompt(call.args),
-                env_ids=branch.env_ids,
-                tool_specs=tuple(
-                    spec
-                    for spec in sub.sub_tool_specs(branch.env_ids[0])
-                    if child_subagent is not None or spec.name != sub.name
-                ),
-                subagent=child_subagent,
-                group_by=self._group_by if self._custom_grouping else None,
-                budget=self._budget,
-                history_contract=self._recorded.contract if self._recorded else None,
-                history=previous,
-                record_store=self._recorded.store if self._recorded else None,
-                _id_prefix=f"{self._id_prefix}{child_key}",
-                _resolve_only=self._resolve_only,
-            )
-        except (FeedbackResolutionError, InvalidHistoryError) as error:
-            self._fail(error)
-            return
-        self._children[child_key] = _ChildLink(child=child, branch_id=branch.branch_id, call=call)
+            return FeedbackResolutionError("no recorded subagent conversation")
+        child: BatchLoop[P] = BatchLoop(
+            prompt=sub.build_prompt(call.args),
+            env_ids=branch.env_ids,
+            tool_specs=tuple(
+                spec
+                for spec in sub.sub_tool_specs(branch.env_ids[0])
+                if child_subagent is not None or spec.name != sub.name
+            ),
+            subagent=child_subagent,
+            group_by=self._group_by if self._custom_grouping else None,
+            budget=self._budget,
+            history_contract=self._recorded.contract if self._recorded else None,
+            history=previous,
+            record_store=self._recorded.store if self._recorded else None,
+            _id_prefix=f"{self._id_prefix}{child_key}",
+            _resolve_only=self._resolve_only,
+            _defer_failure=True,
+        )
+        if child._error is not None:
+            return child._error
+        return _ChildLink(child=child, branch_id=branch.branch_id, call=call)
 
     def _pop_any(self) -> Request[P] | None:
         llm_head = self._ready_llm[0] if self._ready_llm else None
@@ -892,6 +965,19 @@ class BatchLoop(Generic[P]):
 
     def _accept_assistant(self, branch: _Branch[P], message: Message[P]) -> bool:
         """Return True to schedule the next node after a user continuation."""
+        prepared: dict[str, tuple[str, _ChildLink[P]]] = {}
+        next_child = self._next_child
+        for call in message.tool_calls:
+            if self._is_subagent_call(call):
+                # Reserve locally. A rejected turn must not issue IDs, attach
+                # children, or enqueue its ordinary calls either.
+                next_child += 1
+                key = f"sub:{next_child}/"
+                child = self._prepare_child(branch, call, key)
+                if isinstance(child, (FeedbackResolutionError, InvalidHistoryError)):
+                    self._fail(child)
+                    return False
+                prepared[call.id] = (key, child)
         if self._recorded is not None:
             node = self._recorded._node(branch.history_path)
             self._set_history_node(
@@ -926,13 +1012,13 @@ class BatchLoop(Generic[P]):
             return False
         branch.turn_calls = message.tool_calls
         branch.turn_results = {}
+        self._next_child = next_child
         for call in message.tool_calls:
-            if self._is_subagent_call(call):
-                self._spawn_child(branch, call)
+            if call.id in prepared:
+                key, link = prepared[call.id]
+                self._children[key] = link
             else:
                 self._request_tool(branch, call)
-            if self._error is not None:
-                return False
         return False
 
     def _handle_tool(self, request: ToolRequest, completion: ToolCompletion[P]) -> None:

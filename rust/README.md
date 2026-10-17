@@ -140,7 +140,17 @@ subagent prompt/spec-building callbacks, and provider/adapter settings in the
 contract. Closures cannot be introspected.
 Payload `Clone` must have immutable value semantics: interior-mutable aliases must
 not change submitted facts. Grouping, equality and hashing must be deterministic;
-callback panics are not recoverable validation errors.
+callback panics are not recoverable validation errors. Child prompts, specs and
+constructors are prepared once before fulfilling/recording the parent assistant
+turn or issuing its ordinary requests; commit reuses those prepared children.
+Library-detected child compatibility errors return `IncompatibleHistory` rather
+than panicking. Construction rejects the loop; a late mismatch becomes a terminal
+error (`error()`/`result()`), cancelling pending work without publishing a partial
+answer or partially starting the rejected assistant turn. Preceding valid tool
+evidence may remain in the working snapshot; old snapshots stay immutable. Caller
+side effects and orphan append-only preparation records are not rolled back.
+Discard the live loop after an arbitrary callback panic. See the
+[transaction boundary](../README.md#transactional-child-preparation-and-callback-failures).
 
 ### Feedback and shared-path resumption
 
