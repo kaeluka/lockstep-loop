@@ -242,7 +242,7 @@ fn subagent_answers_refine_the_parent_branch() {
     assert_eq!(result.results["a"], "done:yes");
     assert_eq!(result.results["b"], "done:yes");
     assert_eq!(result.results["c"], "done:no");
-    assert!(request_ids.iter().any(|id| id.starts_with("sub:root/inv/")));
+    assert!(request_ids.iter().any(|id| id.starts_with("sub:1/")));
     assert_eq!(
         request_ids
             .iter()

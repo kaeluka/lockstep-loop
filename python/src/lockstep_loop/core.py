@@ -424,6 +424,7 @@ class BatchLoop(Generic[P]):
         self._custom_grouping = group_by is not None
         self._recorded = history
         self._next_branch = 0
+        self._next_child = 0
         self._subagent = subagent
         self._id_prefix = _id_prefix
         self._group_by: Callable[[P], Hashable] = (
@@ -699,6 +700,11 @@ class BatchLoop(Generic[P]):
             entry = next((e for e in node.subagents if e.call_id == call.id), None)
             if entry is not None:
                 previous = History(entry.history, self._recorded.store)
+        # Only internal counters form routing paths. Opaque provider call IDs
+        # may contain any of our delimiters; never interpolate them into addresses.
+        # This counter spans all branches/turns, so old invocation IDs stay retired.
+        self._next_child += 1
+        child_key = f"sub:{self._next_child}/"
         child: BatchLoop[P] = BatchLoop(
             prompt=sub.build_prompt(call.args),
             env_ids=branch.env_ids,
@@ -713,11 +719,9 @@ class BatchLoop(Generic[P]):
             history_contract=self._recorded.contract if self._recorded else None,
             history=previous,
             record_store=self._recorded.store if self._recorded else None,
-            _id_prefix=f"{self._id_prefix}sub:{branch.branch_id}/{call.id}/turn-{branch.steps}/",
+            _id_prefix=f"{self._id_prefix}{child_key}",
         )
-        self._children[f"{branch.branch_id}:{call.id}"] = _ChildLink(
-            child=child, branch_id=branch.branch_id, call=call
-        )
+        self._children[child_key] = _ChildLink(child=child, branch_id=branch.branch_id, call=call)
 
     def _pop_any(self) -> Request[P] | None:
         llm_head = self._ready_llm[0] if self._ready_llm else None

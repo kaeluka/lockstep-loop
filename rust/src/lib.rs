@@ -482,6 +482,7 @@ pub struct BatchLoop<P, K = P> {
 
     seq: u64,
     next_branch: u64,
+    next_child: u64,
     branches: HashMap<String, Branch<P>>,
     partition: Vec<BranchRecord>, // legacy per-run partition summary
     recorded: Option<History<P>>,
@@ -613,6 +614,7 @@ where
             id_prefix,
             seq: 0,
             next_branch: 0,
+            next_child: 0,
             branches: HashMap::new(),
             partition: vec![root_record],
             recorded,
@@ -1057,18 +1059,23 @@ where
             budget: self.budget.clone(),
             history: history_options,
         };
+        // Routing paths contain only internal counters, never opaque provider
+        // call IDs. The counter spans all branches/turns: retired invocations
+        // cannot be confused with later calls, even when their call IDs repeat.
+        self.next_child = self
+            .next_child
+            .checked_add(1)
+            .expect("child invocation counter exhausted");
+        let child_key = format!("sub:{}/", self.next_child);
         let child = Self::build(
             config,
             Arc::clone(&self.group_by),
-            format!(
-                "{}sub:{}/{}/turn-{}/",
-                self.id_prefix, branch.branch_id, call.id, branch.steps
-            ),
+            format!("{}{child_key}", self.id_prefix),
             self.custom_grouping,
         )
         .expect("subagent callback violated the recorded compatibility contract");
         self.children.insert(
-            format!("{}:{}", branch.branch_id, call.id),
+            child_key,
             ChildLink {
                 child: Box::new(child),
                 branch_id: branch.branch_id.clone(),

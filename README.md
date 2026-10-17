@@ -188,8 +188,11 @@ Partial tool collections and request queues are builders, not persisted state;
 replay restarts tools, including child tools. This is **not crash recovery**.
 Validation errors (wrong kind, duplicate call IDs, invalid environment result
 sets) leave pending requests recoverable, including nested routes. Child request
-IDs include the parent turn, so reusing a tool-call ID in a later turn cannot
-accept a stale completion from an earlier invocation. Python also
+IDs use paths of internal invocation counters that never reset across a loop's
+branches or turns. Opaque tool-call IDs (including delimiter-containing IDs) are
+preserved as evidence, never interpolated into routing addresses. Repeated calls
+cannot accept stale completions from earlier invocations. Request IDs remain
+run-local; their format is not a persistence contract. Python also
 validates grouping of tool outputs and child final answers before fulfillment.
 Concurrent extensions of separate roots are not automatically merged.
 
