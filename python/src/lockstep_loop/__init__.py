@@ -25,6 +25,13 @@ from lockstep_loop.core import (
     run_to_completion,
 )
 from lockstep_loop.history import (
+    Agent,
+    AgentDescriptor,
+    AgentQuery,
+    AgentResolver,
+    Asset,
+    ChildAgentRun,
+    ChildAgentUpdate,
     ChildHistoryRun,
     ChildHistoryUpdate,
     EnvObservation,
@@ -39,10 +46,19 @@ from lockstep_loop.history import (
     RecordStore,
     SubagentContract,
     SubagentHistory,
+    SubagentRecord,
     UserContinuation,
 )
 
 __all__ = [
+    "Agent",
+    "AgentDescriptor",
+    "AgentQuery",
+    "AgentResolver",
+    "Asset",
+    "ChildAgentRun",
+    "ChildAgentUpdate",
+    "SubagentRecord",
     "BatchLoop",
     "BatchResult",
     "ChildHistoryRun",

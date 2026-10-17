@@ -1,6 +1,6 @@
 //! Run from the repository root: cargo run -p lockstep-loop --example history_replay
 use lockstep_loop::{
-    BatchLoop, Completion, History, LlmCompletion, LoopConfig, NodeRef, RecordStore, Request,
+    Agent, BatchLoop, Completion, LlmCompletion, LoopConfig, NodeRef, RecordStore, Request,
     RequestKind, ToolCall, ToolCompletion, ToolSpec,
 };
 use serde_json::json;
@@ -10,8 +10,8 @@ use std::sync::Arc;
 fn investigate(
     env: &str,
     observation: &str,
-    previous: Option<History<String>>,
-) -> Result<(History<String>, usize, String), Box<dyn std::error::Error>> {
+    previous: Option<Agent<String>>,
+) -> Result<(Agent<String>, usize, String), Box<dyn std::error::Error>> {
     let contract = "status-investigation/v1;exact-grouping;provider-policy-v1";
     let config = LoopConfig::new(
         "Read the revision's status.".to_owned(),
@@ -23,7 +23,7 @@ fn investigate(
         )],
     );
     let config = match previous {
-        Some(history) => config.with_replay(history, contract),
+        Some(agent) => config.with_agent(agent, contract),
         None => config
             .with_recording(contract)
             .with_record_store(RecordStore::new("writer-1")),
@@ -65,18 +65,15 @@ fn investigate(
         }
     }
     let result = loop_.result()?;
-    Ok((
-        result.history.unwrap(),
-        llm_calls,
-        result.results[env].clone(),
-    ))
+    let answer = result.results[env].clone();
+    Ok((result.into_agent().unwrap(), llm_calls, answer))
 }
 
 type Backend = BTreeMap<NodeRef, Vec<u8>>;
 
-fn persist(history: &History<String>, backend: &mut Backend) -> Vec<u8> {
+fn persist(agent: &Agent<String>, backend: &mut Backend) -> Vec<u8> {
     // Persist shallow immutable records BEFORE atomically publishing descriptor.
-    for (reference, node) in history.store.records() {
+    for (reference, node) in agent.store.records() {
         let bytes = serde_json::to_vec(&node).unwrap();
         if let Some(old) = backend.get(&reference) {
             assert_eq!(old, &bytes);
@@ -84,13 +81,13 @@ fn persist(history: &History<String>, backend: &mut Backend) -> Vec<u8> {
             backend.insert(reference, bytes);
         }
     }
-    serde_json::to_vec(&history.descriptor).unwrap()
+    serde_json::to_vec(&agent.descriptor).unwrap()
 }
 
-fn restore(descriptor: &[u8], backend: Backend, fresh_writer_namespace: &str) -> History<String> {
+fn restore(descriptor: &[u8], backend: Backend, fresh_writer_namespace: &str) -> Agent<String> {
     // Reserve a globally unique writer namespace in real storage (e.g. a database
     // sequence or UUID). Never reuse writer-N across independent writable stores.
-    History {
+    Agent {
         descriptor: serde_json::from_slice(descriptor).unwrap(),
         store: RecordStore::with_loader(fresh_writer_namespace, move |reference| {
             // Caller-owned codec/I/O. No traversal or observation matching here.

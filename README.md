@@ -33,6 +33,9 @@ cargo run -p lockstep-loop --example feedback
 (cd python && PYTHONPATH=src python3 examples/specialized_subagents.py)
 cargo run -p lockstep-loop --example specialized_subagents
 # changed parent: 0 fresh child LLM calls; child tools still rerun
+
+(cd python && PYTHONPATH=src python3 examples/agent_assets.py)
+cargo run -p lockstep-loop --example agent_assets
 ```
 
 ## What the library owns
@@ -47,11 +50,14 @@ environment, and unrelated paths may generate similar answers independently.
 You supply pure/read-only tools over stable snapshots, identical tool specs across
 environments, model-visible content that does not expose environment identities,
 and immutable payloads. Recording/replay is opt-in on `BatchLoop`; you persist the
-snapshots. The current API calls the recorded agent structure `History`.
+`Agent` snapshots. An `Asset` is a leaf investigation backed by its full conversation,
+not just its value or environment class. Old `History` APIs remain compatibility aliases.
 
 ## Go deeper
 
 - [Documentation map](docs/README.md)
+- [Agent/Asset glossary, inspection API, and compatibility mapping](docs/agent-assets.md)
+- [End-to-end agent/assets example](docs/agent-assets.md#end-to-end-examples)
 - [History, replay, feedback, and persistence contracts](docs/history-reference.md)
 - [Specialized subagents and independent child caches](docs/history-reference.md#specialized-tools-and-independently-reusable-child-histories)
 - [README audit and verification](docs/verification.md)

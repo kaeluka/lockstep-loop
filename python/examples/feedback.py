@@ -22,13 +22,13 @@ NOTE = "Also inspect /foo and revise if needed"
 SPECS = (ToolSpec("read", "Read entry", {}), ToolSpec("foo", "Inspect /foo", {}))
 
 
-def investigate(envs, history=None, feedback=None):
+def investigate(envs, agent=None, feedback=None):
     loop = BatchLoop(
         prompt=PROMPT,
         env_ids=envs,
         tool_specs=SPECS,
-        history_contract="feedback-example/v1",
-        history=history,
+        agent_contract="feedback-example/v1",
+        agent=agent,
         feedback=feedback,
     )
     llms, tools = [], []
@@ -64,22 +64,22 @@ def investigate(envs, history=None, feedback=None):
 
 if __name__ == "__main__":
     old, _, _ = investigate(("A", "B", "D"))
-    revised, llms, _ = investigate(("A",), old.history, Feedback(NOTE))
+    revised, llms, _ = investigate(("A",), old.agent, Feedback(NOTE))
     assert len(llms) == 2  # none while locating the old answer; two AFTER feedback
     assert [m.content for m in llms[0].messages[-2:]] == ["no issues", NOTE]
     assert revised.results == {"A": "no issues"}  # same answer is valid, no reinjection
-    assert not old.history.load(old.history.root.observations[0].continuation).user_continuations
+    assert not old.agent.load(old.agent.root.observations[0].continuation).user_continuations
 
     backend = {}
-    old_descriptor = persist(old.history, backend)
-    descriptor = persist(revised.history, backend)
+    old_descriptor = persist(old.agent, backend)
+    descriptor = persist(revised.agent, backend)
     inherited, llms, tools = investigate(("A", "B", "C", "D"), restore(descriptor, backend))
     assert inherited.results == {"A": "no issues", "B": "found", "C": "no issues", "D": "no issues"}
     assert len(llms) == 1 and llms[0].env_ids == ("B",)
     assert [r.env_ids for r in tools if r.tool_call.name == "foo"] == [("A", "B", "C")]
 
     # A NEW explicit operation appends the same feedback again after the latest answer.
-    descriptor = persist(inherited.history, backend)
+    descriptor = persist(inherited.agent, backend)
     repeated, llms, _ = investigate(("B",), restore(descriptor, backend), Feedback(NOTE))
     assert [m.content for m in llms[0].messages if m.role == "user"] == [PROMPT, NOTE, NOTE]
     assert llms[0].messages[-2].content == "found"
@@ -93,8 +93,8 @@ if __name__ == "__main__":
         prompt=PROMPT,
         env_ids=["changed"],
         tool_specs=SPECS,
-        history_contract="feedback-example/v1",
-        history=old.history,
+        agent_contract="feedback-example/v1",
+        agent=old.agent,
         feedback=Feedback(NOTE),
     )
     request = failed.next_request()
@@ -102,7 +102,7 @@ if __name__ == "__main__":
         failed.complete(ToolCompletion(request.request_id, (("changed", "unseen"),)))
     except FeedbackResolutionError:
         assert failed.done and failed.error is not None and failed.outstanding_count == 0
-        assert failed.history.descriptor == old.history.descriptor
+        assert failed.agent.descriptor == old.agent.descriptor
     else:
         raise AssertionError("feedback must not manufacture an unseen target")
     print(

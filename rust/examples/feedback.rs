@@ -1,7 +1,7 @@
 //! Run: cargo run -p lockstep-loop --example feedback
 //! Caller-side fake executors and shallow-record persistence, no sessions/endpoints.
 use lockstep_loop::{
-    BatchLoop, BatchResult, Completion, History, LlmCompletion, LlmRequest, LoopConfig, LoopError,
+    Agent, BatchLoop, BatchResult, Completion, LlmCompletion, LlmRequest, LoopConfig, LoopError,
     NodeRef, RecordStore, Request, RequestKind, Role, ToolCall, ToolCompletion, ToolRequest,
     ToolSpec,
 };
@@ -19,7 +19,7 @@ fn specs() -> Vec<ToolSpec> {
 }
 fn config(
     envs: &[&str],
-    previous: Option<History<String>>,
+    previous: Option<Agent<String>>,
     feedback: Option<&str>,
 ) -> LoopConfig<String> {
     let config = LoopConfig::new(
@@ -28,7 +28,7 @@ fn config(
         specs(),
     );
     let mut config = match previous {
-        Some(h) => config.with_replay(h, "feedback-example/v1"),
+        Some(agent) => config.with_agent(agent, "feedback-example/v1"),
         None => config
             .with_recording("feedback-example/v1")
             .with_record_store(RecordStore::new("initial-writer")),
@@ -45,7 +45,7 @@ struct Investigation {
 }
 fn investigate(
     envs: &[&str],
-    previous: Option<History<String>>,
+    previous: Option<Agent<String>>,
     feedback: Option<&str>,
 ) -> Investigation {
     let mut loop_ = BatchLoop::new(config(envs, previous, feedback)).unwrap();
@@ -107,9 +107,9 @@ fn investigate(
 }
 
 type Backend = BTreeMap<NodeRef, Vec<u8>>;
-fn persist(history: &History<String>, backend: &mut Backend) -> Vec<u8> {
+fn persist(agent: &Agent<String>, backend: &mut Backend) -> Vec<u8> {
     // Records first; publish descriptor only after records are durable.
-    for (reference, node) in history.store.records() {
+    for (reference, node) in agent.store.records() {
         let bytes = serde_json::to_vec(&node).unwrap();
         if let Some(old) = backend.get(&reference) {
             assert_eq!(old, &bytes);
@@ -117,10 +117,10 @@ fn persist(history: &History<String>, backend: &mut Backend) -> Vec<u8> {
             backend.insert(reference, bytes);
         }
     }
-    serde_json::to_vec(&history.descriptor).unwrap()
+    serde_json::to_vec(&agent.descriptor).unwrap()
 }
-fn restore(descriptor: &[u8], backend: Backend, fresh_writer: &str) -> History<String> {
-    History {
+fn restore(descriptor: &[u8], backend: Backend, fresh_writer: &str) -> Agent<String> {
+    Agent {
         descriptor: serde_json::from_slice(descriptor).unwrap(),
         store: RecordStore::with_loader(fresh_writer, move |reference| {
             Arc::new(serde_json::from_slice(&backend[reference]).unwrap())
@@ -131,7 +131,7 @@ fn restore(descriptor: &[u8], backend: Backend, fresh_writer: &str) -> History<S
 fn main() {
     let old = investigate(&["A", "B", "D"], None, None)
         .result
-        .history
+        .into_agent()
         .unwrap();
     let revised = investigate(&["A"], Some(old.clone()), Some(NOTE));
     assert_eq!(revised.llms.len(), 2); // both AFTER resolving the old answer
@@ -146,7 +146,7 @@ fn main() {
     );
     let mut backend = Backend::new();
     let old_descriptor = persist(&old, &mut backend);
-    let descriptor = persist(&revised.result.history.unwrap(), &mut backend);
+    let descriptor = persist(revised.result.agent().unwrap(), &mut backend);
     let inherited = investigate(
         &["A", "B", "C", "D"],
         Some(restore(&descriptor, backend.clone(), "inherited-writer")),
@@ -170,7 +170,7 @@ fn main() {
             .filter(|r| r.tool_call.name == "foo")
             .all(|r| r.env_ids == ["A", "B", "C"])
     );
-    let descriptor = persist(&inherited.result.history.unwrap(), &mut backend);
+    let descriptor = persist(inherited.result.agent().unwrap(), &mut backend);
     let repeated = investigate(
         &["B"],
         Some(restore(&descriptor, backend.clone(), "repeated-writer")),
@@ -208,7 +208,7 @@ fn main() {
     assert!(failed.is_done());
     assert_eq!(failed.error(), Some(&LoopError::FeedbackResolutionMiss));
     assert_eq!(failed.outstanding_count(), 0);
-    assert_eq!(failed.history().unwrap(), old);
+    assert_eq!(failed.agent().unwrap(), old);
     println!(
         "shared feedback: A/B/C inherit; D unchanged; old snapshot reusable; replay miss explicit"
     );

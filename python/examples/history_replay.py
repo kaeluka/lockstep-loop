@@ -3,8 +3,8 @@
 import pickle
 
 from lockstep_loop import (
+    Agent,
     BatchLoop,
-    History,
     LlmCompletion,
     LlmRequest,
     RecordStore,
@@ -14,13 +14,13 @@ from lockstep_loop import (
 )
 
 
-def investigate(env: str, observation: str, history: History[str] | None = None):
+def investigate(env: str, observation: str, agent: Agent[str] | None = None):
     loop = BatchLoop(
         prompt="Read the revision's status.",
         env_ids=[env],
         tool_specs=[ToolSpec("status", "Read status without changing it.", {})],
-        history_contract="status-investigation/v1;exact-grouping;provider-policy-v1",
-        history=history,
+        agent_contract="status-investigation/v1;exact-grouping;provider-policy-v1",
+        agent=agent,
     )
     llm_calls = 0
     while not loop.done:
@@ -44,27 +44,27 @@ def investigate(env: str, observation: str, history: History[str] | None = None)
                 )
             )
     result = loop.result()
-    assert result.history is not None
-    return result.history, llm_calls, result.results[env]
+    assert result.agent is not None
+    return result.agent, llm_calls, result.results[env]
 
 
-def persist(history, backend):
+def persist(agent, backend):
     # Each node is SHALLOW: continuation/subagent references are addresses.
     # Store immutable records first; only then atomically publish the descriptor.
-    for reference, node in history.store.records().items():
+    for reference, node in agent.store.records().items():
         encoded = pickle.dumps(node)
         if reference in backend:
             assert backend[reference] == encoded  # never overwrite a different record
         else:
             backend[reference] = encoded
-    return pickle.dumps(history.descriptor)
+    return pickle.dumps(agent.descriptor)
 
 
 def restore(descriptor, backend):
     # No traversal here: core loads just the selected path, including children.
     # Each RecordStore gets a fresh writer namespace (UUID by default in Python).
     store = RecordStore(load=lambda reference: pickle.loads(backend[reference]))
-    return History(pickle.loads(descriptor), store)
+    return Agent(pickle.loads(descriptor), store)
 
 
 if __name__ == "__main__":

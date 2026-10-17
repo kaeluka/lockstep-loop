@@ -25,9 +25,13 @@ its published value. The value alone is not the asset: A/B and D above both say
 environments. An open continuation is also an investigation state; it need not
 have a new completed value yet.
 
-> **Today's API:** the recorded agent snapshot is called `History`. Completed
-> values are assistant replies **with no tool calls**, not designated result-tool
-> arguments. Agent/asset are the conceptual vocabulary, not new API handles.
+> **Today's API:** `Agent` is the complete immutable snapshot (`History` remains
+> an alias). `agent.assets()` exposes read-only, path-backed `Asset` views, not
+> independent endpoint handles. Values are terminal assistant replies **with no
+> tool calls**, not designated result-tool arguments. An open asset can retain an
+> older value without having a new completed answer.
+>
+> [Inspect agents/assets and migrate API names →](agent-assets.md)
 
 ## Subdivide only when evidence requires it
 
@@ -101,17 +105,20 @@ investigates those details and returns a value. Its paths may diverge extensivel
 if its final values agree, that child call does not split the parent. Different
 parent-visible tuples still split normally. This is **containment, not remerging**.
 
-There is a second payoff to aim for: **contain invalidation**. Give the child a
+There is a second payoff: **contain invalidation**. Give the child a
 fixed or deterministically constructed recipe — for example, “List imports in
 `foo.py`” built from a structured file argument. With independently reusable child
 agents, changing a parent's wording need not discard the child's experience.
 Different file paths mean different recipes/tries, not fuzzy prompt matches.
 
-**Supported now:** one configured `SubagentTool`, deterministic `build_prompt`,
-nested recording/replay, and divergence containment. The initial prompt is a user
-message, not a separate system-role API. **Design direction:** multiple specialized
-child tools and independent child-history lookup across changed parent prompts.
-Those are not shipping APIs in this checkout.
+**Supported now:** multiple named `SubagentTool` definitions, deterministic
+`build_prompt`, bounded child allowlists, nested replay, and independent child-agent
+lookup across changed parent prompts. The initial prompt is a user message, not a
+separate system-role API. A caller's resolver selects a compatible child revision
+for a new invocation; recorded parent invocations remain pinned to their recorded
+child revision. Each invocation exposes its base/result agent snapshots for
+inspection and caller-owned persistence; concurrent updates are not silently merged.
+See the [specialized-agent reference](history-reference.md#specialized-tools-and-independently-reusable-child-histories).
 
 ## Why this design?
 
@@ -125,6 +132,7 @@ no model-visible environment identities, and immutable payload contents.
 and designated result-tool publication. A changed child value does not automatically
 update an already completed parent.
 
-**Next:** [Python API](../python/README.md) · [Rust API](../rust/README.md) ·
+**Next:** [Agent/Asset glossary and inspection](agent-assets.md) ·
+[Python API](../python/README.md) · [Rust API](../rust/README.md) ·
 [Runnable replay and feedback demos](../README.md#try-it) ·
 [Storage and compatibility reference](history-reference.md)

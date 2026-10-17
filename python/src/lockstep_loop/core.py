@@ -1,7 +1,7 @@
 """Core types and orchestrator for lockstep-loop.
 
-lockstep-loop runs a single agent prompt across many similar, read-only
-environments without generating shared tokens twice:
+lockstep-loop runs an agent's initial prompt across similar, read-only
+environments, sharing LLM work while observation paths remain equivalent:
 
 1. All environments start in one equivalence class sharing a single LLM
    conversation.
@@ -9,11 +9,13 @@ environments without generating shared tokens twice:
    environment still in the class (SIMD-style fan-out).
 3. Tool results are compared and the class is refined: one sub-conversation
    per distinct result.  Branches then continue independently.
-4. The process repeats per branch until the loop finishes, yielding a
-   prefix-sharing trie whose leaves are equivalence classes of environments.
+4. The process repeats per branch until the loop finishes. With recording,
+   the immutable Agent includes prompt, contract, and accumulated conversation
+   trie; its Asset views expose leaf investigations and their complete paths.
+   EnvClass and SplitNode remain partition-only summaries, not assets or agents.
 
-Cost scales with the number of distinct tool-call traces, not with the
-number of environments.
+LLM work is shared by observation path; tools still execute per environment.
+Separate paths may publish the same value without remerging their conversations.
 
 Provider-agnostic by construction: the library never calls an LLM (or a
 tool) itself.  ``BatchLoop`` hands out requests — LLM calls and tool
@@ -35,19 +37,19 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Generic, Literal, Protocol, TypeAlias, TypeVar, cast, overload
 
 from .history import (
-    ChildHistoryRun,
-    ChildHistoryUpdate,
+    Agent,
+    AgentDescriptor,
+    AgentQuery,
+    AgentResolver,
+    ChildAgentRun,
+    ChildAgentUpdate,
     EnvObservation,
-    History,
-    HistoryDescriptor,
     HistoryNode,
-    HistoryQuery,
-    HistoryResolver,
     Observation,
     OutputRecord,
     RecordStore,
     SubagentContract,
-    SubagentHistory,
+    SubagentRecord,
     UserContinuation,
     _HistoryPath,
 )
@@ -242,6 +244,15 @@ class SubagentTool(Generic[P]):
     subagents: tuple[SubagentTool[P], ...] | None = None
     """Child allowlist. None preserves bounded self-recursion; () makes this a leaf."""
 
+    @property
+    def agent_contract(self) -> str | None:
+        """Child agent's compatibility version, not an agent or asset ID."""
+        return self.history_contract
+
+    def with_agent_contract(self, contract: str) -> SubagentTool[P]:
+        """Return this definition with a child-agent contract (legacy field: history_contract)."""
+        return replace(self, history_contract=contract)
+
 
 def _subagent_contract(sub: SubagentTool[P]) -> SubagentContract:
     return SubagentContract(
@@ -302,7 +313,7 @@ class SplitNode:
     Represents the set of environments whose conversations are identical so
     far. Children retain result-group representations as labels, disambiguated
     on representation collisions. Exact evidence and continuations live in
-    ``History``, not this partition summary.
+    ``Agent``, not this partition summary.
 
     Nodes are never mutated: a split builds new child nodes and copies the
     path from the split point back to the root (structural sharing).  Treat
@@ -334,8 +345,17 @@ class BatchResult(Generic[P]):
     results: Mapping[str, P]
     """Final assistant message per environment (identical within a class)."""
 
-    history: History[P] | None = None
-    child_histories: tuple[ChildHistoryUpdate[P], ...] = ()
+    history: Agent[P] | None = None
+    child_histories: tuple[ChildAgentUpdate[P], ...] = ()
+
+    @property
+    def agent(self) -> Agent[P] | None:
+        """Updated immutable agent snapshot; history is the compatibility field."""
+        return self.history
+
+    @property
+    def child_agents(self) -> tuple[ChildAgentUpdate[P], ...]:
+        return self.child_histories
 
 
 @dataclass(frozen=True)
@@ -383,8 +403,8 @@ class _ChildLink(Generic[P]):
     branch_id: str
     call: ToolCall
     ordinal: int
-    base: HistoryDescriptor[P] | None
-    prior_runs: tuple[ChildHistoryRun[P], ...]
+    base: AgentDescriptor[P] | None
+    prior_runs: tuple[ChildAgentRun[P], ...]
 
 
 class _Transition(Generic[P]):
@@ -397,7 +417,7 @@ class _Transition(Generic[P]):
     def __init__(self) -> None:
         self.undo: list[Callable[[], None]] = []
         self.loops: list[BatchLoop[P]] = []
-        self.roots: dict[int, History[P] | None] = {}
+        self.roots: dict[int, Agent[P] | None] = {}
         self.branches: set[int] = set()
         self.removed_children: dict[int, BatchLoop[P]] = {}
 
@@ -540,18 +560,37 @@ class BatchLoop(Generic[P]):
         tool_specs: Sequence[ToolSpec],
         subagent: SubagentTool[P] | None = None,
         subagents: Sequence[SubagentTool[P]] | None = None,
-        history_resolver: HistoryResolver[P] | None = None,
+        history_resolver: AgentResolver[P] | None = None,
         group_by: Callable[[P], Hashable] | None = None,
         budget: Budget | None = None,
         history_contract: str | None = None,
-        history: History[P] | None = None,
+        history: Agent[P] | None = None,
         record_store: RecordStore[P] | None = None,
+        agent: Agent[P] | None = None,
+        agent_contract: str | None = None,
+        agent_resolver: AgentResolver[P] | None = None,
         feedback: Feedback[P] | None = None,
         _id_prefix: str = "",
         _resolve_only: bool = False,
         _defer_failure: bool = False,
         _unavailable_subagents: frozenset[str] = frozenset(),
     ) -> None:
+        # Aliases converge immediately to one state/contract/resolver. Never guess
+        # between two supplied snapshots or maintain parallel representations.
+        if agent is not None:
+            if history is not None:
+                raise ValueError("use agent or history, not both")
+            history = agent
+        if agent_contract is not None:
+            if history_contract is not None:
+                raise ValueError("use agent_contract or history_contract, not both")
+            history_contract = agent_contract
+        if agent_resolver is not None:
+            if history_resolver is not None:
+                raise ValueError("use agent_resolver or history_resolver, not both")
+            history_resolver = agent_resolver
+        if history is not None and not isinstance(history, Agent):
+            raise TypeError("agent/history must be an Agent snapshot, not an asset or endpoint")
         envs = tuple(env_ids)
         if not envs:
             raise ValueError("env_ids must be non-empty")
@@ -600,8 +639,8 @@ class BatchLoop(Generic[P]):
                 )
             if history is None:
                 store = record_store if record_store is not None else RecordStore[P]()
-                history = History(
-                    HistoryDescriptor(
+                history = Agent(
+                    AgentDescriptor(
                         history_contract,
                         prompt,
                         self._specs,
@@ -639,7 +678,7 @@ class BatchLoop(Generic[P]):
         self._branches: dict[str, _Branch[P]] = {}
         self._partition: list[_Branch[P]] = []  # legacy per-run partition summary
         self._finals: list[_Branch[P]] = []
-        self._child_histories: list[ChildHistoryUpdate[P]] = []
+        self._child_histories: list[ChildAgentUpdate[P]] = []
         self._ready_llm: deque[LlmRequest[P]] = deque()
         self._ready_tool: deque[ToolRequest] = deque()
         self._outstanding: dict[str, Request[P]] = {}
@@ -905,8 +944,8 @@ class BatchLoop(Generic[P]):
         self._out_llm = self._out_tool = 0
 
     @property
-    def history(self) -> History[P] | None:
-        """Capture the committed immutable root, even during a caller callback.
+    def agent(self) -> Agent[P] | None:
+        """Capture the committed immutable agent snapshot, even during a caller callback.
 
         Child roots are linked incrementally on advancement, not by this getter.
         A reentrant read must never expose a root that might still roll back.
@@ -917,7 +956,12 @@ class BatchLoop(Generic[P]):
                 return transaction.roots.get(id(self), self._recorded)
             return self._recorded
 
-    def append_user_message(self, content: P) -> History[P]:
+    @property
+    def history(self) -> Agent[P] | None:
+        """Compatibility spelling of agent; both return the same snapshot."""
+        return self.agent
+
+    def append_user_message(self, content: P) -> Agent[P]:
         """Fork an OPEN continuation after resolving one environment by replay.
 
         This legacy helper forks an already completed run; it does not resume
@@ -1046,8 +1090,8 @@ class BatchLoop(Generic[P]):
         node = self._recorded._node(branch.history_path)
         entries = list(node.subagents)
         index = next((i for i, e in enumerate(entries) if e.call_id == link.call.id), None)
-        run = ChildHistoryRun(branch.env_ids, link.base, history.descriptor)
-        entry = SubagentHistory(link.call.id, history.descriptor, (*link.prior_runs, run))
+        run = ChildAgentRun(branch.env_ids, link.base, history.descriptor)
+        entry = SubagentRecord(link.call.id, history.descriptor, (*link.prior_runs, run))
         if index is None:
             entries.append(entry)
         elif (
@@ -1095,7 +1139,7 @@ class BatchLoop(Generic[P]):
                 if result.history is not None:
                     self._append(
                         self._child_histories,
-                        ChildHistoryUpdate(
+                        ChildAgentUpdate(
                             link.child._id_prefix,
                             branch.branch_id,
                             branch.steps,
@@ -1144,13 +1188,13 @@ class BatchLoop(Generic[P]):
             else (self._recorded.contract if self._recorded else None)
         )
         previous = None
-        prior_runs: tuple[ChildHistoryRun[P], ...] = ()
+        prior_runs: tuple[ChildAgentRun[P], ...] = ()
         if self._recorded is not None:
             node = self._recorded._node(branch.history_path)
             entry = next((e for e in node.subagents if e.call_id == call.id), None)
             if entry is not None:
-                previous = History(entry.history, self._recorded.store)
-                prior_runs = entry.runs or (ChildHistoryRun((), None, entry.history),)
+                previous = Agent(entry.agent_descriptor, self._recorded.store)
+                prior_runs = entry.runs or (ChildAgentRun((), None, entry.agent_descriptor),)
         # A recorded parent pins its revision. External cache changes must not
         # reinterpret it, nor manufacture a missing feedback-resolution target.
         if self._resolve_only and previous is None:
@@ -1158,12 +1202,14 @@ class BatchLoop(Generic[P]):
         if previous is None and self._history_resolver is not None:
             assert contract is not None and self._record_store is not None
             selected = self._history_resolver(
-                HistoryQuery(contract, prompt, child_specs, self._custom_grouping, child_contracts)
+                AgentQuery(contract, prompt, child_specs, self._custom_grouping, child_contracts)
             )
             if selected is not None:
-                if not isinstance(selected, HistoryDescriptor):
-                    raise TypeError("history_resolver must return HistoryDescriptor or None")
-                previous = History(selected, self._record_store)
+                if not isinstance(selected, AgentDescriptor):
+                    raise TypeError(
+                        "agent_resolver (history_resolver) must return AgentDescriptor or None"
+                    )
+                previous = Agent(selected, self._record_store)
         child: BatchLoop[P] = BatchLoop(
             prompt=prompt,
             env_ids=branch.env_ids,

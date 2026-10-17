@@ -1,4 +1,4 @@
-"""Immutable shallow records and a storage-neutral lazy loading boundary.
+"""Immutable Agent snapshots, contextual Asset views, and shallow history records.
 
 Payloads, schemas and arguments are borrowed immutable values. NodeRef is a
 storage address, never a public conversation/session identity. No core I/O.
@@ -7,9 +7,9 @@ storage address, never a public conversation/session identity. No core I/O.
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Generic, Literal, TypeAlias, TypeVar
+from typing import TYPE_CHECKING, Generic, Literal, NoReturn, TypeAlias, TypeVar
 from uuid import uuid4
 
 if TYPE_CHECKING:
@@ -63,10 +63,15 @@ class SubagentContract:
     # None preserves bounded self-recursion; a tuple is an explicit child allowlist.
     subagents: tuple[SubagentContract, ...] | None = None
 
+    @property
+    def agent_contract(self) -> str | None:
+        """Domain spelling; the persisted field stays history_contract."""
+        return self.history_contract
+
 
 @dataclass(frozen=True)
 class HistoryQuery(Generic[P]):
-    """Exact child compatibility header, without parent/invocation/environment IDs."""
+    """AgentQuery compatibility header; legacy class path retained for persisted codecs."""
 
     contract: str
     prompt: P
@@ -77,7 +82,11 @@ class HistoryQuery(Generic[P]):
 
 @dataclass(frozen=True)
 class HistoryDescriptor(Generic[P]):
-    """Small persistence envelope. Serialize this AND each new shallow record."""
+    """AgentDescriptor persistence envelope; legacy pickle name and fields are stable.
+
+    Serialize this AND each new shallow record; a descriptor needs a RecordStore
+    to inspect its full agent. AgentDescriptor is an alias, not another model.
+    """
 
     contract: str
     prompt: P
@@ -86,8 +95,8 @@ class HistoryDescriptor(Generic[P]):
     root: NodeRef
     subagents: tuple[SubagentContract, ...] = ()
 
-    def query(self) -> HistoryQuery[P]:
-        return HistoryQuery(
+    def query(self) -> AgentQuery[P]:
+        return AgentQuery(
             self.contract, self.prompt, self.tools, self.custom_grouping, self.subagents
         )
 
@@ -102,18 +111,28 @@ HistoryResolver: TypeAlias = Callable[[HistoryQuery[P]], HistoryDescriptor[P] | 
 
 @dataclass(frozen=True)
 class ChildHistoryRun(Generic[P]):
-    """One invocation's inherited environments, selected base, and resulting revision."""
+    """ChildAgentRun: one invocation's environments, base and resulting agent revision."""
 
     env_ids: tuple[str, ...]
     base: HistoryDescriptor[P] | None
     history: HistoryDescriptor[P]
 
+    @property
+    def agent_descriptor(self) -> AgentDescriptor[P]:
+        return self.history
+
 
 @dataclass(frozen=True)
 class SubagentHistory(Generic[P]):
+    """SubagentRecord: parent-call provenance; use Agent.child to inspect its agent."""
+
     call_id: str
     history: HistoryDescriptor[P]
     runs: tuple[ChildHistoryRun[P], ...] = ()
+
+    @property
+    def agent_descriptor(self) -> AgentDescriptor[P]:
+        return self.history
 
 
 @dataclass(frozen=True)
@@ -126,11 +145,17 @@ class ChildHistoryUpdate(Generic[P]):
     tool_call: ToolCall
     env_ids: tuple[str, ...]
     base: HistoryDescriptor[P] | None
-    history: History[P]
+    history: Agent[P]
+
+    @property
+    def agent(self) -> Agent[P]:
+        return self.history
 
 
 @dataclass(frozen=True)
 class HistoryNode(Generic[P]):
+    """A shared prefix or historical endpoint; an Asset also needs its agent/path context."""
+
     assistant: Message[P] | None = None
     env_ids: tuple[str, ...] = ()
     observations: tuple[Observation[P], ...] = ()
@@ -189,15 +214,24 @@ class RecordStore(Generic[P]):
 
 
 @dataclass(frozen=True)
-class History(Generic[P]):
-    """Snapshot plus its resolver; descriptor and records are the persistence API."""
+class Agent(Generic[P]):
+    """Complete immutable agent: initial prompt, contract and accumulated trie.
 
-    descriptor: HistoryDescriptor[P]
+    The descriptor selects a snapshot; the store resolves its immutable records.
+    This is neither a tool definition nor a running BatchLoop. History is the
+    compatibility alias. Persist the descriptor and records, not live views.
+    """
+
+    descriptor: AgentDescriptor[P]
     store: RecordStore[P] = field(compare=False, repr=False)
 
     @property
     def root(self) -> HistoryNode[P]:
         return self.load(self.descriptor.root)
+
+    @property
+    def prompt(self) -> P:
+        return self.descriptor.prompt
 
     @property
     def contract(self) -> str:
@@ -206,9 +240,32 @@ class History(Generic[P]):
     def load(self, ref: NodeRef) -> HistoryNode[P]:
         return self.store.load(ref)
 
-    def child(self, entry: SubagentHistory[P]) -> History[P]:
-        """Inspect/replay a child using this snapshot's shared record resolver."""
-        return History(entry.history, self.store)
+    def child(self, entry: SubagentRecord[P]) -> Agent[P]:
+        """Attach this store to the recorded child agent, without resolving an environment."""
+        return Agent(entry.agent_descriptor, self.store)
+
+    def assets(self) -> Iterator[Asset[P]]:
+        """Lazily inspect this agent's structural leaves, not a per-run partition.
+
+        Child agents are separate tries: inspect them with child(entry).assets().
+        This does not execute tools, select feedback targets, or create records.
+        """
+        stack: list[tuple[NodeRef, int, Observation[P] | UserContinuation[P] | None]] = [
+            (self.descriptor.root, 0, None)
+        ]
+        path: list[_AssetStep[P]] = []
+        while stack:
+            reference, depth, via = stack.pop()
+            del path[depth:]
+            node = self.load(reference)
+            path.append(_AssetStep(node, via))
+            if not node.observations and not node.user_continuations:
+                yield Asset._view(self, tuple(path))
+            else:
+                for user in reversed(node.user_continuations):
+                    stack.append((user.continuation, depth + 1, user))
+                for observation in reversed(node.observations):
+                    stack.append((observation.continuation, depth + 1, observation))
 
     def _node(self, path: _HistoryPath) -> HistoryNode[P]:
         node = self.root
@@ -221,7 +278,7 @@ class History(Generic[P]):
             node = self.load(edge.continuation)
         return node
 
-    def _replace_node(self, path: _HistoryPath, node: HistoryNode[P]) -> History[P]:
+    def _replace_node(self, path: _HistoryPath, node: HistoryNode[P]) -> Agent[P]:
         """Storage-level path copying. Paths are not conversation identities."""
         ancestors = []
         parent = self.root
@@ -257,3 +314,123 @@ class History(Generic[P]):
                 )
             ref = self.store.put(parent)
         return replace(self, descriptor=replace(self.descriptor, root=ref))
+
+
+@dataclass(frozen=True, eq=False)
+class _AssetStep(Generic[P]):
+    node: HistoryNode[P]
+    via: Observation[P] | UserContinuation[P] | None
+
+
+@dataclass(frozen=True, eq=False, init=False)
+class Asset(Generic[P]):
+    """Read-only leaf investigation in one Agent snapshot, backed by its path.
+
+    Values do not identify assets. An open continuation may retain an earlier
+    published message, or have no value yet. No ID, persistence or resume API is
+    provided: feedback still requires agent snapshot + environment replay.
+    """
+
+    agent: Agent[P] = field(repr=False)
+    _path: tuple[_AssetStep[P], ...] = field(repr=False)
+
+    def __init__(self) -> None:
+        raise TypeError("Asset views come from Agent.assets(); persist the agent, not a leaf")
+
+    @classmethod
+    def _view(cls, agent: Agent[P], path: tuple[_AssetStep[P], ...]) -> Asset[P]:
+        view = object.__new__(cls)
+        object.__setattr__(view, "agent", agent)
+        object.__setattr__(view, "_path", path)
+        return view
+
+    def __reduce__(self) -> NoReturn:
+        raise TypeError("persist the agent descriptor and records; assets are contextual views")
+
+    @property
+    def node(self) -> HistoryNode[P]:
+        return self._path[-1].node
+
+    @property
+    def nodes(self) -> tuple[HistoryNode[P], ...]:
+        """Shared prefix through leaf, including child-agent provenance records."""
+        return tuple(step.node for step in self._path)
+
+    @property
+    def observations(self) -> tuple[Observation[P], ...]:
+        """Selected checkpoints, retaining representative AND exact per-env evidence."""
+        return tuple(step.via for step in self._path if isinstance(step.via, Observation))
+
+    @property
+    def messages(self) -> tuple[Message[P], ...]:
+        """The model-visible conversation, using historical representatives."""
+        from .core import Message
+
+        messages = [Message(role="user", content=self.agent.descriptor.prompt)]
+        for index, step in enumerate(self._path):
+            if isinstance(step.via, Observation):
+                assistant = self._path[index - 1].node.assistant
+                assert assistant is not None
+                for call, output in zip(assistant.tool_calls, step.via.representative, strict=True):
+                    messages.append(
+                        Message(role="tool", content=output.tool_output, tool_call_id=call.id)
+                    )
+            elif isinstance(step.via, UserContinuation):
+                messages.append(step.via.message)
+            if step.node.assistant is not None:
+                messages.append(step.node.assistant)
+        return tuple(messages)
+
+    @property
+    def is_complete(self) -> bool:
+        message = self.node.assistant
+        return message is not None and message.role == "assistant" and not message.tool_calls
+
+    @property
+    def published_message(self) -> Message[P] | None:
+        """Latest terminal assistant reply on this path, even before pending feedback work."""
+        for step in reversed(self._path):
+            message = step.node.assistant
+            if message is not None and message.role == "assistant" and not message.tool_calls:
+                return message
+        return None
+
+    @property
+    def has_value(self) -> bool:
+        return self.published_message is not None
+
+    @property
+    def value(self) -> P:
+        """Latest published payload. Raises LookupError if none; a real None remains a value."""
+        message = self.published_message
+        if message is None:
+            raise LookupError("this open asset has no published value yet")
+        return message.content
+
+    @property
+    def env_ids(self) -> tuple[str, ...]:
+        """Known path memberships, not a global/latest environment partition.
+
+        The latest observation bounds membership; later node visits add evidence.
+        Feedback provenance is not an environment gate. Exact repeated visits
+        remain in nodes/observations. In-flight partial tool results are not recorded.
+        """
+        visits = []
+        evidence: tuple[str, ...] = ()
+        for step in reversed(self._path):
+            visits.append(step.node.env_ids)
+            if isinstance(step.via, Observation):
+                evidence = tuple(e.env_id for e in step.via.evidence)
+                break
+        return tuple(dict.fromkeys((*evidence, *(e for group in reversed(visits) for e in group))))
+
+
+# One implementation/model. Persisted class names and fields deliberately retain
+# their historical spellings, so existing pickle and custom codec tags stay valid.
+History = Agent
+AgentDescriptor = HistoryDescriptor
+AgentQuery = HistoryQuery
+AgentResolver: TypeAlias = HistoryResolver[P]
+SubagentRecord = SubagentHistory
+ChildAgentRun = ChildHistoryRun
+ChildAgentUpdate = ChildHistoryUpdate

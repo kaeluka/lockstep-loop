@@ -1,9 +1,9 @@
-//! Immutable shallow records, lazy loading, and caller-owned persistence.
+//! Immutable Agent snapshots, contextual Asset views, and shallow history records.
 //! Payload clones must have immutable value semantics. No core storage I/O.
 
-use crate::{LoopError, Message, ToolCall, ToolSpec};
+use crate::{LoopError, Message, Role, ToolCall, ToolSpec};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::sync::{
     Arc, Mutex,
@@ -53,7 +53,8 @@ pub struct SubagentContract {
     pub subagents: Option<Vec<SubagentContract>>,
 }
 
-/// Exact child compatibility header, without parent/invocation/environment IDs.
+/// AgentQuery: exact child compatibility header, without invocation/environment IDs.
+/// The legacy struct name is retained for persistence codecs.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HistoryQuery<P> {
     pub contract: String,
@@ -66,7 +67,7 @@ pub struct HistoryQuery<P> {
 type Resolver<P> =
     dyn Fn(&HistoryQuery<P>) -> Result<Option<HistoryDescriptor<P>>, LoopError> + Send + Sync;
 
-/// Caller snapshot selection, composing with the existing RecordStore loader.
+/// AgentResolver: caller-owned agent revision selection, using the RecordStore loader.
 pub struct HistoryResolver<P> {
     pub(crate) resolve: Arc<Resolver<P>>,
     pub(crate) prompt_eq: fn(&P, &P) -> bool,
@@ -98,7 +99,8 @@ impl<P> fmt::Debug for HistoryResolver<P> {
     }
 }
 
-/// Small persistence envelope: publish only AFTER its referenced records.
+/// AgentDescriptor: small persistence envelope; publish AFTER its referenced records.
+/// The legacy struct name and fields stay stable for Serde/custom codecs.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HistoryDescriptor<P> {
     pub contract: String,
@@ -109,6 +111,8 @@ pub struct HistoryDescriptor<P> {
     pub subagents: Vec<SubagentContract>,
 }
 
+/// SubagentRecord: parent-call provenance, not the complete child agent itself.
+/// Use Agent::child to inspect the child agent and its assets.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SubagentHistory<P> {
     pub call_id: String,
@@ -117,6 +121,7 @@ pub struct SubagentHistory<P> {
     pub runs: Vec<Arc<ChildHistoryRun<P>>>,
 }
 
+/// ChildAgentRun: one invocation's environments, selected base and resulting revision.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChildHistoryRun<P> {
     pub env_ids: Vec<String>,
@@ -124,7 +129,7 @@ pub struct ChildHistoryRun<P> {
     pub history: HistoryDescriptor<P>,
 }
 
-/// One completed invocation, not a merged cache entry or conversation identity.
+/// ChildAgentUpdate: one completed invocation, not a merged cache or conversation ID.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChildHistoryUpdate<P> {
     pub request_prefix: String,
@@ -133,9 +138,10 @@ pub struct ChildHistoryUpdate<P> {
     pub tool_call: ToolCall,
     pub env_ids: Vec<String>,
     pub base: Option<HistoryDescriptor<P>>,
-    pub history: History<P>,
+    pub history: Agent<P>,
 }
 
+/// Shared prefix or historical endpoint; an Asset also needs its agent/path context.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HistoryNode<P> {
     pub assistant: Option<Message<P>>,
@@ -267,14 +273,15 @@ impl<P> RecordStore<P> {
     }
 }
 
-/// One immutable snapshot plus its resolver. Serialize descriptor and records,
-/// not the resolver. No recursively nested persistence format is needed.
+/// Complete immutable agent: initial prompt, contract and accumulated trie.
+/// This is not a tool definition or a running BatchLoop. Persist its descriptor
+/// and records, not a live resolver or asset view. History is a compatibility alias.
 #[derive(Clone, Debug)]
-pub struct History<P> {
-    pub descriptor: HistoryDescriptor<P>,
+pub struct Agent<P> {
+    pub descriptor: AgentDescriptor<P>,
     pub store: RecordStore<P>,
 }
-impl<P: PartialEq> PartialEq for History<P> {
+impl<P: PartialEq> PartialEq for Agent<P> {
     fn eq(&self, other: &Self) -> bool {
         self.descriptor == other.descriptor
     }
@@ -285,12 +292,27 @@ pub(crate) enum PathStep {
     User(usize),
 }
 
-impl<P> History<P> {
+impl<P> Agent<P> {
+    pub fn prompt(&self) -> &P {
+        &self.descriptor.prompt
+    }
+    pub fn contract(&self) -> &str {
+        &self.descriptor.contract
+    }
     pub fn root(&self) -> Arc<HistoryNode<P>> {
         self.load(&self.descriptor.root)
     }
     pub fn load(&self, reference: &NodeRef) -> Arc<HistoryNode<P>> {
         self.store.load(reference)
+    }
+    /// Lazy leaf inspection. Child agents are separate tries; use child(entry)
+    /// to inspect them. This never executes tools or creates records.
+    pub fn assets(&self) -> Assets<'_, P> {
+        Assets {
+            agent: self,
+            stack: vec![(self.descriptor.root.clone(), 0, None)],
+            path: vec![],
+        }
     }
     pub(crate) fn node(&self, path: &[PathStep]) -> Arc<HistoryNode<P>> {
         let mut node = self.root();
@@ -305,8 +327,8 @@ impl<P> History<P> {
     }
 }
 impl<P: Clone> HistoryDescriptor<P> {
-    pub fn query(&self) -> HistoryQuery<P> {
-        HistoryQuery {
+    pub fn query(&self) -> AgentQuery<P> {
+        AgentQuery {
             contract: self.contract.clone(),
             prompt: self.prompt.clone(),
             tools: self.tools.clone(),
@@ -316,10 +338,10 @@ impl<P: Clone> HistoryDescriptor<P> {
     }
 }
 
-impl<P: Clone> History<P> {
-    pub fn child(&self, entry: &SubagentHistory<P>) -> History<P> {
-        History {
-            descriptor: entry.history.clone(),
+impl<P: Clone> Agent<P> {
+    pub fn child(&self, entry: &SubagentRecord<P>) -> Agent<P> {
+        Agent {
+            descriptor: entry.agent_descriptor().clone(),
             store: self.store.clone(),
         }
     }
@@ -348,10 +370,221 @@ impl<P: Clone> History<P> {
     }
 }
 
+/// AgentOptions: recording/replay configuration, not a second agent snapshot model.
 #[derive(Clone, Debug)]
 pub struct HistoryOptions<P> {
     pub contract: String,
-    pub previous: Option<History<P>>,
+    pub previous: Option<Agent<P>>,
     pub store: Option<RecordStore<P>>,
     pub(crate) prompt_eq: Option<fn(&P, &P) -> bool>,
 }
+
+impl SubagentContract {
+    /// Domain spelling; the persisted field remains history_contract.
+    pub fn agent_contract(&self) -> Option<&str> {
+        self.history_contract.as_deref()
+    }
+}
+impl<P> SubagentHistory<P> {
+    pub fn agent_descriptor(&self) -> &AgentDescriptor<P> {
+        &self.history
+    }
+}
+impl<P> ChildHistoryRun<P> {
+    pub fn agent_descriptor(&self) -> &AgentDescriptor<P> {
+        &self.history
+    }
+}
+impl<P> ChildHistoryUpdate<P> {
+    pub fn agent(&self) -> &Agent<P> {
+        &self.history
+    }
+    pub fn into_agent(self) -> Agent<P> {
+        self.history
+    }
+}
+
+struct AssetStep<P> {
+    node: Arc<HistoryNode<P>>,
+    via: Option<PathStep>,
+}
+impl<P> Clone for AssetStep<P> {
+    fn clone(&self) -> Self {
+        Self {
+            node: self.node.clone(),
+            via: self.via,
+        }
+    }
+}
+
+/// Read-only leaf investigation, in its agent/path context. No IDs, serialization
+/// or resume operation: feedback still resolves agent snapshot + environment.
+/// Asset equality is not defined by the published value.
+pub struct Asset<'a, P> {
+    agent: &'a Agent<P>,
+    path: Vec<AssetStep<P>>,
+}
+
+/// Lazy depth-first inspection of one agent's leaves. Paths copy only record
+/// references once per yielded view; no payload cloning or eager subtree loading.
+pub struct Assets<'a, P> {
+    agent: &'a Agent<P>,
+    stack: Vec<(NodeRef, usize, Option<PathStep>)>,
+    path: Vec<AssetStep<P>>,
+}
+impl<'a, P> Iterator for Assets<'a, P> {
+    type Item = Asset<'a, P>;
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((reference, depth, via)) = self.stack.pop() {
+            self.path.truncate(depth);
+            let node = self.agent.load(&reference);
+            self.path.push(AssetStep {
+                node: node.clone(),
+                via,
+            });
+            if node.observations.is_empty() && node.user_continuations.is_empty() {
+                return Some(Asset {
+                    agent: self.agent,
+                    path: self.path.clone(),
+                });
+            }
+            for (i, edge) in node.user_continuations.iter().enumerate().rev() {
+                self.stack.push((
+                    edge.continuation.clone(),
+                    depth + 1,
+                    Some(PathStep::User(i)),
+                ));
+            }
+            for (i, edge) in node.observations.iter().enumerate().rev() {
+                self.stack.push((
+                    edge.continuation.clone(),
+                    depth + 1,
+                    Some(PathStep::Observation(i)),
+                ));
+            }
+        }
+        None
+    }
+}
+impl<P> Asset<'_, P> {
+    pub fn agent(&self) -> &Agent<P> {
+        self.agent
+    }
+    pub fn node(&self) -> &HistoryNode<P> {
+        &self.path.last().expect("asset has a path").node
+    }
+    /// Shared prefix through leaf, including child-agent provenance records.
+    pub fn nodes(&self) -> Vec<&HistoryNode<P>> {
+        self.path.iter().map(|step| step.node.as_ref()).collect()
+    }
+    /// Selected checkpoints, with both representative and actual per-env evidence.
+    pub fn observations(&self) -> Vec<&Observation<P>> {
+        self.path
+            .iter()
+            .enumerate()
+            .filter_map(|(i, step)| match step.via {
+                Some(PathStep::Observation(edge)) => {
+                    Some(&self.path[i - 1].node.observations[edge])
+                }
+                _ => None,
+            })
+            .collect()
+    }
+    pub fn is_complete(&self) -> bool {
+        self.node()
+            .assistant
+            .as_ref()
+            .is_some_and(|m| m.role == Role::Assistant && m.tool_calls.is_empty())
+    }
+    /// Latest terminal assistant reply, including an ancestor before open feedback work.
+    pub fn published_message(&self) -> Option<&Message<P>> {
+        self.path
+            .iter()
+            .rev()
+            .filter_map(|step| step.node.assistant.as_ref())
+            .find(|m| m.role == Role::Assistant && m.tool_calls.is_empty())
+    }
+    pub fn has_value(&self) -> bool {
+        self.published_message().is_some()
+    }
+    /// None means no publication yet; Some(&None) is a real null optional payload.
+    pub fn value(&self) -> Option<&P> {
+        self.published_message().map(|m| &m.content)
+    }
+    /// Known path memberships, not a global/latest environment partition. The
+    /// latest observation bounds membership; later node visits add evidence.
+    /// Feedback provenance is never an environment gate. Repeated exact evidence
+    /// remains available in observations/nodes; partial in-flight tuples are not recorded.
+    pub fn env_ids(&self) -> Vec<String> {
+        let mut visits = Vec::new();
+        let mut evidence = Vec::new();
+        for (i, step) in self.path.iter().enumerate().rev() {
+            visits.push(&step.node.env_ids);
+            if let Some(PathStep::Observation(edge)) = step.via {
+                evidence.extend(
+                    self.path[i - 1].node.observations[edge]
+                        .evidence
+                        .iter()
+                        .map(|e| e.env_id.as_str()),
+                );
+                break;
+            }
+        }
+        let mut seen = HashSet::new();
+        evidence
+            .into_iter()
+            .chain(
+                visits
+                    .into_iter()
+                    .rev()
+                    .flat_map(|v| v.iter().map(String::as_str)),
+            )
+            .filter(|env| seen.insert(*env))
+            .map(str::to_owned)
+            .collect()
+    }
+}
+impl<P: Clone> Asset<'_, P> {
+    /// The model-visible conversation, using historical representatives.
+    pub fn messages(&self) -> Vec<Message<P>> {
+        let mut messages = vec![Message::user(self.agent.descriptor.prompt.clone())];
+        for (i, step) in self.path.iter().enumerate() {
+            match step.via {
+                Some(PathStep::Observation(edge)) => {
+                    let parent = &self.path[i - 1].node;
+                    let calls = &parent
+                        .assistant
+                        .as_ref()
+                        .expect("observation follows assistant")
+                        .tool_calls;
+                    let outputs = &parent.observations[edge].representative;
+                    assert_eq!(calls.len(), outputs.len(), "malformed observation tuple");
+                    for (call, output) in calls.iter().zip(outputs) {
+                        messages.push(Message::tool(output.tool_output.clone(), call.id.clone()));
+                    }
+                }
+                Some(PathStep::User(edge)) => messages.push(
+                    self.path[i - 1].node.user_continuations[edge]
+                        .message
+                        .clone(),
+                ),
+                None => {}
+            }
+            if let Some(message) = &step.node.assistant {
+                messages.push(message.clone());
+            }
+        }
+        messages
+    }
+}
+
+// One model. Record type/field names remain unchanged for Serde/custom codecs.
+// These aliases are the preferred domain vocabulary, not duplicate wrappers.
+pub use Agent as History;
+pub use ChildHistoryRun as ChildAgentRun;
+pub use ChildHistoryUpdate as ChildAgentUpdate;
+pub use HistoryDescriptor as AgentDescriptor;
+pub use HistoryOptions as AgentOptions;
+pub use HistoryQuery as AgentQuery;
+pub use HistoryResolver as AgentResolver;
+pub use SubagentHistory as SubagentRecord;

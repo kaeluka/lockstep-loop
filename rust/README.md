@@ -4,9 +4,10 @@ Provider-agnostic lockstep orchestration for running one LLM conversation over
 many similar, read-only environments and splitting it only when tool results
 diverge.
 
-[Start with the visual guide](../docs/concepts.md). Conceptually, an agent contains
-its prompt, reuse contract, and accumulated investigation trie; the recorded agent
-snapshot type is currently `History`.
+[Start with the visual guide](../docs/concepts.md). `Agent` contains its initial
+prompt, reuse contract, and complete accumulated investigation trie (`History`
+remains an alias). An `Asset` is a read-only leaf investigation backed by its full
+path, not an answer or environment set. See the [glossary/API mapping](../docs/agent-assets.md).
 
 The crate never calls an LLM. Drive `BatchLoop` directly for arbitrary scheduling,
 or use `run_to_completion` for a serial local-tool driver. Shared reasoning saves
@@ -66,12 +67,14 @@ the caller can produce a valid value of the opaque payload type.
 ## Recording and replay
 
 Opt into recording through `LoopConfig::with_recording(contract)`. Restore a
-snapshot with `with_replay(history, expected_contract)`; constructors still use
+snapshot with `with_agent(agent, expected_contract)` (`with_replay` remains an alias);
+constructors still use
 `BatchLoop::new` (exact equality) or `BatchLoop::with_group_by` (explicit lossy
-policy). Existing loops without these options behave as before. Code using
-Constructor-based callers remain supported. Struct-literal callers must include
-new optional configuration fields (`history`, `feedback`, `subagents`,
-`history_resolver`, `record_store`); `BatchResult` also exposes `child_histories`. Legacy `group_key` labels retain debug
+policy). Existing loops without these options behave as before. Constructor-based
+callers remain supported. Public configuration/result fields keep compatibility
+spellings (`history`, `history_resolver`, `child_histories`); prefer the canonical
+builders and `agent()` / `child_agents()` getters. No duplicate state is stored.
+Legacy `group_key` labels retain debug
 renderings of result tuples. Equal renderings are allowed on distinct edges in
 the result's `Vec`; internal branch IDs remain collision-free.
 
@@ -81,10 +84,10 @@ let config = LoopConfig::new(prompt.clone(), vec!["revision-1".into()], specs.cl
     .with_record_store(RecordStore::new("caller-reserved-writer-namespace"));
 let mut loop_ = BatchLoop::new(config)?;
 // Serve normal requests/completions.
-let snapshot = loop_.history().unwrap(); // immutable root, including active children
-// Also available as loop_.result()?.history after completion.
+let snapshot = loop_.agent().unwrap(); // immutable agent, including active children
+// After completion, loop_.result()?.into_agent() moves out the updated agent.
 let replay_config = LoopConfig::new(prompt, vec!["revision-2".into()], specs)
-    .with_replay(snapshot, "inspect-v1/tools-v1/exact-grouping/provider-v1");
+    .with_agent(snapshot, "inspect-v1/tools-v1/exact-grouping/provider-v1");
 let mut replay = BatchLoop::new(replay_config)?;
 ```
 
@@ -97,25 +100,25 @@ cargo run -p lockstep-loop --example history_replay
 ```
 
 It uses ordinary `serde_json::to_vec`/`from_slice` for **each shallow record** and
-`HistoryDescriptor<String>`, not a recursively encoded `History`. No recursion
+`AgentDescriptor<String>`, not a recursively encoded `Agent`. No recursion
 limit adjustment is needed for deep histories. Storage/codecs are caller-owned.
 
-`History { descriptor, store }` pairs a small envelope with its resolver.
+`Agent { descriptor, store }` pairs a small envelope with its resolver.
 `HistoryNode` is the one internal/public record model. Its observation edges use
 `NodeRef { namespace, index }` addresses, ordered representative
 `OutputRecord { tool_output }` values and exact per-environment evidence. Use
-`history.root()` and `history.load(&edge.continuation)` to inspect nodes. Lossy
+`agent.root()` and `agent.load(&edge.continuation)` to inspect nodes. Lossy
 grouping keeps the original representative context without discarding actual
 outputs. Immutable path-copying updates preserve old records/references. Editing
 owned clones creates different values; payload aliases must remain immutable.
 
-For persistence, iterate `history.store.records()` and encode each `(NodeRef,
+For persistence, iterate `agent.store.records()` and encode each `(NodeRef,
 Arc<HistoryNode<P>>)` individually. Insert immutable records first (reject address
-collisions), then atomically publish `history.descriptor`. Restore with:
+collisions), then atomically publish `agent.descriptor`. Restore with:
 
 ```rust
-let history = History {
-    descriptor: serde_json::from_slice::<HistoryDescriptor<String>>(&published)?,
+let agent = Agent {
+    descriptor: serde_json::from_slice::<AgentDescriptor<String>>(&published)?,
     store: RecordStore::with_loader("fresh-reserved-writer-namespace", move |reference| {
         // Caller loader: read/decode ONE immutable record; no replay/matching here.
         Arc::new(serde_json::from_slice(&backend[reference]).unwrap())
@@ -138,7 +141,7 @@ wire format or validation of arbitrary imported graphs is promised. See the
 
 **Nested subagents:** `HistoryNode.subagents` entries associate an assistant call
 ID with a latest child descriptor and immutable `runs` recording inherited envs,
-selected bases and resulting revisions. Inspect with `history.child(entry)`.
+selected bases and resulting revisions. Inspect with `agent.child(entry)`.
 Core replay reruns child
 tools lazily, supports mixed ordinary/subagent calls and configured nesting depth,
 and folds child final answers into parent matching. Parent classes do not split
@@ -148,7 +151,7 @@ snapshots preserve fulfilled turns without serializing pending tool builders.
 **Compatibility:** contract IDs must be non-empty and equal; prompt equality,
 ordered tool specs, default/custom grouping mode and subagent spec/depth are also
 checked. Child contracts are checked on entry. The
-`with_replay` builder requires `P: PartialEq` for prompt checking (recording alone
+`with_agent` builder requires `P: PartialEq` for prompt checking (recording alone
 does not). The caller versions tool implementation semantics, custom grouping,
 subagent prompt/spec-building callbacks, and provider/adapter settings in the
 contract. Closures cannot be introspected.
@@ -168,6 +171,37 @@ side effects and orphan append-only preparation records are not rolled back.
 Discard the live loop after an arbitrary callback panic. See the
 [transaction boundary](../docs/history-reference.md#transactional-child-preparation-and-callback-failures).
 
+### Inspecting assets
+
+```rust
+let agent = result.agent().unwrap();
+for asset in agent.assets() {
+    println!("{:?}: complete={}", asset.env_ids(), asset.is_complete());
+    if let Some(value) = asset.value() { println!("{value:?}"); }
+    println!("{:?}", asset.messages());
+    // asset.observations(): selected checkpoints with full per-env evidence
+}
+```
+
+`Asset<'_, P>` borrows the immutable agent and retains its root-to-leaf record
+references. Keep that agent value alive while using views. Inspection does not
+clone payloads; owned `messages()` requires `P: Clone`. An open asset may retain
+an ancestor's published value while `is_complete()` is false, or have no value.
+`Some(&None)` is a real null optional payload, distinct from no publication.
+Known `env_ids()` are checkpoint/visit evidence, not a global latest partition.
+The view has no persisted ID or feedback/resume API. Child-agent leaves are not
+parent assets; inspect `agent.child(entry).assets()` separately. Traversal is lazy,
+iterative, read-only, and performed only when requested.
+
+```sh
+cargo run -p lockstep-loop --example agent_assets
+```
+
+The [end-to-end example](examples/agent_assets.rs) loads an agent, replays an
+environment, inspects its asset, resolves feedback through tools again, and saves
+the new agent while retaining old/open snapshots. See
+[view semantics and compatibility](../docs/agent-assets.md).
+
 ### Specialized tools and independent child caches
 
 ```rust
@@ -180,14 +214,14 @@ let imports = SubagentTool::try_new(
     },
     |_| Ok(repo_tool_specs()),
     1,
-).with_history_contract("imports/template-v1/tools-v1/grouping-v1/provider-v1")
+).with_agent_contract("imports/template-v1/tools-v1/grouping-v1/provider-v1")
  .with_subagents(vec![]);
 
 let config = LoopConfig::new(parent_prompt, env_ids, ordinary_parent_specs)
     .with_subagents(vec![imports, other_specialist])
     .with_recording("parent/v2")
     .with_record_store(RecordStore::with_loader(fresh_writer_namespace, load_node))
-    .with_history_resolver(move |query| {
+    .with_agent_resolver(move |query| {
         Ok(selected.get(&(query.contract.clone(), query.prompt.clone())).cloned())
     });
 let mut loop_ = BatchLoop::new(config)?;
@@ -207,13 +241,13 @@ There is no JSON Schema validator or fuzzy matching. Different file paths under
 the example's template get different prompts/tries, not new environment IDs.
 Children always inherit the parent's environment set.
 
-`with_history_resolver` accepts a synchronous caller callback returning
-`Result<Option<HistoryDescriptor<P>>, LoopError>` for a `HistoryQuery<P>` containing
+`with_agent_resolver` accepts a synchronous caller callback returning
+`Result<Option<AgentDescriptor<P>>, LoopError>` for an `AgentQuery<P>` containing
 only child prompt, child contract version, ordered tools, grouping mode and nested
-configuration. It requires `P: PartialEq`, like `with_replay`, for full compatibility
+configuration. It requires `P: PartialEq`, like `with_agent`, for full compatibility
 checks. Return None for a miss; return a chosen descriptor for a hit. Index hashes
 or abbreviated keys never replace core equality checks. Each registered definition
-must have an explicit non-empty `.with_history_contract(...)` when using a resolver.
+must have an explicit non-empty `.with_agent_contract(...)` when using a resolver.
 Child grouping is inherited: its contract must cover that function's semantics,
 child tools/templates and provider settings, independently of parent wording.
 Without a resolver, missing child contracts retain legacy parent-owned recording;
@@ -223,15 +257,16 @@ The existing `RecordStore` is the node-loading boundary for both parent and sele
 child roots. Supply a shared in-memory store or one whose loader resolves all
 referenced addresses across your backends. Metadata selection does not import a
 foreign store. Persist shallow writes before publishing descriptors; no core I/O
-or parallel persistence model is added. Root selection remains `with_replay`.
+or parallel persistence model is added. Agent snapshot selection remains `with_agent`.
 
-`BatchResult.child_histories` contains separate `ChildHistoryUpdate` values for
+`BatchResult::child_agents()` exposes separate `ChildAgentUpdate` values for
 completed recorded invocations, including descendants when the containing child
-finishes. Each includes `history` (descriptor + store), selected `base`, original
+finishes. Each exposes `agent()` (descriptor + store), selected `base`, original
 `tool_call`, inherited `env_ids`, and parent branch/depth plus the existing run-local
 request prefix for provenance. No runtime prefix is used in cache lookup or accepted
 as a feedback target. `HistoryNode.subagents[*].runs` shares immutable invocation
-records through `Arc`, retaining old roots even as `history` aliases the latest run.
+records through `Arc`, retaining old roots even as `agent_descriptor()` exposes
+the latest run (stored field `history`).
 Persist updates with the normal descriptor/record codecs. A store's writes may
 include parent/orphan records, but a child descriptor needs no parent descriptor
 to replay. Concurrent hits on one base remain independent executions and updates;
@@ -265,22 +300,23 @@ arbitrary callback panics remain unrecovered. No factories are rerun at commit.
 Budgets remain unsupported wherever child recording is enabled. No environment
 binding/remapping, new system-role API, logical asset registry or scheduler is added.
 
-**Record-schema migration:** descriptors now use ordered `subagents` rather than
-singular `subagent`, and invocation records add `runs`. Inspect these new fields in
-codecs/UIs. No cross-version wire format is promised; migrate prior singular headers
-in caller codecs or record new histories. `SubagentTool::new` and singular loop
-constructors remain supported; exact redundant advertisements preserve old callers.
+**Naming compatibility:** canonical names are aliases to the existing record types,
+not a second model. Serde names/fields remain unchanged, including `history` and
+`history_contract`. No storage migration is required for this rename. The earlier
+specialized-subagent change introduced ordered `subagents` and `runs`; migrations
+from before that change remain caller-owned. Existing constructors and legacy
+getters/setters stay supported. See the [exact mapping](../docs/agent-assets.md#preferred-names-and-compatibility).
 
 ### Feedback and shared-path resumption
 
 ```rust
 let config = LoopConfig::new(prompt, vec!["revision-1".into()], specs)
-    .with_replay(snapshot, "inspect-v1/tools-v1/exact-grouping/provider-v1")
+    .with_agent(snapshot, "inspect-v1/tools-v1/exact-grouping/provider-v1")
     .with_feedback("Also inspect /foo and revise if needed.".to_owned());
 let mut loop_ = BatchLoop::new(config)?;
 // Serve ordinary requests/completions. Resolution reruns tools with no fresh
 // LLM work; once the old answer is located, feedback is appended and work resumes.
-// let revised = loop_.result()?;  // after completion; revised.history is a new snapshot
+// let revised = loop_.result()?;  // after completion; revised.agent() is a new snapshot
 ```
 
 Run the complete [caller-side feedback example](examples/feedback.rs):
@@ -289,7 +325,7 @@ Run the complete [caller-side feedback example](examples/feedback.rs):
 cargo run -p lockstep-loop --example feedback
 ```
 
-A feedback operation requires supplied history and **one environment for locating
+A feedback operation requires a supplied agent and **one environment for locating
 the target**, not an environment-specific scope. In the new snapshot, **every
 environment reaching that observation path inherits the continuation**, including
 old siblings and new commit IDs. Additional tools can split them on new evidence.
@@ -310,7 +346,7 @@ is unseen/unfulfilled; it never generates an answer to manufacture a target. It
 can be returned by construction or by `complete` after valid tool evidence arrives.
 A later failure cancels queued/outstanding work; `is_done()` is true, `error()`
 exposes the failure, `next_request()` returns None, and `result()`/further
-completions return the stored error. `history()` reverts to the supplied root on
+completions return the stored error. `agent()` reverts to the supplied root on
 a resolution miss; append-only orphan writes may remain. Invalid completion sets,
 duplicate IDs and wrong kinds remain correctable and do not set `error()`.
 An open earlier feedback continuation cannot be targeted by another explicit
@@ -335,20 +371,21 @@ classification, alternate scope modes or environment binding is implemented.
 Budgets remain unsupported for recorded execution, before and after injection.
 “Once” is per live operation, not crash-safe exactly-once publication.
 
-**Limits:** recording still rejects budgets; use direct `BatchLoop`, not convenience
-drivers. No core storage I/O, async loader, eviction/GC, or independent-root merge.
+**Limits:** recording still rejects budgets; root agent recording/replay requires
+direct `BatchLoop`. Serial drivers can expose recorded child-agent updates.
+No core storage I/O, async loader, eviction/GC, or independent-root merge.
 Stores retain local writes/cached loads; deep path copying can have quadratic
 write volume. Pending requests/partial tuples are not persisted, so tools restart
 on replay: this is not in-flight crash recovery. Invalid completions remain
 correctable, including nested routes. `stats.depth` includes reused turns;
-`split_depth` is local to the new execution. Current subagents use one configured
-reserved tool; independent child-cache lookup across changed parent prompts is
-not implemented. Dedicated asset/publication APIs, DAG scheduling, and UI are not
-implemented. See the
+`split_depth` is local to the new execution. Multiple specialized tools and
+independent child-agent lookup are supported. Asset views are inspection only;
+result-tool publication, DAG scheduling and UI remain unimplemented. See the
 [shared design and limitations](../docs/history-reference.md#immutable-recorded-history-and-incremental-replay).
 
 See `tests/loop.rs`, `tests/history.rs`, `tests/history_foundation.rs`,
-`tests/request_routing.rs` and `tests/feedback.rs` for
+`tests/request_routing.rs`, `tests/feedback.rs`, `tests/specialized_subagents.rs`
+and `tests/agent_assets.rs` for
 regressions including 256-turn shallow-record persistence with default JSON
 limits, lazy traversal, nested evidence/equal parent answers, open user
 continuations, shared-path feedback inheritance, explicit resolution misses,

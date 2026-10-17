@@ -4,13 +4,21 @@
 //! environments. Tool calls fan out over every environment in the class; the
 //! class splits only when tool results differ. The caller owns all LLM and
 //! tool execution and may complete requests in any order.
+//!
+//! An immutable [`Agent`] contains the initial prompt, compatible execution
+//! contract and accumulated trie. Its [`Asset`] views are leaf investigations
+//! backed by their complete conversations, not just published values or
+//! environment classes. [`History`] remains an alias; persistence fields stay
+//! compatible. Feedback still resolves an agent snapshot + environment by replay.
 
 mod history;
 use history::PathStep;
 pub use history::{
-    ChildHistoryRun, ChildHistoryUpdate, EnvObservation, History, HistoryDescriptor, HistoryNode,
-    HistoryOptions, HistoryQuery, HistoryResolver, NodeRef, Observation, OutputRecord, RecordStore,
-    SubagentContract, SubagentHistory, UserContinuation,
+    Agent, AgentDescriptor, AgentOptions, AgentQuery, AgentResolver, Asset, Assets, ChildAgentRun,
+    ChildAgentUpdate, ChildHistoryRun, ChildHistoryUpdate, EnvObservation, History,
+    HistoryDescriptor, HistoryNode, HistoryOptions, HistoryQuery, HistoryResolver, NodeRef,
+    Observation, OutputRecord, RecordStore, SubagentContract, SubagentHistory, SubagentRecord,
+    UserContinuation,
 };
 
 use indexmap::IndexMap;
@@ -288,9 +296,18 @@ impl<P> SubagentTool<P> {
         }
     }
 
-    pub fn with_history_contract(mut self, contract: impl Into<String>) -> Self {
+    pub fn with_agent_contract(mut self, contract: impl Into<String>) -> Self {
         self.history_contract = Some(contract.into());
         self
+    }
+
+    /// Compatibility spelling of with_agent_contract.
+    pub fn with_history_contract(self, contract: impl Into<String>) -> Self {
+        self.with_agent_contract(contract)
+    }
+
+    pub fn agent_contract(&self) -> Option<&str> {
+        self.history_contract.as_deref()
     }
 
     pub fn with_subagents(mut self, subagents: Vec<SubagentTool<P>>) -> Self {
@@ -347,10 +364,12 @@ pub struct LoopConfig<P> {
     pub tool_specs: Vec<ToolSpec>,
     pub subagent: Option<SubagentTool<P>>,
     pub subagents: Option<Vec<SubagentTool<P>>>,
-    pub history_resolver: Option<HistoryResolver<P>>,
+    /// Compatibility field; configure agent lookup with with_agent_resolver.
+    pub history_resolver: Option<AgentResolver<P>>,
     pub record_store: Option<RecordStore<P>>,
     pub budget: Option<Budget<P>>,
-    pub history: Option<HistoryOptions<P>>,
+    /// Compatibility field; configure recorded agents with with_agent/with_recording.
+    pub history: Option<AgentOptions<P>>,
     /// Some(payload) is one intervention; even Some(None) for an optional payload.
     pub feedback: Option<P>,
 }
@@ -373,7 +392,7 @@ impl<P> LoopConfig<P> {
 
     /// Enable recording; the caller versions the complete reuse contract.
     pub fn with_recording(mut self, contract: impl Into<String>) -> Self {
-        self.history = Some(HistoryOptions {
+        self.history = Some(AgentOptions {
             contract: contract.into(),
             previous: None,
             store: None,
@@ -383,17 +402,25 @@ impl<P> LoopConfig<P> {
     }
 
     /// Reuse a snapshot under an explicitly attested compatible contract.
-    pub fn with_replay(mut self, previous: History<P>, contract: impl Into<String>) -> Self
+    pub fn with_agent(mut self, previous: Agent<P>, contract: impl Into<String>) -> Self
     where
         P: PartialEq,
     {
-        self.history = Some(HistoryOptions {
+        self.history = Some(AgentOptions {
             contract: contract.into(),
             previous: Some(previous),
             store: None,
             prompt_eq: Some(PartialEq::eq),
         });
         self
+    }
+
+    /// Compatibility spelling of with_agent; still resolves environments through replay.
+    pub fn with_replay(self, previous: Agent<P>, contract: impl Into<String>) -> Self
+    where
+        P: PartialEq,
+    {
+        self.with_agent(previous, contract)
     }
 
     /// Select the shared record resolver/writer for root and child recording.
@@ -415,9 +442,9 @@ impl<P> LoopConfig<P> {
         self
     }
 
-    pub fn with_history_resolver(
+    pub fn with_agent_resolver(
         mut self,
-        resolver: impl Fn(&HistoryQuery<P>) -> Result<Option<HistoryDescriptor<P>>, LoopError>
+        resolver: impl Fn(&AgentQuery<P>) -> Result<Option<AgentDescriptor<P>>, LoopError>
         + Send
         + Sync
         + 'static,
@@ -425,8 +452,22 @@ impl<P> LoopConfig<P> {
     where
         P: PartialEq,
     {
-        self.history_resolver = Some(HistoryResolver::new(resolver));
+        self.history_resolver = Some(AgentResolver::new(resolver));
         self
+    }
+
+    /// Compatibility spelling of with_agent_resolver.
+    pub fn with_history_resolver(
+        self,
+        resolver: impl Fn(&AgentQuery<P>) -> Result<Option<AgentDescriptor<P>>, LoopError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self
+    where
+        P: PartialEq,
+    {
+        self.with_agent_resolver(resolver)
     }
 
     pub fn with_subagent(mut self, subagent: SubagentTool<P>) -> Self {
@@ -465,8 +506,22 @@ pub struct BatchResult<P> {
     pub tree: SplitNode,
     pub classes: Vec<EnvClass>,
     pub results: BTreeMap<String, P>,
-    pub history: Option<History<P>>,
-    pub child_histories: Vec<ChildHistoryUpdate<P>>,
+    /// Compatibility field; prefer agent() for the recorded agent snapshot.
+    pub history: Option<Agent<P>>,
+    /// Compatibility field; prefer child_agents().
+    pub child_histories: Vec<ChildAgentUpdate<P>>,
+}
+
+impl<P> BatchResult<P> {
+    pub fn agent(&self) -> Option<&Agent<P>> {
+        self.history.as_ref()
+    }
+    pub fn into_agent(self) -> Option<Agent<P>> {
+        self.history
+    }
+    pub fn child_agents(&self) -> &[ChildAgentUpdate<P>] {
+        &self.child_histories
+    }
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -557,8 +612,8 @@ struct ChildLink<P, K> {
     child: Box<BatchLoop<P, K>>,
     branch_id: String,
     call: ToolCall,
-    base: Option<HistoryDescriptor<P>>,
-    prior_runs: Vec<Arc<ChildHistoryRun<P>>>,
+    base: Option<AgentDescriptor<P>>,
+    prior_runs: Vec<Arc<ChildAgentRun<P>>>,
 }
 
 struct PreparedChildren<P, K> {
@@ -634,7 +689,7 @@ struct ChildRoute {
 pub struct BatchLoop<P, K = P> {
     specs: Vec<ToolSpec>,
     subagents: IndexMap<String, SubagentTool<P>>,
-    history_resolver: Option<HistoryResolver<P>>,
+    history_resolver: Option<AgentResolver<P>>,
     record_store: Option<RecordStore<P>>,
     unavailable_subagents: HashSet<String>,
     group_by: Arc<GroupFunction<P, K>>,
@@ -646,15 +701,15 @@ pub struct BatchLoop<P, K = P> {
     next_child: u64,
     branches: HashMap<String, Branch<P>>,
     partition: Vec<BranchRecord>, // legacy per-run partition summary
-    recorded: Option<History<P>>,
+    recorded: Option<Agent<P>>,
     feedback: Option<P>,
     resolve_only: bool,
-    resolution_base: Option<History<P>>,
+    resolution_base: Option<Agent<P>>,
     error: Option<LoopError>,
     prompt_eq: Option<fn(&P, &P) -> bool>,
     custom_grouping: bool,
     finals: Vec<FinalBranch<P>>,
-    child_histories: Vec<ChildHistoryUpdate<P>>,
+    child_histories: Vec<ChildAgentUpdate<P>>,
     ready_llm: VecDeque<LlmRequest<P>>,
     ready_tool: VecDeque<ToolRequest>,
     outstanding: HashMap<String, Request<P>>,
@@ -792,8 +847,8 @@ where
                     .store
                     .or_else(|| config.record_store.clone())
                     .unwrap_or_default();
-                Some(History {
-                    descriptor: HistoryDescriptor {
+                Some(Agent {
+                    descriptor: AgentDescriptor {
                         contract: options.contract,
                         prompt: config.prompt.clone(),
                         tools: registry.specs.clone(),
@@ -1008,13 +1063,13 @@ where
     }
 
     /// A structurally shared snapshot; builders and pending requests are not persisted.
-    pub fn history(&self) -> Option<History<P>> {
+    pub fn agent(&self) -> Option<Agent<P>> {
         let mut snapshot = self.recorded.clone()?;
         for link in self.children.values() {
             let child = link
                 .child
-                .history()
-                .expect("recorded parent has recorded children");
+                .agent()
+                .expect("recorded parent has recorded child agents");
             let branch = &self.branches[&link.branch_id];
             let current = snapshot.node(&branch.history_path);
             if current.subagents.iter().any(|old| {
@@ -1026,12 +1081,12 @@ where
             }
             let mut node = current.as_ref().clone();
             let mut runs = link.prior_runs.clone();
-            runs.push(Arc::new(ChildHistoryRun {
+            runs.push(Arc::new(ChildAgentRun {
                 env_ids: branch.env_ids.clone(),
                 base: link.base.clone(),
                 history: child.descriptor.clone(),
             }));
-            let entry = SubagentHistory {
+            let entry = SubagentRecord {
                 call_id: link.call.id.clone(),
                 history: child.descriptor,
                 runs,
@@ -1050,10 +1105,15 @@ where
         Some(snapshot)
     }
 
+    /// Compatibility spelling of agent().
+    pub fn history(&self) -> Option<Agent<P>> {
+        self.agent()
+    }
+
     /// Fork an open shared-path continuation of an already completed run. This
     /// legacy helper does not resume this loop. Prefer with_feedback for strict
     /// replay-only resolution before resumption. No endpoint ID is accepted.
-    pub fn append_user_message(&mut self, content: P) -> Result<History<P>, LoopError> {
+    pub fn append_user_message(&mut self, content: P) -> Result<Agent<P>, LoopError> {
         if let Some(error) = &self.error {
             return Err(error.clone());
         }
@@ -1182,7 +1242,7 @@ where
                     .insert(link.call.id.clone(), child_result.results);
                 self.child_histories.extend(child_result.child_histories);
                 if let Some(history) = child_result.history {
-                    self.child_histories.push(ChildHistoryUpdate {
+                    self.child_histories.push(ChildAgentUpdate {
                         request_prefix: link.child.id_prefix.clone(),
                         branch_id: branch.branch_id.clone(),
                         depth: branch.steps,
@@ -1464,13 +1524,13 @@ where
         if let Some(history) = &self.recorded {
             let node = history.node(&branch.history_path);
             if let Some(entry) = node.subagents.iter().find(|s| s.call_id == call.id) {
-                previous = Some(History {
-                    descriptor: entry.history.clone(),
+                previous = Some(Agent {
+                    descriptor: entry.agent_descriptor().clone(),
                     store: history.store.clone(),
                 });
                 prior_runs = entry.runs.clone();
                 if prior_runs.is_empty() {
-                    prior_runs.push(Arc::new(ChildHistoryRun {
+                    prior_runs.push(Arc::new(ChildAgentRun {
                         env_ids: vec![],
                         base: None,
                         history: entry.history.clone(),
@@ -1486,7 +1546,7 @@ where
         if previous.is_none()
             && let Some(resolver) = &self.history_resolver
         {
-            let query = HistoryQuery {
+            let query = AgentQuery {
                 contract: contract.clone().expect("independent child has a contract"),
                 prompt: prompt.clone(),
                 tools: registry.specs.clone(),
@@ -1494,7 +1554,7 @@ where
                 subagents: registry.contracts,
             };
             if let Some(descriptor) = (resolver.resolve)(&query)? {
-                previous = Some(History {
+                previous = Some(Agent {
                     descriptor,
                     store: self
                         .record_store
@@ -1504,7 +1564,7 @@ where
             }
         }
         let base = previous.as_ref().map(|h| h.descriptor.clone());
-        let history_options = contract.map(|contract| HistoryOptions {
+        let history_options = contract.map(|contract| AgentOptions {
             contract,
             previous,
             store: self.record_store.clone(),

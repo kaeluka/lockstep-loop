@@ -1,7 +1,7 @@
 //! cargo run -p lockstep-loop --example specialized_subagents
 //! Caller metadata selection + ordinary RecordStore loading. Initial prompts use USER role.
 use lockstep_loop::{
-    BatchLoop, BatchResult, Completion, HistoryDescriptor, LlmCompletion, LoopConfig, LoopError,
+    AgentDescriptor, BatchLoop, BatchResult, Completion, LlmCompletion, LoopConfig, LoopError,
     NodeRef, RecordStore, Request, RequestKind, SubagentTool, ToolCall, ToolCompletion, ToolSpec,
 };
 use serde_json::{Value, json};
@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 type Backend = Arc<Mutex<BTreeMap<NodeRef, Vec<u8>>>>;
-type Cache = Arc<Mutex<BTreeMap<(String, String), HistoryDescriptor<String>>>>;
+type Cache = Arc<Mutex<BTreeMap<(String, String), AgentDescriptor<String>>>>;
 const CHILD_CONTRACT: &str = "imports/template-v1/read-semantics-v1/exact-grouping";
 fn schema() -> Value {
     json!({"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"], "additionalProperties": false})
@@ -40,7 +40,7 @@ fn imports() -> SubagentTool<String> {
         |_| Ok(vec![read_spec()]),
         1,
     )
-    .with_history_contract(CHILD_CONTRACT)
+    .with_agent_contract(CHILD_CONTRACT)
     .with_subagents(vec![])
 }
 fn investigate(
@@ -59,7 +59,7 @@ fn investigate(
         .with_subagents(vec![imports()])
         .with_recording(format!("parent-policy:{parent_prompt}"))
         .with_record_store(store)
-        .with_history_resolver(move |query| {
+        .with_agent_resolver(move |query| {
             // Fixed configuration in this example; core still checks full compatibility.
             Ok(selected
                 .lock()
@@ -134,13 +134,13 @@ fn investigate(
         (parent_llms, child_llms, child_tools),
     )
 }
-fn publish(result: &BatchResult<String>, backend: &Backend) -> HistoryDescriptor<String> {
-    assert_eq!(result.child_histories.len(), 1); // concurrent updates need explicit caller coordination
-    let history = &result.child_histories[0].history;
+fn publish(result: &BatchResult<String>, backend: &Backend) -> AgentDescriptor<String> {
+    assert_eq!(result.child_agents().len(), 1); // concurrent updates need explicit caller coordination
+    let agent = result.child_agents()[0].agent();
     let mut backend = backend.lock().unwrap();
     // Insert-only shallow records BEFORE publishing any descriptor. No parent
     // descriptor is required to load this child investigation in another run.
-    for (reference, node) in history.store.records() {
+    for (reference, node) in agent.store.records() {
         let bytes = serde_json::to_vec(&node).unwrap();
         if let Some(old) = backend.get(&reference) {
             assert_eq!(old, &bytes);
@@ -148,7 +148,7 @@ fn publish(result: &BatchResult<String>, backend: &Backend) -> HistoryDescriptor
             backend.insert(reference, bytes);
         }
     }
-    serde_json::from_slice(&serde_json::to_vec(&history.descriptor).unwrap()).unwrap()
+    serde_json::from_slice(&serde_json::to_vec(&agent.descriptor).unwrap()).unwrap()
 }
 fn main() {
     let cache = Cache::default();
@@ -163,7 +163,7 @@ fn main() {
         &backend,
     );
     assert_eq!(counts, (2, 2, 1));
-    let original = first.child_histories[0].history.clone();
+    let original = first.child_agents()[0].agent();
     let selected = publish(&first, &backend);
     cache.lock().unwrap().insert(
         (selected.contract.clone(), selected.prompt.clone()),
@@ -178,14 +178,14 @@ fn main() {
     );
     assert_eq!(counts, (2, 0, 1));
     assert_eq!(second.results["repo@commit-2"], "os, sys");
-    let update = &second.child_histories[0];
+    let update = &second.child_agents()[0];
     assert_eq!(update.base.as_ref(), Some(&selected));
-    assert_ne!(update.history.descriptor.root, selected.root);
+    assert_ne!(update.agent().descriptor.root, selected.root);
     assert_eq!(original.root().env_ids, ["repo@commit-1"]);
-    let parent_root = second.history.as_ref().unwrap().root();
+    let parent_root = second.agent().unwrap().root();
     let provenance = parent_root.subagents[0].runs.last().unwrap();
     assert_eq!(provenance.base.as_ref(), Some(&selected));
-    assert_eq!(provenance.history, update.history.descriptor);
+    assert_eq!(provenance.agent_descriptor(), &update.agent().descriptor);
     let updated = publish(&second, &backend);
     cache
         .lock()

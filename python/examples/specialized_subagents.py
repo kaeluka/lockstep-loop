@@ -42,9 +42,8 @@ IMPORTS = SubagentTool(
     parameters=SCHEMA,
     build_prompt=imports_prompt,
     sub_tool_specs=lambda _: (READ,),
-    history_contract="imports/template-v1/read-semantics-v1/exact-grouping",
     subagents=(),
-)
+).with_agent_contract("imports/template-v1/read-semantics-v1/exact-grouping")
 
 
 def investigate(parent_prompt, env, cache, backend):
@@ -60,9 +59,9 @@ def investigate(parent_prompt, env, cache, backend):
         env_ids=[env],
         tool_specs=[],
         subagents=[IMPORTS],
-        history_contract=f"parent-policy:{parent_prompt}",
+        agent_contract=f"parent-policy:{parent_prompt}",
         record_store=store,
-        history_resolver=resolve,
+        agent_resolver=resolve,
     )
     parent_llms = child_llms = child_tools = 0
     while not loop.done:
@@ -104,7 +103,7 @@ if __name__ == "__main__":
     cache, backend = {}, {}
     first, counts = investigate("Parent A: analyze dependencies", "repo@commit-1", cache, backend)
     assert counts == (2, 2, 1)
-    original = first.child_histories[0].history
+    original = first.child_agents[0].agent
     # Persist shallow records BEFORE publishing the selected child descriptor.
     # Trusted pickle only; choose your own codecs and backend in production.
     selected = pickle.loads(persist(original, backend))
@@ -115,14 +114,14 @@ if __name__ == "__main__":
     )
     assert counts == (2, 0, 1)  # parent regenerated, child reasoning reused, child tool rerun
     assert second.results == {"repo@commit-2": "os, sys"}
-    update = second.child_histories[0]
+    update = second.child_agents[0]
     assert update.base == selected
-    assert update.history.descriptor.root != selected.root
+    assert update.agent.descriptor.root != selected.root
     assert original.root.env_ids == ("repo@commit-1",)
-    provenance = second.history.root.subagents[0].runs[-1]
-    assert provenance.base == selected and provenance.history == update.history.descriptor
+    provenance = second.agent.root.subagents[0].runs[-1]
+    assert provenance.base == selected and provenance.agent_descriptor == update.agent.descriptor
     # There is one update for this query here. Concurrent invocations would yield
     # separate entries; selecting/merging/publishing them is a caller decision.
-    updated = pickle.loads(persist(update.history, backend))
+    updated = pickle.loads(persist(update.agent, backend))
     cache[(updated.contract, updated.prompt)] = updated
     print("Changed parent: 2 fresh parent LLM calls, 0 child LLM calls, 1 child tool rerun")
