@@ -1,7 +1,10 @@
 # lockstep-loop for Python
 
 Share an investigation across similar, read-only environments, branching only
-when observations differ. [Start with the visual guide](../docs/concepts.md).
+when observations differ. An environment can be a document bundle, a product
+specification, a dataset release, or a repository snapshot—not necessarily a
+filesystem. [Start with the visual guide](../docs/concepts.md) or explore
+[use cases and tool designs](../docs/use-cases.md).
 
 `Agent` is the complete immutable prompt + reuse contract + accumulated trie
 (`History` remains an alias). `Asset` is a read-only leaf investigation backed by
@@ -58,13 +61,27 @@ def complete_llm(req):  # the only provider seam
                          tool_calls=resp.tool_calls)
 
 result = run_to_completion(
-    prompt="summarize what src/pkgA contains",
-    env_ids=["fork-1", "fork-2", "fork-3"],
+    prompt="Assess whether the supplier's submitted evidence is complete.",
+    env_ids=["packet-a/v1", "packet-b/v1", "packet-c/v2"],
     tools=make_tools,          # env_id -> tool impls (specs must be identical)
     complete_llm=complete_llm,
 )
 # result.tree, result.classes, result.results (env_id -> final message)
 ```
+
+`make_tools(env_id)` binds reads to that frozen evidence packet. The tool specs
+are the same for every packet; routing IDs stay outside model-visible content.
+The library supplies neither document extraction nor compliance judgments.
+
+For a complete, provider-free product-ratings example:
+
+```sh
+PYTHONPATH=src python examples/product_screening.py
+```
+
+[Source](examples/product_screening.py): three products share one initial LLM turn,
+ratings split them into two classes, and a matching new product replays with zero
+new LLM calls. The scripted replies demonstrate orchestration, not model quality.
 
 For parallel serving, drive `BatchLoop` yourself (scheduling sketch):
 
@@ -86,15 +103,15 @@ options retain their behavior. Legacy `history` spellings remain aliases:
 
 ```python
 loop = BatchLoop(
-    prompt="inspect", env_ids=["revision-1"], tool_specs=specs,
-    agent_contract="inspect-v1/tool-semantics-v1/exact-grouping/provider-v1",
+    prompt="Assess the evidence packet.", env_ids=["packet-a/v1"], tool_specs=specs,
+    agent_contract="assessment-v1/tool-semantics-v1/exact-grouping/provider-v1",
 )
 # Drive the ordinary requests/completions as above.
 snapshot = loop.agent             # immutable agent, including fulfilled turns
 # After completion: snapshot = loop.result().agent
 next_loop = BatchLoop(
-    prompt="inspect", env_ids=["revision-2"], tool_specs=specs,
-    agent_contract="inspect-v1/tool-semantics-v1/exact-grouping/provider-v1",
+    prompt="Assess the evidence packet.", env_ids=["packet-a/v2"], tool_specs=specs,
+    agent_contract="assessment-v1/tool-semantics-v1/exact-grouping/provider-v1",
     agent=snapshot,
 )
 ```
@@ -196,17 +213,17 @@ while retaining old and open snapshots. No new stored leaf identities are added.
 ```python
 from lockstep_loop import BatchLoop, RecordStore, SubagentTool, ToolSpec
 
-imports = SubagentTool(
-    name="list_imports", description="List imported packages.",
-    parameters={"type": "object", "properties": {"file_path": {"type": "string"}},
-                "required": ["file_path"], "additionalProperties": False},
-    build_prompt=lambda args: f"List imports in {args['file_path']!r}.",
-    sub_tool_specs=lambda env: repo_tool_specs,
+study_design = SubagentTool(
+    name="assess_design", description="Assess a study-design criterion.",
+    parameters={"type": "object", "properties": {"criterion": {"type": "string"}},
+                "required": ["criterion"], "additionalProperties": False},
+    build_prompt=lambda args: f"Assess study design against criterion {args['criterion']!r}.",
+    sub_tool_specs=lambda env: study_tool_specs,
     subagents=(),  # explicit leaf
-).with_agent_contract("imports/template-v1/tools-v1/grouping-v1/provider-v1")
+).with_agent_contract("study-design/template-v1/tools-v1/grouping-v1/provider-v1")
 loop = BatchLoop(
-    prompt="A revised parent investigation", env_ids=["repo@immutable-commit"],
-    tool_specs=ordinary_parent_specs, subagents=[imports, another_specialist],
+    prompt="Screen the study against our review criteria.", env_ids=["study-packet/v2"],
+    tool_specs=ordinary_parent_specs, subagents=[study_design, another_specialist],
     agent_contract="parent/v2",
     agent_resolver=lambda query: selected.get((query.contract, query.prompt)),
     record_store=RecordStore(load=load_node),
@@ -218,10 +235,12 @@ in `tool_specs`. The child prompt is an initial **user** message, not a system
 message. The caller must construct it deterministically and validate structured
 args (the example above's minimal lambda raises on a missing key; the executable
 example validates keys/types). The core neither evaluates JSON Schema nor
-normalizes file paths or paraphrases delegation. Distinct file paths yield distinct
-prompts/tries under this template. Child environment IDs are inherited unchanged.
+canonicalizes criterion names or paraphrases delegation. Distinct criteria yield
+distinct prompts/tries under this template. Child environment IDs are inherited
+unchanged: the specialist reads the same study packet as the parent.
 
-Run the full [independent-cache example](examples/specialized_subagents.py):
+The full [independent-cache example](examples/specialized_subagents.py) uses file
+imports as a small fixture for this same protocol:
 
 ```sh
 PYTHONPATH=src python examples/specialized_subagents.py
@@ -300,10 +319,10 @@ naming. Old constructors/fields remain usable; see the
 from lockstep_loop import BatchLoop, Feedback, FeedbackResolutionError
 
 loop = BatchLoop(
-    prompt="inspect", env_ids=["revision-1"], tool_specs=specs,
-    agent_contract="inspect-v1/tool-semantics-v1/exact-grouping/provider-v1",
+    prompt="Assess the evidence packet.", env_ids=["packet-a/v1"], tool_specs=specs,
+    agent_contract="assessment-v1/tool-semantics-v1/exact-grouping/provider-v1",
     agent=snapshot,
-    feedback=Feedback("Also inspect /foo and revise if needed."),
+    feedback=Feedback("Also check certificate exclusions and revise if needed."),
 )
 # Serve ordinary requests/completions. Resolution reruns tools but emits NO new
 # LLM work until an existing completed conversation has been found and feedback appended.
@@ -357,7 +376,7 @@ that loop; use constructor feedback for strict resolution and resumption.
 
 **Caveat:** feedback changes the investigation for the entire path, not a private
 annotation on one environment. Express transferable instructions (“check whether
-X”), not unqualified commit-specific assertions, or retain a separate snapshot.
+X”), not unqualified subject-specific assertions, or retain a separate snapshot.
 There is no automatic rewriting/classification, scope switch or environment
 binding. Budgets remain rejected for recorded execution, including both resolution
 and the new continuation. “Once” is per live operation, not crash-safe publication.

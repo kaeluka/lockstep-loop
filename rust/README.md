@@ -2,7 +2,9 @@
 
 Provider-agnostic lockstep orchestration for running one LLM conversation over
 many similar, read-only environments and splitting it only when tool results
-diverge.
+diverge. Environments can be archived study documents, product specifications,
+contract bundles, dataset releases, or repository snapshots. The core has no
+built-in subject type or evidence backend; see [use cases](../docs/use-cases.md).
 
 [Start with the visual guide](../docs/concepts.md). `Agent` contains its initial
 prompt, reuse contract, and complete accumulated investigation trie (`History`
@@ -22,8 +24,8 @@ use lockstep_loop::{
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut loop_ = BatchLoop::new(LoopConfig::new(
-        "inspect the repository".to_owned(),
-        vec!["fork-a".to_owned(), "fork-b".to_owned()],
+        "Explain the assessment checklist.".to_owned(),
+        vec!["packet-a/v1".to_owned(), "packet-b/v1".to_owned()],
         vec![],
     ))?;
 
@@ -42,10 +44,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let result = loop_.result()?;
-    assert_eq!(result.results["fork-a"], "done");
+    assert_eq!(result.results["packet-a/v1"], "done");
     Ok(())
 }
 ```
+
+For a complete product-ratings fixture that actually exercises tool fan-out,
+branching, and reuse across new specification snapshots:
+
+```sh
+cargo run -p lockstep-loop --example product_screening
+```
+
+[Source](examples/product_screening.rs): three products share one initial LLM turn,
+ratings split them into two classes, and a matching new product uses zero new LLM
+calls. Scripted replies demonstrate the protocol, not product-certification advice.
 
 With real tools, handle `Request::Tool` by executing its call once per
 `request.env_ids` entry, then return a `ToolCompletion` containing every result.
@@ -205,20 +218,20 @@ the new agent while retaining old/open snapshots. See
 ### Specialized tools and independent child caches
 
 ```rust
-let imports = SubagentTool::try_new(
-    ToolSpec::new("list_imports", "List imported packages.", schema),
+let study_design = SubagentTool::try_new(
+    ToolSpec::new("assess_design", "Assess a study-design criterion.", schema),
     |args| {
-        let path = args["file_path"].as_str().ok_or_else(||
-            LoopError::InvalidSubagentArguments("file_path must be a string".into()))?;
-        Ok(format!("List imports in {path:?}."))
+        let criterion = args["criterion"].as_str().ok_or_else(||
+            LoopError::InvalidSubagentArguments("criterion must be a string".into()))?;
+        Ok(format!("Assess study design against criterion {criterion:?}."))
     },
-    |_| Ok(repo_tool_specs()),
+    |_| Ok(study_tool_specs()),
     1,
-).with_agent_contract("imports/template-v1/tools-v1/grouping-v1/provider-v1")
+).with_agent_contract("study-design/template-v1/tools-v1/grouping-v1/provider-v1")
  .with_subagents(vec![]);
 
 let config = LoopConfig::new(parent_prompt, env_ids, ordinary_parent_specs)
-    .with_subagents(vec![imports, other_specialist])
+    .with_subagents(vec![study_design, other_specialist])
     .with_recording("parent/v2")
     .with_record_store(RecordStore::with_loader(fresh_writer_namespace, load_node))
     .with_agent_resolver(move |query| {
@@ -227,7 +240,9 @@ let config = LoopConfig::new(parent_prompt, env_ids, ordinary_parent_specs)
 let mut loop_ = BatchLoop::new(config)?;
 ```
 
-Run the complete [caller-side example](examples/specialized_subagents.rs):
+Here `schema` requires a string `criterion`, and `env_ids` identify frozen study
+packets. The complete [caller-side example](examples/specialized_subagents.rs)
+uses file imports as a small fixture for this same independent-cache protocol:
 
 ```sh
 cargo run -p lockstep-loop --example specialized_subagents
@@ -236,10 +251,10 @@ cargo run -p lockstep-loop --example specialized_subagents
 
 All registered specs are advertised automatically. `build_prompt` produces initial
 **user** content, not a system message. Structured argument interpretation,
-validation, deterministic templates and any path normalization belong to the caller.
-There is no JSON Schema validator or fuzzy matching. Different file paths under
-the example's template get different prompts/tries, not new environment IDs.
-Children always inherit the parent's environment set.
+validation, deterministic templates and any criterion canonicalization belong to
+the caller. There is no JSON Schema validator or fuzzy matching. Different criteria
+under this template get different prompts/tries, not new environment IDs.
+Children inherit the parent's environment set and read the same study packets.
 
 `with_agent_resolver` accepts a synchronous caller callback returning
 `Result<Option<AgentDescriptor<P>>, LoopError>` for an `AgentQuery<P>` containing
@@ -312,7 +327,7 @@ getters/setters stay supported. See the [exact mapping](../docs/agent-assets.md#
 ```rust
 let config = LoopConfig::new(prompt, vec!["revision-1".into()], specs)
     .with_agent(snapshot, "inspect-v1/tools-v1/exact-grouping/provider-v1")
-    .with_feedback("Also inspect /foo and revise if needed.".to_owned());
+    .with_feedback("Also check certificate exclusions and revise if needed.".to_owned());
 let mut loop_ = BatchLoop::new(config)?;
 // Serve ordinary requests/completions. Resolution reruns tools with no fresh
 // LLM work; once the old answer is located, feedback is appended and work resumes.
@@ -328,7 +343,7 @@ cargo run -p lockstep-loop --example feedback
 A feedback operation requires a supplied agent and **one environment for locating
 the target**, not an environment-specific scope. In the new snapshot, **every
 environment reaching that observation path inherits the continuation**, including
-old siblings and new commit IDs. Additional tools can split them on new evidence.
+old subjects and newly submitted snapshots. Additional tools can split them on new evidence.
 Unrelated paths and old roots are untouched. There is no session/endpoint handle
 or value-triggered feedback map. Source-environment metadata is provenance only.
 A new explicit operation resolves the latest completed continuation and appends
@@ -366,7 +381,7 @@ constructor feedback is the strict resolution/resumption operation.
 
 **Caveat:** this is a path-wide investigative improvement, not a private annotation.
 Use transferable instructions (“check whether X”) rather than unqualified
-commit-specific assertions, or keep a separate snapshot. No rewriting, semantic
+subject-specific assertions, or keep a separate snapshot. No rewriting, semantic
 classification, alternate scope modes or environment binding is implemented.
 Budgets remain unsupported for recorded execution, before and after injection.
 “Once” is per live operation, not crash-safe exactly-once publication.

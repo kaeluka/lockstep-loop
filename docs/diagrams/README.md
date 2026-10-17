@@ -4,12 +4,14 @@
 
 | Concept | SVG preview | PNG preview | Editable source |
 | --- | --- | --- | --- |
-| Agent, conversation, assets, subdivision | [SVG](agent-trie.svg) | [PNG](agent-trie.png) | [Excalidraw](agent-trie.excalidraw) |
-| Replay across commits | [SVG](replay.svg) | [PNG](replay.png) | [Excalidraw](replay.excalidraw) |
-| Immutable feedback and inheritance | [SVG](feedback.svg) | [PNG](feedback.png) | [Excalidraw](feedback.excalidraw) |
-| Child divergence containment | [SVG](subagents.svg) | [PNG](subagents.png) | [Excalidraw](subagents.excalidraw) |
+| Product checks: agent, conversation, assets | [SVG](agent-trie.svg) | [PNG](agent-trie.png) | [Excalidraw](agent-trie.excalidraw) |
+| Dataset releases: replay | [SVG](replay.svg) | [PNG](replay.png) | [Excalidraw](replay.excalidraw) |
+| Supplier evidence: feedback and inheritance | [SVG](feedback.svg) | [PNG](feedback.png) | [Excalidraw](feedback.excalidraw) |
+| Research screening: child divergence containment | [SVG](subagents.svg) | [PNG](subagents.png) | [Excalidraw](subagents.excalidraw) |
 
-The guide supplies descriptive alt text. Labels are intentionally abbreviated;
+The four domains illustrate the same generic state machine; none is a built-in
+integration or privileged environment type. The guide supplies descriptive alt
+text. Labels are intentionally abbreviated;
 the library records full evidence, not these diagram summaries. Blue denotes
 shared reasoning, green completed values, orange new work/feedback, and purple
 child investigations. Text labels convey the meaning without relying on color.
@@ -48,5 +50,7 @@ npx -y mcp-excalidraw-server render docs/diagrams/replay.excalidraw \
   --format svg --out docs/diagrams/replay.svg
 ```
 
-The original shared canvas was snapshotted but not edited; all drawing took place
-on the isolated loopback canvas. No diagram was uploaded to a public service.
+The original layout was drawn on an isolated loopback canvas. The domain-neutral
+documentation rewrite updated the saved labels, rendered both formats offline,
+and visually checked all four PNGs for clipping, overlaps, and readability.
+No diagram was uploaded to a public service.

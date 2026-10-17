@@ -3,6 +3,9 @@
 [Visual guide](concepts.md) · [Documentation](README.md) · [Repository](../README.md)
 
 This is the technical contract for the current Python and Rust implementations.
+It applies to any supported read-only evidence domain: documents, specifications,
+datasets, source code, and others. For concrete environment/tool designs, see
+[use cases](use-cases.md); tools and evidence ingestion remain caller-owned.
 `Agent` is the complete immutable snapshot: initial prompt, reuse contract, and
 accumulated trie. `Asset` is a read-only leaf investigation backed by its full path.
 See the [glossary, inspection API and exact compatibility mapping](agent-assets.md).
@@ -62,11 +65,12 @@ Register multiple `SubagentTool` definitions using Python `subagents=[...]` or
 Rust `LoopConfig::with_subagents(vec![...])`. Each definition supplies structured
 argument specs and `build_prompt(args)`: the **caller**, not the model/core,
 constructs the deterministic initial **user** message. There is no system-role
-API. Repeating `list_imports(file_path="foo.py")` can reuse the same child reasoning
-under a differently worded parent. Different file paths produce different prompts/
-tries unless the caller intentionally canonicalizes them; the core never normalizes
-paths or uses fuzzy/semantic prompt matching. All children inherit the parent's
-environment IDs unchanged. Resolve mutable repository references outside the core.
+API. Repeating `assess_design(criterion="randomized")` can reuse the same child
+reasoning under a differently worded research-screening parent. Different criteria
+produce different prompts/tries unless the caller intentionally canonicalizes
+them; the core never uses fuzzy/semantic prompt matching. The same pattern works
+for `list_imports(file_path="foo.py")` in code analysis. All children inherit the
+parent's environment IDs unchanged. Resolve mutable evidence sources outside the core.
 
 Give each independently cached definition an explicit non-empty agent contract
 using `.with_agent_contract(...)` (legacy constructor/wire field `history_contract`), versioning its template/tool,
@@ -160,8 +164,8 @@ Child prompt/spec contracts are checked when the child is entered. The caller
 must also change the contract when tool implementation **semantics**, subagent
 prompt/spec-building callbacks, grouping semantics, provider
 settings, or adapter behavior change: these cannot be inferred from closures or
-specs. A new repository revision is an environment change, not a tool semantic
-change. Custom grouping must be pure, deterministic, and use stable equality/
+specs. A revised document bundle, dataset release, or repository commit is an
+environment change, not a tool semantic change. Custom grouping must be pure, deterministic, and use stable equality/
 hashing. It deliberately permits lossy reuse. Never use environment IDs in the
 model-visible prompt, arguments, schemas or tool responses.
 
@@ -252,8 +256,8 @@ scope gates, value-to-feedback maps, public session IDs, or endpoint shortcuts**
 Existing `resolved_env_id` metadata is provenance only; it never selects a path.
 
 **Caller caveat:** this revises the investigation for the entire path, not a
-private annotation on one environment. An assertion such as “this commit
-introduces vulnerability X” is not automatically safe to generalize. Prefer
+private annotation on one environment. An assertion such as “this supplier's
+certificate is expired” is not automatically safe to generalize. Prefer
 transferable investigative instructions such as “check whether X”, or retain a
 separate snapshot. The library does not rewrite/classify feedback or offer
 alternate scope modes. Under custom lossy grouping, inheritance uses the same

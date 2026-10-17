@@ -21,6 +21,12 @@ The package name, replay, grouping, scheduling, request IDs, feedback scope and
 storage protocol are unchanged. This is a vocabulary/API-view change, not an
 asset publication or dependency-DAG system.
 
+These terms are domain-neutral. A study-screening agent may have assets concluding
+“eligible” or “insufficient evidence”; a dataset-intake agent may have assets with
+different quality findings. Two supplier reviews can publish the same value while
+retaining different supporting conversations. See [use cases](use-cases.md) for
+concrete prompts, environment boundaries, and tools.
+
 ## Inspecting assets
 
 Python's `agent.assets()` lazily yields frozen `Asset` views; Rust returns an
@@ -151,8 +157,11 @@ cargo run -p lockstep-loop --example agent_assets
 [Python source](../python/examples/agent_assets.py) ·
 [Rust source](../rust/examples/agent_assets.rs)
 
-Both examples load an agent, replay a new environment, inspect an asset's value
-and conversation, resolve feedback by replay (not via the view), inspect an open
-continuation with its prior value, persist the updated agent, and show that the
-old snapshot still has its original asset. Shared-path inheritance and subdivision
-remain unchanged. No model/provider account or storage service is needed.
+Both examples use a small file-inspection fixture. They load an agent, replay a
+new environment, inspect its asset's value and conversation, resolve feedback by
+replay (not via the view), and persist the updated agent. They also inspect an
+open continuation with its prior value and verify that the old snapshot retains
+its original asset. Shared-path inheritance and subdivision remain unchanged.
+No model/provider account or storage service is needed. For a different domain,
+see the product-specification [Python](../python/examples/product_screening.py)
+and [Rust](../rust/examples/product_screening.rs) demos; the asset model is the same.
