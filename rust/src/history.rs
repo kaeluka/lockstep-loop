@@ -1,7 +1,7 @@
 //! Immutable shallow records, lazy loading, and caller-owned persistence.
 //! Payload clones must have immutable value semantics. No core storage I/O.
 
-use crate::{Message, ToolSpec};
+use crate::{LoopError, Message, ToolCall, ToolSpec};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -48,6 +48,54 @@ pub struct UserContinuation<P> {
 pub struct SubagentContract {
     pub spec: ToolSpec,
     pub max_depth: usize,
+    pub history_contract: Option<String>,
+    /// None means bounded self-recursion; Some is the explicit child allowlist.
+    pub subagents: Option<Vec<SubagentContract>>,
+}
+
+/// Exact child compatibility header, without parent/invocation/environment IDs.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HistoryQuery<P> {
+    pub contract: String,
+    pub prompt: P,
+    pub tools: Vec<ToolSpec>,
+    pub custom_grouping: bool,
+    pub subagents: Vec<SubagentContract>,
+}
+
+type Resolver<P> =
+    dyn Fn(&HistoryQuery<P>) -> Result<Option<HistoryDescriptor<P>>, LoopError> + Send + Sync;
+
+/// Caller snapshot selection, composing with the existing RecordStore loader.
+pub struct HistoryResolver<P> {
+    pub(crate) resolve: Arc<Resolver<P>>,
+    pub(crate) prompt_eq: fn(&P, &P) -> bool,
+}
+impl<P: PartialEq> HistoryResolver<P> {
+    pub fn new(
+        resolve: impl Fn(&HistoryQuery<P>) -> Result<Option<HistoryDescriptor<P>>, LoopError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            resolve: Arc::new(resolve),
+            prompt_eq: PartialEq::eq,
+        }
+    }
+}
+impl<P> Clone for HistoryResolver<P> {
+    fn clone(&self) -> Self {
+        Self {
+            resolve: self.resolve.clone(),
+            prompt_eq: self.prompt_eq,
+        }
+    }
+}
+impl<P> fmt::Debug for HistoryResolver<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("HistoryResolver { .. }")
+    }
 }
 
 /// Small persistence envelope: publish only AFTER its referenced records.
@@ -58,13 +106,34 @@ pub struct HistoryDescriptor<P> {
     pub tools: Vec<ToolSpec>,
     pub custom_grouping: bool,
     pub root: NodeRef,
-    pub subagent: Option<SubagentContract>,
+    pub subagents: Vec<SubagentContract>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SubagentHistory<P> {
     pub call_id: String,
     pub history: HistoryDescriptor<P>,
+    #[serde(default = "Vec::new")]
+    pub runs: Vec<Arc<ChildHistoryRun<P>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChildHistoryRun<P> {
+    pub env_ids: Vec<String>,
+    pub base: Option<HistoryDescriptor<P>>,
+    pub history: HistoryDescriptor<P>,
+}
+
+/// One completed invocation, not a merged cache entry or conversation identity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChildHistoryUpdate<P> {
+    pub request_prefix: String,
+    pub branch_id: String,
+    pub depth: usize,
+    pub tool_call: ToolCall,
+    pub env_ids: Vec<String>,
+    pub base: Option<HistoryDescriptor<P>>,
+    pub history: History<P>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -152,6 +221,9 @@ impl<P> RecordStore<P> {
         store.loader = Some(Arc::new(loader));
         store
     }
+    pub(crate) fn same_store(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.records, &other.records)
+    }
     pub fn put(&self, node: HistoryNode<P>) -> NodeRef {
         let mut records = self.records.lock().expect("record store poisoned");
         let reference = NodeRef {
@@ -232,7 +304,25 @@ impl<P> History<P> {
         node
     }
 }
+impl<P: Clone> HistoryDescriptor<P> {
+    pub fn query(&self) -> HistoryQuery<P> {
+        HistoryQuery {
+            contract: self.contract.clone(),
+            prompt: self.prompt.clone(),
+            tools: self.tools.clone(),
+            custom_grouping: self.custom_grouping,
+            subagents: self.subagents.clone(),
+        }
+    }
+}
+
 impl<P: Clone> History<P> {
+    pub fn child(&self, entry: &SubagentHistory<P>) -> History<P> {
+        History {
+            descriptor: entry.history.clone(),
+            store: self.store.clone(),
+        }
+    }
     pub(crate) fn replace_node(&mut self, path: &[PathStep], node: HistoryNode<P>) {
         let mut ancestors = Vec::new();
         let mut parent = self.root();

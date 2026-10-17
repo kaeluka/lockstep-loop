@@ -63,6 +63,7 @@ def state(loop):
         loop.outstanding_llm,
         loop.outstanding_tool,
         loop.error,
+        tuple(loop._child_histories),
     )
 
 

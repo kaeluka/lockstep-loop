@@ -30,8 +30,9 @@ The history model is the replay engine's model, not a lossy export:
   With custom lossy grouping, replay keeps the **original representative
   conversation**, while appending the new environment's actual, possibly unequal
   outputs to evidence.
-- `HistoryNode.subagents` retains a full child history descriptor per assistant
-  call ID, including children still open when a snapshot is captured. Children
+- `HistoryNode.subagents` retains the latest child history descriptor per assistant
+  call ID and immutable per-invocation `runs` (environments, selected base revision,
+  resulting child root), including a current run still open when captured. Children
   use the same shallow records/resolver and may themselves invoke subagents up
   to the configured depth (the reserved spec is omitted at the depth limit).
   Replay reruns child tools; child trace splits do NOT
@@ -49,11 +50,103 @@ outputs. Branch IDs are run-local scheduling identifiers. Repeated environment
 IDs append visits/evidence rather than overwriting them; use revision-qualified
 IDs if you need to distinguish runs in an inspector.
 
+### Specialized tools and independently reusable child histories
+
+Register multiple `SubagentTool` definitions using Python `subagents=[...]` or
+Rust `LoopConfig::with_subagents(vec![...])`. Each definition supplies structured
+argument specs and `build_prompt(args)`: the **caller**, not the model/core,
+constructs the deterministic initial **user** message. There is no system-role
+API. Repeating `list_imports(file_path="foo.py")` can reuse the same child reasoning
+under a differently worded parent. Different file paths produce different prompts/
+tries unless the caller intentionally canonicalizes them; the core never normalizes
+paths or uses fuzzy/semantic prompt matching. All children inherit the parent's
+environment IDs unchanged. Resolve mutable repository references outside the core.
+
+Give each independently cached definition an explicit non-empty
+`history_contract` / `.with_history_contract(...)`, versioning its template/tool,
+inherited grouping, and provider/adapter semantics independently of the parent.
+Configure `history_resolver` / `.with_history_resolver(...)` to receive a
+`HistoryQuery`: child prompt, child contract version, ordered effective tool specs,
+grouping mode, and nested subagent configuration. It contains **no parent prompt,
+branch/invocation ID, tool-call ID, or environment membership**. The caller returns
+a chosen `HistoryDescriptor`, or None for a miss (Rust wraps this in `Result`).
+Core verifies full compatibility by value; a bad hit is an error, not a silent miss.
+Hashes may index the caller's cache but cannot replace those equality checks.
+
+This composes with the existing `RecordStore`: the loop and child descriptors must
+use one caller-resolvable record-address domain. Pass a shared in-memory store or
+a store whose loader can resolve every referenced record, across caller-chosen
+backends if needed. The resolver selects **metadata/revisions**; the existing node
+loader loads records lazily. No second execution/storage framework or core I/O is
+introduced. Root history selection remains explicit via `history`/`with_replay`.
+A metadata callback returning a descriptor does not supply its records: the shared
+store must be able to load them. Persist writes before publishing selected roots.
+
+**Selection precedence and feedback:** a recorded parent invocation pins its
+recorded child descriptor. Replay uses that revision and does not consult a mutable
+cache pointer for that invocation. Only a new/unrecorded invocation consults the
+resolver. A changed parent prompt starts a new parent history and can select a
+recorded child. The selected child can include feedback; its shared-path user
+continuations are replayed normally, including their tool calls. A prompt key is
+not a unique revision. Updating a cache index does not rewrite completed parents
+or automatically propagate changed child results. New parent investigations (or
+new invocations after explicit parent feedback) can select updated child roots.
+Strict feedback resolution never uses an external hit to manufacture missing
+parent-invocation provenance.
+
+`BatchResult.child_histories` returns **every completed recorded invocation**,
+including descendants once their containing invocation completes. Each update has
+its full `History` handle (descriptor + store), selected `base` descriptor or None,
+original tool call, inherited env IDs, parent branch/depth and existing run-local
+request prefix for provenance. That prefix is not a cache key, conversation ID,
+or feedback shortcut. Two concurrent invocations of the same base have independent
+builders and separate updates; no single-flight, root merging or last-writer-wins
+cache publication occurs in core. The caller chooses which returned revision to
+publish. Parent `SubagentHistory.runs` retains earlier invocation roots rather than
+replacing their evidence. `history` aliases the latest run for existing inspection;
+`history.child(entry)` attaches the same record resolver to it. While a parent is
+running, its normal history snapshot still exposes its active child roots. Store
+write sets may include parent/orphan records; a child descriptor is an independent
+entry point and needs no parent descriptor to replay.
+
+**Registration/depth rules:** names must be unique. Ordinary spec names duplicated
+within `tool_specs`, duplicate subagent definitions, conflicting ordinary/subagent
+specs, and mixed singular/plural registration are rejected. For old direct-loop
+callers, an exactly matching `ToolSpec` is accepted as a redundant advertisement
+of a reserved subagent, not as another executor. Serial drivers register **all**
+subagent entries and reject actual callable/subagent name collisions even when
+specs match. Subagent specs are automatically advertised, so callers need not
+repeat them. Without a resolver, legacy definitions lacking their own contract
+retain parent-owned recording behavior. With a resolver, all registered definitions
+must supply explicit independent child contracts; no parent contract is guessed.
+
+Each definition may declare its own child `subagents` allowlist. Empty means leaf;
+None preserves legacy **self** recursion, never all parent siblings. At each spawn,
+nested definitions' `max_depth` is clamped to the caller's remaining depth. A nested
+definition cannot reset the budget. Only those eligible definitions are advertised;
+known ancestor/sibling/depth-disabled reserved specs are omitted and calls to them
+are rejected, never sent to ordinary execution. General unknown ordinary-tool
+handling remains caller-owned; this is not a JSON Schema validator. Validate args
+in `build_prompt` (Rust `try_new` supports fallible prompt/spec factories).
+
+Executable independent-cache examples (from the repository root):
+
+```sh
+(cd python && PYTHONPATH=src python examples/specialized_subagents.py)
+cargo run -p lockstep-loop --example specialized_subagents
+```
+
+They show fresh parent reasoning but **zero fresh child LLM calls** after changing
+the parent prompt, while rerunning the child's tool and publishing a separate
+updated child root. No environment binding, logical asset registry, or DAG
+invalidation/scheduling is included.
+
 ### Compatibility and ownership
 
 Replay requires an explicit, non-empty caller-managed **contract version**. The
 core rejects a changed contract, unequal prompt, changed ordered tool specs, or
-a switch between default and custom grouping, or changed subagent spec/depth.
+a switch between default and custom grouping, or changed subagent registration,
+contract version, nesting allowlist or depth.
 Child prompt/spec contracts are checked when the child is entered. The caller
 must also change the contract when tool implementation **semantics**, subagent
 prompt/spec-building callbacks, grouping semantics, provider
@@ -230,11 +323,14 @@ also be measured from `python/` (100/400/1000 environments, no recording):
 PYTHONPATH=src python benchmarks/split_completion.py --repeats 3
 ```
 
-Rust reports library-detected nested incompatibility as `IncompatibleHistory`,
-not a panic. A constructor rejects it directly; a later transition enters the
-normal terminal error state with no half-started assistant turn or stranded
-requests. Validated preceding tool evidence may already be recorded, but no
-partial result is returned. Arbitrary Rust callback panics are **not** recovered;
+Rust's `SubagentTool::try_new` and history resolver return structured errors.
+While preparing a fresh LLM completion, argument/spec/resolver/compatibility errors
+leave its request outstanding for correction, without partial child spawning.
+A constructor rejects incompatible history directly. Errors encountered while
+replaying an already-recorded assistant turn are terminal (there is no fresh
+assistant request to correct): pending work is cancelled, `error()`/`result()`
+report the failure, and no partial result is returned. Preceding valid tool evidence
+may already be recorded. Arbitrary Rust callback panics are **not** recovered;
 discard the live loop if one occurs.
 
 Neither language rolls back caller side effects or append-only store allocations.

@@ -35,10 +35,14 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Generic, Literal, Protocol, TypeAlias, TypeVar, cast, overload
 
 from .history import (
+    ChildHistoryRun,
+    ChildHistoryUpdate,
     EnvObservation,
     History,
     HistoryDescriptor,
     HistoryNode,
+    HistoryQuery,
+    HistoryResolver,
     Observation,
     OutputRecord,
     RecordStore,
@@ -228,11 +232,55 @@ class SubagentTool(Generic[P]):
     description: str
     parameters: Mapping[str, Any]
     build_prompt: Callable[[Mapping[str, Any]], P]
-    """Build the child loop's root prompt from the tool-call arguments."""
+    """Deterministically build the child's initial USER content; validate args here."""
     sub_tool_specs: Callable[[str], Sequence[ToolSpec]]
     """Spec provider for the child loop's tools (one env id -> all specs)."""
     max_depth: int = 1
-    """How many levels below this loop sub-agents may still spawn (children get max_depth-1)."""
+    """Total spawn depth below this call site; nested definitions are clamped to the remainder."""
+    history_contract: str | None = None
+    """Explicit independent child contract. Required when using a history_resolver."""
+    subagents: tuple[SubagentTool[P], ...] | None = None
+    """Child allowlist. None preserves bounded self-recursion; () makes this a leaf."""
+
+
+def _subagent_contract(sub: SubagentTool[P]) -> SubagentContract:
+    return SubagentContract(
+        ToolSpec(sub.name, sub.description, sub.parameters),
+        sub.max_depth,
+        sub.history_contract,
+        None if sub.subagents is None else tuple(_subagent_contract(s) for s in sub.subagents),
+    )
+
+
+def _registration(
+    specs: Sequence[ToolSpec], definitions: Sequence[SubagentTool[P]], *, independent: bool
+) -> tuple[tuple[ToolSpec, ...], dict[str, SubagentTool[P]], tuple[SubagentContract, ...]]:
+    advertised = list(specs)
+    by_name: dict[str, ToolSpec] = {}
+    for spec in advertised:
+        if spec.name in by_name:
+            raise ValueError(f"duplicate tool name {spec.name!r}")
+        by_name[spec.name] = spec
+    registered: dict[str, SubagentTool[P]] = {}
+    for sub in definitions:
+        if sub.name in registered:
+            raise ValueError(f"duplicate subagent name {sub.name!r}")
+        if sub.max_depth < 1:
+            raise ValueError("subagent.max_depth must be >= 1")
+        if sub.history_contract == "" or (independent and sub.history_contract is None):
+            raise ValueError(
+                "child history_contract must be non-empty and is required with history_resolver"
+            )
+        spec = ToolSpec(sub.name, sub.description, sub.parameters)
+        if sub.name in by_name:
+            if by_name[sub.name] != spec:
+                raise ValueError(f"conflicting ordinary/subagent spec for {sub.name!r}")
+            # Exact redundant advertisements are allowed for legacy callers.
+        else:
+            advertised.append(spec)
+            by_name[sub.name] = spec
+        registered[sub.name] = sub
+    return tuple(advertised), registered, tuple(_subagent_contract(s) for s in definitions)
 
 
 @dataclass(frozen=True)
@@ -287,6 +335,7 @@ class BatchResult(Generic[P]):
     """Final assistant message per environment (identical within a class)."""
 
     history: History[P] | None = None
+    child_histories: tuple[ChildHistoryUpdate[P], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -334,6 +383,8 @@ class _ChildLink(Generic[P]):
     branch_id: str
     call: ToolCall
     ordinal: int
+    base: HistoryDescriptor[P] | None
+    prior_runs: tuple[ChildHistoryRun[P], ...]
 
 
 class _Transition(Generic[P]):
@@ -488,6 +539,8 @@ class BatchLoop(Generic[P]):
         env_ids: Sequence[str],
         tool_specs: Sequence[ToolSpec],
         subagent: SubagentTool[P] | None = None,
+        subagents: Sequence[SubagentTool[P]] | None = None,
+        history_resolver: HistoryResolver[P] | None = None,
         group_by: Callable[[P], Hashable] | None = None,
         budget: Budget | None = None,
         history_contract: str | None = None,
@@ -497,29 +550,38 @@ class BatchLoop(Generic[P]):
         _id_prefix: str = "",
         _resolve_only: bool = False,
         _defer_failure: bool = False,
+        _unavailable_subagents: frozenset[str] = frozenset(),
     ) -> None:
         envs = tuple(env_ids)
         if not envs:
             raise ValueError("env_ids must be non-empty")
         if len(set(envs)) != len(envs):
             raise ValueError("env_ids must be unique")
-        if subagent is not None and subagent.max_depth < 1:
-            raise ValueError("subagent.max_depth must be >= 1")
-        self._specs = tuple(tool_specs)
-        sub_contract = (
-            SubagentContract(
-                ToolSpec(subagent.name, subagent.description, subagent.parameters),
-                subagent.max_depth,
-            )
-            if subagent
-            else None
+        if subagent is not None and subagents is not None:
+            raise ValueError("use subagent or subagents, not both")
+        definitions = (
+            tuple(subagents) if subagents is not None else ((subagent,) if subagent else ())
         )
+        self._specs, self._subagents, sub_contracts = _registration(
+            tool_specs, definitions, independent=history_resolver is not None
+        )
+        self._history_resolver = history_resolver
+        self._unavailable_subagents = _unavailable_subagents - self._subagents.keys()
+        independent = history_resolver is not None or any(
+            s.history_contract is not None for s in definitions
+        )
+        if independent and budget is not None:
+            raise ValueError("recorded child histories do not support budgets")
         if feedback is not None and not isinstance(feedback, Feedback):
             raise TypeError("feedback must be Feedback(content), or None for no intervention")
         if feedback is not None and (history is None or len(envs) != 1):
             raise ValueError("feedback requires a supplied history and exactly one environment")
         if history is not None and history_contract is None:
             raise ValueError("replay requires an explicit history_contract")
+        if history is not None and "subagents" not in vars(history.descriptor):
+            # Old pickles bypass __init__: do not let the new empty-tuple class
+            # default silently erase their former singular registration.
+            raise ValueError("migrate legacy history descriptor from subagent to subagents")
         if history_contract is not None:
             if not history_contract:
                 raise ValueError("history_contract must be non-empty")
@@ -530,7 +592,7 @@ class BatchLoop(Generic[P]):
                 or history.descriptor.prompt != prompt
                 or history.descriptor.tools != self._specs
                 or history.descriptor.custom_grouping != (group_by is not None)
-                or history.descriptor.subagent != sub_contract
+                or history.descriptor.subagents != sub_contracts
             ):
                 raise ValueError(
                     "incompatible history contract, prompt, tools, grouping "
@@ -545,14 +607,15 @@ class BatchLoop(Generic[P]):
                         self._specs,
                         group_by is not None,
                         store.put(HistoryNode()),
-                        sub_contract,
+                        sub_contracts,
                     ),
                     store,
                 )
             elif record_store is not None and record_store is not history.store:
                 raise ValueError("replay uses the snapshot's record store")
-        elif record_store is not None:
-            raise ValueError("record_store requires history_contract")
+        self._record_store = history.store if history else record_store
+        if self._record_store is None and independent:
+            self._record_store = RecordStore()
         self._custom_grouping = group_by is not None
         self._recorded = history
         self._feedback = feedback
@@ -561,7 +624,6 @@ class BatchLoop(Generic[P]):
         self._error: _ExecutionError | None = None
         self._next_branch = 0
         self._next_child = 0
-        self._subagent = subagent
         self._id_prefix = _id_prefix
         self._group_by: Callable[[P], Hashable] = (
             group_by if group_by is not None else lambda v: cast(Hashable, v)
@@ -577,6 +639,7 @@ class BatchLoop(Generic[P]):
         self._branches: dict[str, _Branch[P]] = {}
         self._partition: list[_Branch[P]] = []  # legacy per-run partition summary
         self._finals: list[_Branch[P]] = []
+        self._child_histories: list[ChildHistoryUpdate[P]] = []
         self._ready_llm: deque[LlmRequest[P]] = deque()
         self._ready_tool: deque[ToolRequest] = deque()
         self._outstanding: dict[str, Request[P]] = {}
@@ -695,6 +758,8 @@ class BatchLoop(Generic[P]):
                 ids = [call.id for call in completion.tool_calls]
                 if len(set(ids)) != len(ids):
                     raise ValueError("duplicate tool call id in one assistant turn")
+                if any(c.name in self._unavailable_subagents for c in completion.tool_calls):
+                    raise ValueError("subagent is unavailable in this child/depth")
                 self._handle_llm(request, completion)
                 self._raise_if_failed()
                 self._delete(self._outstanding, completion.request_id)
@@ -981,10 +1046,14 @@ class BatchLoop(Generic[P]):
         node = self._recorded._node(branch.history_path)
         entries = list(node.subagents)
         index = next((i for i, e in enumerate(entries) if e.call_id == link.call.id), None)
-        entry = SubagentHistory(link.call.id, history.descriptor)
+        run = ChildHistoryRun(branch.env_ids, link.base, history.descriptor)
+        entry = SubagentHistory(link.call.id, history.descriptor, (*link.prior_runs, run))
         if index is None:
             entries.append(entry)
-        elif entries[index].history.root == history.descriptor.root:
+        elif (
+            entries[index].history.root == history.descriptor.root
+            and len(entries[index].runs) == len(link.prior_runs) + 1
+        ):
             return
         else:
             entries[index] = entry
@@ -1011,7 +1080,8 @@ class BatchLoop(Generic[P]):
                 return
             for key, link in finished:
                 branch = self._branches[link.branch_id]
-                results = dict(self._in_child(link, lambda child: child.result()).results)
+                result = self._in_child(link, lambda child: child.result())
+                results = dict(result.results)
                 candidate = {**branch.turn_results, link.call.id: results}
                 plan = (
                     self._plan_turn(branch, candidate)
@@ -1020,6 +1090,21 @@ class BatchLoop(Generic[P]):
                 )
                 self._watch_branch(branch)
                 branch.turn_results = candidate
+                for update in result.child_histories:
+                    self._append(self._child_histories, update)
+                if result.history is not None:
+                    self._append(
+                        self._child_histories,
+                        ChildHistoryUpdate(
+                            link.child._id_prefix,
+                            branch.branch_id,
+                            branch.steps,
+                            link.call,
+                            branch.env_ids,
+                            link.base,
+                            result.history,
+                        ),
+                    )
                 if self._transaction is not None:
                     self._transaction.removed_children[id(self)] = self
                 self._delete(self._children, key)
@@ -1031,46 +1116,80 @@ class BatchLoop(Generic[P]):
             # Settle those too, without producing a false stalled frontier.
 
     def _is_subagent_call(self, call: ToolCall) -> bool:
-        return self._subagent is not None and call.name == self._subagent.name
+        return call.name in self._subagents
 
     def _prepare_child(
         self, branch: _Branch[P], call: ToolCall, child_key: str, ordinal: int
     ) -> _ChildLink[P] | _ExecutionError:
         """Build once; distinguish detected failure from an exception in caller code."""
-        sub = self._subagent
-        assert sub is not None
-        child_subagent: SubagentTool[P] | None = None
-        if sub.max_depth > 1:
-            child_subagent = replace(sub, max_depth=sub.max_depth - 1)
+        sub = self._subagents[call.name]
+        declared = sub.subagents if sub.subagents is not None else (sub,)
+        nested = (
+            tuple(replace(s, max_depth=min(s.max_depth, sub.max_depth - 1)) for s in declared)
+            if sub.max_depth > 1
+            else ()
+        )
+        reserved = self._unavailable_subagents | self._subagents.keys() | {s.name for s in declared}
+        allowed = {s.name for s in nested}
+        unavailable = frozenset(reserved - allowed)
+        prompt = sub.build_prompt(call.args)
+        child_specs, _, child_contracts = _registration(
+            tuple(s for s in sub.sub_tool_specs(branch.env_ids[0]) if s.name not in unavailable),
+            nested,
+            independent=self._history_resolver is not None,
+        )
+        contract = (
+            sub.history_contract
+            if sub.history_contract is not None
+            else (self._recorded.contract if self._recorded else None)
+        )
         previous = None
+        prior_runs: tuple[ChildHistoryRun[P], ...] = ()
         if self._recorded is not None:
             node = self._recorded._node(branch.history_path)
             entry = next((e for e in node.subagents if e.call_id == call.id), None)
             if entry is not None:
                 previous = History(entry.history, self._recorded.store)
+                prior_runs = entry.runs or (ChildHistoryRun((), None, entry.history),)
+        # A recorded parent pins its revision. External cache changes must not
+        # reinterpret it, nor manufacture a missing feedback-resolution target.
         if self._resolve_only and previous is None:
             return FeedbackResolutionError("no recorded subagent conversation")
+        if previous is None and self._history_resolver is not None:
+            assert contract is not None and self._record_store is not None
+            selected = self._history_resolver(
+                HistoryQuery(contract, prompt, child_specs, self._custom_grouping, child_contracts)
+            )
+            if selected is not None:
+                if not isinstance(selected, HistoryDescriptor):
+                    raise TypeError("history_resolver must return HistoryDescriptor or None")
+                previous = History(selected, self._record_store)
         child: BatchLoop[P] = BatchLoop(
-            prompt=sub.build_prompt(call.args),
+            prompt=prompt,
             env_ids=branch.env_ids,
-            tool_specs=tuple(
-                spec
-                for spec in sub.sub_tool_specs(branch.env_ids[0])
-                if child_subagent is not None or spec.name != sub.name
-            ),
-            subagent=child_subagent,
+            tool_specs=child_specs,
+            subagents=nested,
+            history_resolver=self._history_resolver,
             group_by=self._group_by if self._custom_grouping else None,
             budget=self._budget,
-            history_contract=self._recorded.contract if self._recorded else None,
+            history_contract=contract,
             history=previous,
-            record_store=self._recorded.store if self._recorded else None,
+            record_store=self._record_store,
             _id_prefix=f"{self._id_prefix}{child_key}",
             _resolve_only=self._resolve_only,
             _defer_failure=True,
+            _unavailable_subagents=unavailable,
         )
         if child._error is not None:
             return child._error
-        return _ChildLink(child=child, branch_id=branch.branch_id, call=call, ordinal=ordinal)
+        return _ChildLink(
+            child=child,
+            branch_id=branch.branch_id,
+            call=call,
+            ordinal=ordinal,
+            base=previous.descriptor if previous else None,
+            prior_runs=prior_runs,
+        )
 
     def _pop_any(self) -> Request[P] | None:
         llm_head = self._ready_llm[0] if self._ready_llm else None
@@ -1165,6 +1284,9 @@ class BatchLoop(Generic[P]):
 
     def _accept_assistant(self, branch: _Branch[P], message: Message[P]) -> bool:
         """Return True to schedule the next node after a user continuation."""
+        if any(c.name in self._unavailable_subagents for c in message.tool_calls):
+            self._fail(InvalidHistoryError("recorded call targets an unavailable subagent"))
+            return False
         prepared: dict[str, tuple[str, _ChildLink[P]]] = {}
         next_child = self._next_child
         for call in message.tool_calls:
@@ -1379,7 +1501,13 @@ class BatchLoop(Generic[P]):
         for b in self._finals:
             for env in b.env_ids:
                 results[env] = cast(P, b.final_content)
-        return BatchResult(tree=root_node, classes=classes, results=results, history=self._recorded)
+        return BatchResult(
+            tree=root_node,
+            classes=classes,
+            results=results,
+            history=self._recorded,
+            child_histories=tuple(self._child_histories),
+        )
 
 
 def run_batch(
@@ -1438,9 +1566,9 @@ def run_to_completion(
 
     ``tools`` is a factory producing each environment's tool implementations;
     the first environment's specs describe the tools to the model, so specs
-    must be identical across environments.  Any ``SubagentTool`` in the list
-    is detected by ``isinstance`` and made the loop's subagent (the first one
-    wins); it never reaches the tool executor.  ``complete_llm`` is the only
+    must be identical across environments. Every ``SubagentTool`` is registered
+    as a reserved tool; none reaches the ordinary tool executor. Duplicate names,
+    including callable/subagent collisions, are rejected.  ``complete_llm`` is the only
     provider dependency: adapt any LLM API to it.  ``complete_tool`` defaults
     to executing tools directly via the ``tools`` factory.  For parallel
     serving, drive ``BatchLoop`` yourself instead.
@@ -1449,29 +1577,22 @@ def run_to_completion(
     if not envs:
         raise ValueError("env_ids must be non-empty")
     specs: list[ToolSpec] = []
-    subagent: SubagentTool[P] | None = None
+    subagents: list[SubagentTool[P]] = []
+    names: set[str] = set()
     for t in tools(envs[0]):
+        if t.name in names:
+            raise ValueError(f"duplicate tool implementation {t.name!r}")
+        names.add(t.name)
+        specs.append(ToolSpec(t.name, t.description, dict(t.parameters)))
         if isinstance(t, SubagentTool):
-            if subagent is None:
-                subagent = t
-                specs.append(
-                    ToolSpec(
-                        name=t.name,
-                        description=t.description,
-                        parameters=dict(t.parameters),
-                    )
-                )
-        else:
-            specs.append(
-                ToolSpec(name=t.name, description=t.description, parameters=dict(t.parameters))
-            )
+            subagents.append(t)
     if complete_tool is None:
         complete_tool = _local_tool_executor(tools)
     loop: BatchLoop[P] = BatchLoop(
         prompt=prompt,
         env_ids=envs,
         tool_specs=specs,
-        subagent=subagent,
+        subagents=subagents,
         group_by=group_by,
         budget=budget,
     )
@@ -1492,7 +1613,14 @@ def _local_tool_executor(
     def execute(request: ToolRequest) -> ToolCompletion[P]:
         results: list[tuple[str, P]] = []
         for env in request.env_ids:
-            impls = {t.name: t for t in tools(env) if not isinstance(t, SubagentTool)}
+            impls: dict[str, Tool[P]] = {}
+            names: set[str] = set()
+            for tool in tools(env):
+                if tool.name in names:
+                    raise ValueError(f"duplicate tool implementation {tool.name!r}")
+                names.add(tool.name)
+                if not isinstance(tool, SubagentTool):
+                    impls[tool.name] = tool
             impl = impls.get(request.tool_call.name)
             if impl is None:
                 raise ValueError(f"env {env!r} has no tool named {request.tool_call.name!r}")

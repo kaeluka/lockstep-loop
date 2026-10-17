@@ -25,10 +25,14 @@ from lockstep_loop.core import (
     run_to_completion,
 )
 from lockstep_loop.history import (
+    ChildHistoryRun,
+    ChildHistoryUpdate,
     EnvObservation,
     History,
     HistoryDescriptor,
     HistoryNode,
+    HistoryQuery,
+    HistoryResolver,
     NodeRef,
     Observation,
     OutputRecord,
@@ -41,6 +45,10 @@ from lockstep_loop.history import (
 __all__ = [
     "BatchLoop",
     "BatchResult",
+    "ChildHistoryRun",
+    "ChildHistoryUpdate",
+    "HistoryQuery",
+    "HistoryResolver",
     "Budget",
     "Completion",
     "EnvClass",

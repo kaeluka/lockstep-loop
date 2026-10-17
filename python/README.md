@@ -144,8 +144,9 @@ context. Snapshot extension path-copies records, leaving prior roots unchanged.
 
 **Subagents are recorded and replayed**, including mixed ordinary/subagent turns,
 concurrent child calls and configured nesting depth. `node.subagents` entries
-contain the assistant call ID and a child descriptor: inspect one with
-`History(entry.history, snapshot.store)`. Child tool observations are rerun; only
+contain the assistant call ID, latest child descriptor, and immutable `runs`
+(selected base, resulting revision, and inherited env IDs). Inspect the latest
+child with `snapshot.child(entry)`. Child tool observations are rerun; only
 child final answers enter the parent's result tuple. Divergent child traces with
 identical answers do not split the parent. Active child snapshots retain fulfilled
 turns, not partial tool collections.
@@ -158,6 +159,108 @@ settings. Equality cannot detect a changed implementation behind an unchanged
 schema. Payloads, arguments and schemas are **borrowed immutable values**: do not
 mutate nested contents through any alias after handing them to the loop. Convert
 mutable provider objects to stable values or make your own copies first.
+
+### Specialized tools and independent child caches
+
+```python
+from lockstep_loop import BatchLoop, RecordStore, SubagentTool, ToolSpec
+
+imports = SubagentTool(
+    name="list_imports", description="List imported packages.",
+    parameters={"type": "object", "properties": {"file_path": {"type": "string"}},
+                "required": ["file_path"], "additionalProperties": False},
+    build_prompt=lambda args: f"List imports in {args['file_path']!r}.",
+    sub_tool_specs=lambda env: repo_tool_specs,
+    history_contract="imports/template-v1/tools-v1/grouping-v1/provider-v1",
+    subagents=(),  # explicit leaf
+)
+loop = BatchLoop(
+    prompt="A revised parent investigation", env_ids=["repo@immutable-commit"],
+    tool_specs=ordinary_parent_specs, subagents=[imports, another_specialist],
+    history_contract="parent/v2",
+    history_resolver=lambda query: selected.get((query.contract, query.prompt)),
+    record_store=RecordStore(load=load_node),
+)
+```
+
+The subagent specs are advertised automatically; no duplicate entries are needed
+in `tool_specs`. The child prompt is an initial **user** message, not a system
+message. The caller must construct it deterministically and validate structured
+args (the example above's minimal lambda raises on a missing key; the executable
+example validates keys/types). The core neither evaluates JSON Schema nor
+normalizes file paths or paraphrases delegation. Distinct file paths yield distinct
+prompts/tries under this template. Child environment IDs are inherited unchanged.
+
+Run the full [independent-cache example](examples/specialized_subagents.py):
+
+```sh
+PYTHONPATH=src python examples/specialized_subagents.py
+# Changed parent: 2 fresh parent LLM calls, 0 child LLM calls, 1 child tool rerun
+```
+
+A resolver receives `HistoryQuery(contract, prompt, tools, custom_grouping,
+subagents)` and returns a caller-selected **HistoryDescriptor**, or None for a
+miss. It is not keyed by the parent prompt, invocation/call IDs, or env membership.
+All registered definitions require explicit non-empty child `history_contract`s
+when a resolver is configured. Without a resolver, a missing child contract
+preserves legacy parent-owned recording; an explicit contract records children
+independently even when the parent itself is not recorded. Child grouping is
+inherited from the loop: version the child contract for changes to that function
+as well as child templates, tool semantics and provider settings.
+
+The resolver only selects a revision; the existing shared `RecordStore` loads its
+nodes lazily. Its loader must resolve all selected descriptor references. For
+in-memory reuse, share the same store; for persistence, save immutable record
+writes first, publish child descriptors, and attach a new writer with a loader
+covering those records. Do not return a live `History` from the metadata callback
+or assume the descriptor carries its records. Full prompt/spec/grouping/nested
+configuration compatibility is checked even if the caller indexes only by a
+hash or `(contract, prompt)`. An incompatible hit raises, never silently falls back.
+
+`result.child_histories` contains every completed recorded invocation (descendants
+included when their containing child finishes): `tool_call`, `env_ids`, selected
+`base`, resulting `history`, parent `branch_id`/`depth`, and run-local
+`request_prefix`. This is provenance, not a new conversation identity. Persist
+`update.history.descriptor` and `update.history.store.records()` with the normal
+codecs. Store writes may include parent/orphan records; the child descriptor is an
+independent entry point with no parent descriptor dependency. Two concurrent hits
+on the same base expose two separate updates, not a hidden mutable cache merge.
+Do not blindly collapse them into a dict unless you intend to select one; caller
+coordination/root publication is explicit.
+
+A **recorded parent invocation is pinned** to its recorded child revision and
+bypasses the resolver. Only new invocations consult the external cache. Thus child
+feedback can be selected by a new parent investigation without automatically
+rewriting completed parents. Child feedback's shared-path semantics are preserved;
+there is no assumption that one prompt implies one revision. Parent entries retain
+all prior `runs`; their `history` field aliases the latest/current run. Root history
+selection remains the explicit `history=` argument. Strict feedback resolution
+cannot synthesize missing invocation provenance from an external cache hit.
+
+**Registration/nesting:** duplicate definitions and duplicate ordinary spec names
+are errors. Conflicting ordinary/subagent specs are errors; an exact matching spec
+is accepted as a redundant legacy advertisement, not as a second executor. Serial
+`run_to_completion` now recognizes all subagent entries and rejects actual callable/
+subagent name collisions. Use direct `BatchLoop` for resolver-driven serving.
+Mixing `subagent=` and `subagents=` (even an empty list) is rejected. Singular callers
+remain supported. A definition's `subagents` is its explicit child allowlist; `()`
+means leaf, and None preserves bounded self-recursion, not parent siblings. Each
+nested definition is capped to the remaining `max_depth`; known unavailable
+reserved names are omitted/rejected, never ordinary tool requests.
+
+Resolver/factory failures during advancement preserve the pending Python work via
+the existing journal, including mixed turns. Callbacks are not rerun at commit;
+caller side effects and orphan record writes are not rolled back. Budgets cannot
+be combined with recorded children. No environment remapping, dependency
+invalidation, logical asset registry, single-flight, or root-merging service is
+introduced.
+
+**Record-schema migration:** `HistoryDescriptor.subagents` is now the ordered
+configuration list (the Python `.subagent` inspection property still returns the
+sole entry or None). Child invocation records add `runs`. This prototype does not
+promise cross-version wire compatibility; caller codecs must migrate old singular
+headers explicitly or record new histories. Existing constructor-based singular
+APIs and existing history/feedback behavior remain supported.
 
 ### Feedback and shared-path resumption
 

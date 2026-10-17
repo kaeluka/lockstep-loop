@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Generic, Literal, TypeAlias, TypeVar
 from uuid import uuid4
 
 if TYPE_CHECKING:
-    from .core import Message, ToolSpec
+    from .core import Message, ToolCall, ToolSpec
 
 P = TypeVar("P")
 
@@ -59,6 +59,20 @@ class UserContinuation(Generic[P]):
 class SubagentContract:
     spec: ToolSpec
     max_depth: int
+    history_contract: str | None = None
+    # None preserves bounded self-recursion; a tuple is an explicit child allowlist.
+    subagents: tuple[SubagentContract, ...] | None = None
+
+
+@dataclass(frozen=True)
+class HistoryQuery(Generic[P]):
+    """Exact child compatibility header, without parent/invocation/environment IDs."""
+
+    contract: str
+    prompt: P
+    tools: tuple[ToolSpec, ...]
+    custom_grouping: bool
+    subagents: tuple[SubagentContract, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -70,13 +84,49 @@ class HistoryDescriptor(Generic[P]):
     tools: tuple[ToolSpec, ...]
     custom_grouping: bool
     root: NodeRef
-    subagent: SubagentContract | None = None
+    subagents: tuple[SubagentContract, ...] = ()
+
+    def query(self) -> HistoryQuery[P]:
+        return HistoryQuery(
+            self.contract, self.prompt, self.tools, self.custom_grouping, self.subagents
+        )
+
+    @property
+    def subagent(self) -> SubagentContract | None:
+        """Legacy singular inspection; use subagents for the complete configuration."""
+        return self.subagents[0] if len(self.subagents) == 1 else None
+
+
+HistoryResolver: TypeAlias = Callable[[HistoryQuery[P]], HistoryDescriptor[P] | None]
+
+
+@dataclass(frozen=True)
+class ChildHistoryRun(Generic[P]):
+    """One invocation's inherited environments, selected base, and resulting revision."""
+
+    env_ids: tuple[str, ...]
+    base: HistoryDescriptor[P] | None
+    history: HistoryDescriptor[P]
 
 
 @dataclass(frozen=True)
 class SubagentHistory(Generic[P]):
     call_id: str
     history: HistoryDescriptor[P]
+    runs: tuple[ChildHistoryRun[P], ...] = ()
+
+
+@dataclass(frozen=True)
+class ChildHistoryUpdate(Generic[P]):
+    """Completed invocation, not a merged cache entry or public conversation identity."""
+
+    request_prefix: str
+    branch_id: str
+    depth: int
+    tool_call: ToolCall
+    env_ids: tuple[str, ...]
+    base: HistoryDescriptor[P] | None
+    history: History[P]
 
 
 @dataclass(frozen=True)
@@ -155,6 +205,10 @@ class History(Generic[P]):
 
     def load(self, ref: NodeRef) -> HistoryNode[P]:
         return self.store.load(ref)
+
+    def child(self, entry: SubagentHistory[P]) -> History[P]:
+        """Inspect/replay a child using this snapshot's shared record resolver."""
+        return History(entry.history, self.store)
 
     def _node(self, path: _HistoryPath) -> HistoryNode[P]:
         node = self.root

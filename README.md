@@ -29,6 +29,10 @@ cargo run -p lockstep-loop --example history_replay
 
 (cd python && PYTHONPATH=src python3 examples/feedback.py)
 cargo run -p lockstep-loop --example feedback
+
+(cd python && PYTHONPATH=src python3 examples/specialized_subagents.py)
+cargo run -p lockstep-loop --example specialized_subagents
+# changed parent: 0 fresh child LLM calls; child tools still rerun
 ```
 
 ## What the library owns
@@ -49,6 +53,7 @@ snapshots. The current API calls the recorded agent structure `History`.
 
 - [Documentation map](docs/README.md)
 - [History, replay, feedback, and persistence contracts](docs/history-reference.md)
+- [Specialized subagents and independent child caches](docs/history-reference.md#specialized-tools-and-independently-reusable-child-histories)
 - [README audit and verification](docs/verification.md)
 - [Editable diagrams and local rendering](docs/diagrams/README.md)
 

@@ -183,7 +183,7 @@ fn nested_histories_mixed_calls_depth_equal_parent_answers_and_snapshots() {
     assert_eq!(driven.llms.iter().filter(|s| *s == "main").count(), 2);
     let old = driven.result.history.unwrap();
     let grand = child(&child(&old, "child"), "nested");
-    assert!(grand.descriptor.subagent.is_none());
+    assert!(grand.descriptor.subagents.is_empty());
     assert!(
         grand
             .descriptor

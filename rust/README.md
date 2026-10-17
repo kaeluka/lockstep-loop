@@ -69,9 +69,9 @@ Opt into recording through `LoopConfig::with_recording(contract)`. Restore a
 snapshot with `with_replay(history, expected_contract)`; constructors still use
 `BatchLoop::new` (exact equality) or `BatchLoop::with_group_by` (explicit lossy
 policy). Existing loops without these options behave as before. Code using
-`LoopConfig` or `BatchResult` struct literals must add `history: None`;
-`LoopConfig` literals also need `feedback: None`. Existing constructor-based code
-is unchanged. Legacy `group_key` labels retain debug
+Constructor-based callers remain supported. Struct-literal callers must include
+new optional configuration fields (`history`, `feedback`, `subagents`,
+`history_resolver`, `record_store`); `BatchResult` also exposes `child_histories`. Legacy `group_key` labels retain debug
 renderings of result tuples. Equal renderings are allowed on distinct edges in
 the result's `Vec`; internal branch IDs remain collision-free.
 
@@ -137,8 +137,9 @@ wire format or validation of arbitrary imported graphs is promised. See the
 [load/update/publish protocol](../docs/history-reference.md#individually-addressable-records-and-lazy-persistence).
 
 **Nested subagents:** `HistoryNode.subagents` entries associate an assistant call
-ID with a full child descriptor. Inspect using `History { descriptor:
-entry.history.clone(), store: history.store.clone() }`. Core replay reruns child
+ID with a latest child descriptor and immutable `runs` recording inherited envs,
+selected bases and resulting revisions. Inspect with `history.child(entry)`.
+Core replay reruns child
 tools lazily, supports mixed ordinary/subagent calls and configured nesting depth,
 and folds child final answers into parent matching. Parent classes do not split
 merely because child traces differ when their answers agree. Active-child
@@ -157,13 +158,118 @@ callback panics are not recoverable validation errors. Child prompts, specs and
 constructors are prepared once before fulfilling/recording the parent assistant
 turn or issuing its ordinary requests; commit reuses those prepared children.
 Library-detected child compatibility errors return `IncompatibleHistory` rather
-than panicking. Construction rejects the loop; a late mismatch becomes a terminal
-error (`error()`/`result()`), cancelling pending work without publishing a partial
-answer or partially starting the rejected assistant turn. Preceding valid tool
-evidence may remain in the working snapshot; old snapshots stay immutable. Caller
+than panicking. Errors during preparation of a fresh LLM completion leave that
+request outstanding for correction. Construction rejects incompatible history;
+errors replaying an already recorded assistant turn become terminal errors
+(`error()`/`result()`), cancelling work without a partial answer or half-started
+assistant turn. Preceding valid tool evidence may remain in the working snapshot;
+old snapshots stay immutable. Caller
 side effects and orphan append-only preparation records are not rolled back.
 Discard the live loop after an arbitrary callback panic. See the
 [transaction boundary](../docs/history-reference.md#transactional-child-preparation-and-callback-failures).
+
+### Specialized tools and independent child caches
+
+```rust
+let imports = SubagentTool::try_new(
+    ToolSpec::new("list_imports", "List imported packages.", schema),
+    |args| {
+        let path = args["file_path"].as_str().ok_or_else(||
+            LoopError::InvalidSubagentArguments("file_path must be a string".into()))?;
+        Ok(format!("List imports in {path:?}."))
+    },
+    |_| Ok(repo_tool_specs()),
+    1,
+).with_history_contract("imports/template-v1/tools-v1/grouping-v1/provider-v1")
+ .with_subagents(vec![]);
+
+let config = LoopConfig::new(parent_prompt, env_ids, ordinary_parent_specs)
+    .with_subagents(vec![imports, other_specialist])
+    .with_recording("parent/v2")
+    .with_record_store(RecordStore::with_loader(fresh_writer_namespace, load_node))
+    .with_history_resolver(move |query| {
+        Ok(selected.get(&(query.contract.clone(), query.prompt.clone())).cloned())
+    });
+let mut loop_ = BatchLoop::new(config)?;
+```
+
+Run the complete [caller-side example](examples/specialized_subagents.rs):
+
+```sh
+cargo run -p lockstep-loop --example specialized_subagents
+# Changed parent: 2 fresh parent LLM calls, 0 child LLM calls, 1 child tool rerun
+```
+
+All registered specs are advertised automatically. `build_prompt` produces initial
+**user** content, not a system message. Structured argument interpretation,
+validation, deterministic templates and any path normalization belong to the caller.
+There is no JSON Schema validator or fuzzy matching. Different file paths under
+the example's template get different prompts/tries, not new environment IDs.
+Children always inherit the parent's environment set.
+
+`with_history_resolver` accepts a synchronous caller callback returning
+`Result<Option<HistoryDescriptor<P>>, LoopError>` for a `HistoryQuery<P>` containing
+only child prompt, child contract version, ordered tools, grouping mode and nested
+configuration. It requires `P: PartialEq`, like `with_replay`, for full compatibility
+checks. Return None for a miss; return a chosen descriptor for a hit. Index hashes
+or abbreviated keys never replace core equality checks. Each registered definition
+must have an explicit non-empty `.with_history_contract(...)` when using a resolver.
+Child grouping is inherited: its contract must cover that function's semantics,
+child tools/templates and provider settings, independently of parent wording.
+Without a resolver, missing child contracts retain legacy parent-owned recording;
+explicit child contracts also enable recording beneath an unrecorded parent.
+
+The existing `RecordStore` is the node-loading boundary for both parent and selected
+child roots. Supply a shared in-memory store or one whose loader resolves all
+referenced addresses across your backends. Metadata selection does not import a
+foreign store. Persist shallow writes before publishing descriptors; no core I/O
+or parallel persistence model is added. Root selection remains `with_replay`.
+
+`BatchResult.child_histories` contains separate `ChildHistoryUpdate` values for
+completed recorded invocations, including descendants when the containing child
+finishes. Each includes `history` (descriptor + store), selected `base`, original
+`tool_call`, inherited `env_ids`, and parent branch/depth plus the existing run-local
+request prefix for provenance. No runtime prefix is used in cache lookup or accepted
+as a feedback target. `HistoryNode.subagents[*].runs` shares immutable invocation
+records through `Arc`, retaining old roots even as `history` aliases the latest run.
+Persist updates with the normal descriptor/record codecs. A store's writes may
+include parent/orphan records, but a child descriptor needs no parent descriptor
+to replay. Concurrent hits on one base remain independent executions and updates;
+there is no silent last-writer-wins cache, root merge or single-flight protocol.
+
+**Revision selection:** recorded parent invocations pin their child revision and
+skip external lookup; new invocations use the caller resolver. Selected child
+feedback histories replay their shared-path continuations normally. A prompt key
+need not imply a unique revision. Updating a cache pointer does not automatically
+update completed parents. Start a new parent investigation, or create new
+invocations after explicit parent feedback, to choose a newer child revision.
+Strict feedback resolution never manufactures missing parent provenance from a
+cache hit. There is no DAG invalidation/propagation service here.
+
+**Registration/nesting:** mixing `with_subagent` and `with_subagents` is rejected.
+Duplicate names and conflicting ordinary/subagent specs are rejected; an exactly
+matching `ToolSpec` is accepted as a redundant legacy advertisement. Serial drivers
+now register all `ToolEntry::Subagent` entries and reject actual callable/subagent
+name collisions, even with identical specs. The default serial driver records
+exact-equality grouping; `_by` records explicit custom grouping. Use direct
+`BatchLoop` for resolver-driven serving. `SubagentTool::with_subagents` defines the
+child allowlist: empty is a leaf, None preserves bounded self-recursion, never all
+parent siblings. Nested depths are clamped to the remaining allowance; disabled
+reserved names are omitted/rejected rather than passed to ordinary execution.
+
+Use `try_new` for fallible prompt/spec factories. On a fresh LLM completion,
+`InvalidSubagentArguments`, `SubagentPreparation`, resolver errors (for example
+`HistoryResolution`) and incompatible selected descriptors leave the request
+correctable without partial spawning. Replay-time preparation errors are terminal;
+arbitrary callback panics remain unrecovered. No factories are rerun at commit.
+Budgets remain unsupported wherever child recording is enabled. No environment
+binding/remapping, new system-role API, logical asset registry or scheduler is added.
+
+**Record-schema migration:** descriptors now use ordered `subagents` rather than
+singular `subagent`, and invocation records add `runs`. Inspect these new fields in
+codecs/UIs. No cross-version wire format is promised; migrate prior singular headers
+in caller codecs or record new histories. `SubagentTool::new` and singular loop
+constructors remain supported; exact redundant advertisements preserve old callers.
 
 ### Feedback and shared-path resumption
 
