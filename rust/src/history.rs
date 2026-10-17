@@ -35,7 +35,7 @@ pub struct Observation<P> {
     pub continuation: NodeRef,
 }
 
-/// Represented but never implicitly selected or inherited by replay.
+/// Shared-path continuation followed by every environment reaching this endpoint.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UserContinuation<P> {
     pub message: Message<P>,
@@ -59,7 +59,6 @@ pub struct HistoryDescriptor<P> {
     pub custom_grouping: bool,
     pub root: NodeRef,
     pub subagent: Option<SubagentContract>,
-    pub requires_user_policy: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -208,6 +207,12 @@ impl<P: PartialEq> PartialEq for History<P> {
         self.descriptor == other.descriptor
     }
 }
+#[derive(Clone, Copy)]
+pub(crate) enum PathStep {
+    Observation(usize),
+    User(usize),
+}
+
 impl<P> History<P> {
     pub fn root(&self) -> Arc<HistoryNode<P>> {
         self.load(&self.descriptor.root)
@@ -215,27 +220,38 @@ impl<P> History<P> {
     pub fn load(&self, reference: &NodeRef) -> Arc<HistoryNode<P>> {
         self.store.load(reference)
     }
-    pub(crate) fn node(&self, path: &[usize]) -> Arc<HistoryNode<P>> {
+    pub(crate) fn node(&self, path: &[PathStep]) -> Arc<HistoryNode<P>> {
         let mut node = self.root();
-        for index in path {
-            node = self.load(&node.observations[*index].continuation);
+        for step in path {
+            let reference = match step {
+                PathStep::Observation(i) => &node.observations[*i].continuation,
+                PathStep::User(i) => &node.user_continuations[*i].continuation,
+            };
+            node = self.load(reference);
         }
         node
     }
 }
 impl<P: Clone> History<P> {
-    pub(crate) fn replace_node(&mut self, path: &[usize], node: HistoryNode<P>) {
+    pub(crate) fn replace_node(&mut self, path: &[PathStep], node: HistoryNode<P>) {
         let mut ancestors = Vec::new();
         let mut parent = self.root();
-        for index in path {
-            let next = self.load(&parent.observations[*index].continuation);
-            ancestors.push((parent, *index));
+        for step in path {
+            let reference = match step {
+                PathStep::Observation(i) => &parent.observations[*i].continuation,
+                PathStep::User(i) => &parent.user_continuations[*i].continuation,
+            };
+            let next = self.load(reference);
+            ancestors.push((parent, *step));
             parent = next;
         }
         let mut reference = self.store.put(node);
-        for (ancestor, index) in ancestors.into_iter().rev() {
+        for (ancestor, step) in ancestors.into_iter().rev() {
             let mut node = ancestor.as_ref().clone();
-            node.observations[index].continuation = reference;
+            match step {
+                PathStep::Observation(i) => node.observations[i].continuation = reference,
+                PathStep::User(i) => node.user_continuations[i].continuation = reference,
+            }
             reference = self.store.put(node);
         }
         self.descriptor.root = reference;

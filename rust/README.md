@@ -56,8 +56,9 @@ Opt into recording through `LoopConfig::with_recording(contract)`. Restore a
 snapshot with `with_replay(history, expected_contract)`; constructors still use
 `BatchLoop::new` (exact equality) or `BatchLoop::with_group_by` (explicit lossy
 policy). Existing loops without these options behave as before. Code using
-`LoopConfig` or `BatchResult` struct literals must add `history: None`; existing
-constructor-based code is unchanged. Legacy `group_key` labels retain debug
+`LoopConfig` or `BatchResult` struct literals must add `history: None`;
+`LoopConfig` literals also need `feedback: None`. Existing constructor-based code
+is unchanged. Legacy `group_key` labels retain debug
 renderings of result tuples. Equal renderings are allowed on distinct edges in
 the result's `Vec`; internal branch IDs remain collision-free.
 
@@ -141,16 +142,69 @@ Payload `Clone` must have immutable value semantics: interior-mutable aliases mu
 not change submitted facts. Grouping, equality and hashing must be deterministic;
 callback panics are not recoverable validation errors.
 
-**User continuations:** replay a snapshot against **one stable environment** to
-resolve an investigation, then `loop_.append_user_message(content)?` returns a
-new snapshot with the old assistant answer plus a user-message edge to an OPEN
-node. It does not mutate the prior root or select by answer value. The model can
-represent more investigation, the same answer, and further user messages. There
-is no public session ID or endpoint handle. Feedback selection/inheritance across
-environments remains a policy decision: descriptors containing these edges carry
-`requires_user_policy=true`, and replay returns `UserContinuationPolicyRequired`
-rather than inventing a policy. Representation and append are supported; feedback
-execution/routing, assets, DAG scheduling and UI are not.
+### Feedback and shared-path resumption
+
+```rust
+let config = LoopConfig::new(prompt, vec!["revision-1".into()], specs)
+    .with_replay(snapshot, "inspect-v1/tools-v1/exact-grouping/provider-v1")
+    .with_feedback("Also inspect /foo and revise if needed.".to_owned());
+let mut loop_ = BatchLoop::new(config)?;
+// Serve ordinary requests/completions. Resolution reruns tools with no fresh
+// LLM work; once the old answer is located, feedback is appended and work resumes.
+// let revised = loop_.result()?;  // after completion; revised.history is a new snapshot
+```
+
+Run the complete [caller-side feedback example](examples/feedback.rs):
+
+```sh
+cargo run -p lockstep-loop --example feedback
+```
+
+A feedback operation requires supplied history and **one environment for locating
+the target**, not an environment-specific scope. In the new snapshot, **every
+environment reaching that observation path inherits the continuation**, including
+old siblings and new commit IDs. Additional tools can split them on new evidence.
+Unrelated paths and old roots are untouched. There is no session/endpoint handle
+or value-triggered feedback map. Source-environment metadata is provenance only.
+A new explicit operation resolves the latest completed continuation and appends
+another message, even if identical. Returning the same answer is valid termination.
+
+`LoopConfig.feedback` is `Option<P>`: `None` means absent; for optional payloads
+`.with_feedback(None)` sets `Some(None)` and submits real null content. The same
+immutable payload/Clone contract applies. Full feedback messages live in
+`node.user_continuations[0].message`, with shallow continuation references in the
+existing record model. The old answer stays at the preceding node, and snapshots
+captured while the new assistant is pending retain an open continuation.
+
+**Failure protocol:** `LoopError::FeedbackResolutionMiss` means the selected path
+is unseen/unfulfilled; it never generates an answer to manufacture a target. It
+can be returned by construction or by `complete` after valid tool evidence arrives.
+A later failure cancels queued/outstanding work; `is_done()` is true, `error()`
+exposes the failure, `next_request()` returns None, and `result()`/further
+completions return the stored error. `history()` reverts to the supplied root on
+a resolution miss; append-only orphan writes may remain. Invalid completion sets,
+duplicate IDs and wrong kinds remain correctable and do not set `error()`.
+An open earlier feedback continuation cannot be targeted by another explicit
+intervention; ordinary replay can resume it. Multiple competing user successors
+or malformed user edges yield `InvalidUserContinuation` on traversal, not an
+implicit merge or selection. The provisional `requires_user_policy` field and
+`UserContinuationPolicyRequired` error have been removed.
+
+Feedback targets this loop's terminal no-tool assistant response. Cached nested
+child tools are rerun during resolution with no fresh reasoning allowed on misses;
+after injection, new child work is supported normally. No nested-asset selection,
+result-tool publication or feedback-routing framework is added. Custom lossy
+grouping preserves its original representative context and full actual evidence;
+feedback is inherited by the entire grouped path. The legacy `append_user_message`
+helper still forks an already completed live run without resuming that loop;
+constructor feedback is the strict resolution/resumption operation.
+
+**Caveat:** this is a path-wide investigative improvement, not a private annotation.
+Use transferable instructions (“check whether X”) rather than unqualified
+commit-specific assertions, or keep a separate snapshot. No rewriting, semantic
+classification, alternate scope modes or environment binding is implemented.
+Budgets remain unsupported for recorded execution, before and after injection.
+“Once” is per live operation, not crash-safe exactly-once publication.
 
 **Limits:** recording still rejects budgets; use direct `BatchLoop`, not convenience
 drivers. No core storage I/O, async loader, eviction/GC, or independent-root merge.
@@ -161,7 +215,9 @@ correctable, including nested routes. `stats.depth` includes reused turns;
 `split_depth` is local to the new execution. See the
 [shared design and limitations](../README.md#immutable-recorded-history-and-incremental-replay).
 
-See `tests/loop.rs`, `tests/history.rs` and `tests/history_foundation.rs` for
+See `tests/loop.rs`, `tests/history.rs`, `tests/history_foundation.rs`,
+`tests/request_routing.rs` and `tests/feedback.rs` for
 regressions including 256-turn shallow-record persistence with default JSON
 limits, lazy traversal, nested evidence/equal parent answers, open user
-continuations, immutable snapshots, arbitrary completion order and compatibility.
+continuations, shared-path feedback inheritance, explicit resolution misses,
+immutable snapshots, arbitrary completion order and compatibility.

@@ -316,9 +316,12 @@ def test_user_continuations_are_scoped_by_resolved_path_not_answer_value():
     assert edge.message == Message(role="user", content="Please check again.")
     assert extended.load(edge.continuation).assistant is None
     assert not old.history.load(old.history.root.observations[0].continuation).user_continuations
-    assert not resolving.history.descriptor.requires_user_policy
-    with pytest.raises(ValueError, match="policy required"):
-        simple_loop(("a",), extended)
+    assert not resolving.history.load(
+        resolving.history.root.observations[0].continuation
+    ).user_continuations
+    resumed, calls = sequential(simple_loop(("a",), extended), {"a": "A"}, 1)
+    assert calls == 1
+    assert resumed.results == {"a": "same final"}
     # Representability of another investigation yielding the SAME answer, then
     # another arbitrary user turn. These are storage records, not routing policy.
     store = extended.store

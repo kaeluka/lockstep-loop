@@ -9,13 +9,16 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Generic, TypeVar
+from typing import TYPE_CHECKING, Generic, Literal, TypeAlias, TypeVar
 from uuid import uuid4
 
 if TYPE_CHECKING:
     from .core import Message, ToolSpec
 
 P = TypeVar("P")
+
+# Execution cursors, not persisted references or public conversation identities.
+_HistoryPath: TypeAlias = tuple[tuple[Literal["observation", "user"], int], ...]
 
 
 @dataclass(frozen=True)
@@ -44,7 +47,7 @@ class Observation(Generic[P]):
 
 @dataclass(frozen=True)
 class UserContinuation(Generic[P]):
-    """Represented, not automatically inherited or selected during replay."""
+    """Shared-path continuation: every environment reaching this endpoint follows it."""
 
     message: Message[P]
     continuation: NodeRef
@@ -68,7 +71,6 @@ class HistoryDescriptor(Generic[P]):
     custom_grouping: bool
     root: NodeRef
     subagent: SubagentContract | None = None
-    requires_user_policy: bool = False
 
 
 @dataclass(frozen=True)
@@ -154,30 +156,50 @@ class History(Generic[P]):
     def load(self, ref: NodeRef) -> HistoryNode[P]:
         return self.store.load(ref)
 
-    def _node(self, path: tuple[int, ...]) -> HistoryNode[P]:
+    def _node(self, path: _HistoryPath) -> HistoryNode[P]:
         node = self.root
-        for index in path:
-            node = self.load(node.observations[index].continuation)
+        for kind, index in path:
+            edge = (
+                node.observations[index]
+                if kind == "observation"
+                else node.user_continuations[index]
+            )
+            node = self.load(edge.continuation)
         return node
 
-    def _replace_node(self, path: tuple[int, ...], node: HistoryNode[P]) -> History[P]:
+    def _replace_node(self, path: _HistoryPath, node: HistoryNode[P]) -> History[P]:
         """Storage-level path copying. Paths are not conversation identities."""
         ancestors = []
         parent = self.root
-        for index in path:
-            ancestors.append((parent, index))
-            parent = self.load(parent.observations[index].continuation)
+        for kind, index in path:
+            ancestors.append((parent, kind, index))
+            edge = (
+                parent.observations[index]
+                if kind == "observation"
+                else parent.user_continuations[index]
+            )
+            parent = self.load(edge.continuation)
         ref = self.store.put(node)
-        for ancestor, index in reversed(ancestors):
-            edge = replace(ancestor.observations[index], continuation=ref)
-            ref = self.store.put(
-                replace(
+        for ancestor, kind, index in reversed(ancestors):
+            if kind == "observation":
+                updated = replace(ancestor.observations[index], continuation=ref)
+                parent = replace(
                     ancestor,
                     observations=(
                         *ancestor.observations[:index],
-                        edge,
+                        updated,
                         *ancestor.observations[index + 1 :],
                     ),
                 )
-            )
+            else:
+                updated_user = replace(ancestor.user_continuations[index], continuation=ref)
+                parent = replace(
+                    ancestor,
+                    user_continuations=(
+                        *ancestor.user_continuations[:index],
+                        updated_user,
+                        *ancestor.user_continuations[index + 1 :],
+                    ),
+                )
+            ref = self.store.put(parent)
         return replace(self, descriptor=replace(self.descriptor, root=ref))

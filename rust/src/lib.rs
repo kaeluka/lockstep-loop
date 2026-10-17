@@ -6,6 +6,7 @@
 //! tool execution and may complete requests in any order.
 
 mod history;
+use history::PathStep;
 pub use history::{
     EnvObservation, History, HistoryDescriptor, HistoryNode, HistoryOptions, NodeRef, Observation,
     OutputRecord, RecordStore, SubagentContract, SubagentHistory, UserContinuation,
@@ -298,6 +299,8 @@ pub struct LoopConfig<P> {
     pub subagent: Option<SubagentTool<P>>,
     pub budget: Option<Budget<P>>,
     pub history: Option<HistoryOptions<P>>,
+    /// Some(payload) is one intervention; even Some(None) for an optional payload.
+    pub feedback: Option<P>,
 }
 
 impl<P> LoopConfig<P> {
@@ -309,6 +312,7 @@ impl<P> LoopConfig<P> {
             subagent: None,
             budget: None,
             history: None,
+            feedback: None,
         }
     }
 
@@ -345,6 +349,13 @@ impl<P> LoopConfig<P> {
             "replay uses the snapshot's store"
         );
         options.store = Some(store);
+        self
+    }
+
+    /// Replay one environment to an existing answer, append once, then resume.
+    /// The new continuation is inherited by everyone reaching that path.
+    pub fn with_feedback(mut self, content: P) -> Self {
+        self.feedback = Some(content);
         self
     }
 
@@ -387,14 +398,18 @@ pub struct BatchResult<P> {
     pub history: Option<History<P>>,
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum LoopError {
     #[error("incompatible history contract, prompt, tools, grouping or subagent configuration")]
     IncompatibleHistory,
     #[error("recorded history does not yet support budgets")]
     UnsupportedHistory,
-    #[error("user continuation selection/inheritance policy required")]
-    UserContinuationPolicyRequired,
+    #[error("feedback requires a supplied history and exactly one environment")]
+    InvalidFeedback,
+    #[error("no recorded completed conversation on the feedback resolution path")]
+    FeedbackResolutionMiss,
+    #[error("expected one user continuation after a final assistant answer")]
+    InvalidUserContinuation,
     #[error("resolve a recorded single-environment run before appending user context")]
     UnresolvedConversation,
     #[error("env_ids must be non-empty")]
@@ -430,7 +445,7 @@ struct Branch<P> {
     messages: Vec<Message<P>>,
     split_depth: usize,
     steps: usize,
-    history_path: Vec<usize>,
+    history_path: Vec<PathStep>,
     turn_calls: Vec<ToolCall>,
     turn_results: HashMap<String, BTreeMap<String, P>>,
 }
@@ -445,7 +460,7 @@ struct BranchRecord {
 
 #[derive(Clone)]
 struct FinalBranch<P> {
-    history_path: Vec<usize>,
+    history_path: Vec<PathStep>,
     branch_id: String,
     env_ids: Vec<String>,
     content: P,
@@ -486,6 +501,10 @@ pub struct BatchLoop<P, K = P> {
     branches: HashMap<String, Branch<P>>,
     partition: Vec<BranchRecord>, // legacy per-run partition summary
     recorded: Option<History<P>>,
+    feedback: Option<P>,
+    resolve_only: bool,
+    resolution_base: Option<History<P>>,
+    error: Option<LoopError>,
     prompt_eq: Option<fn(&P, &P) -> bool>,
     custom_grouping: bool,
     finals: Vec<FinalBranch<P>>,
@@ -502,7 +521,7 @@ where
 {
     /// Construct a loop that groups tool results by value equality.
     pub fn new(config: LoopConfig<P>) -> Result<Self, LoopError> {
-        Self::build(config, Arc::new(Clone::clone), String::new(), false)
+        Self::build(config, Arc::new(Clone::clone), String::new(), false, false)
     }
 }
 
@@ -516,7 +535,7 @@ where
         config: LoopConfig<P>,
         group_by: impl Fn(&P) -> K + Send + Sync + 'static,
     ) -> Result<Self, LoopError> {
-        Self::build(config, Arc::new(group_by), String::new(), true)
+        Self::build(config, Arc::new(group_by), String::new(), true, false)
     }
 
     fn build(
@@ -524,6 +543,7 @@ where
         group_by: Arc<GroupFunction<P, K>>,
         id_prefix: String,
         custom_grouping: bool,
+        resolve_only: bool,
     ) -> Result<Self, LoopError> {
         if config.env_ids.is_empty() {
             return Err(LoopError::EmptyEnvIds);
@@ -542,6 +562,13 @@ where
             return Err(LoopError::InvalidSubagentDepth);
         }
 
+        if config.feedback.is_some()
+            && (config.env_ids.len() != 1
+                || config.history.as_ref().is_none_or(|h| h.previous.is_none()))
+        {
+            return Err(LoopError::InvalidFeedback);
+        }
+        let resolve_only = resolve_only || config.feedback.is_some();
         let prompt_eq = config.history.as_ref().and_then(|h| h.prompt_eq);
         let sub_contract = config.subagent.as_ref().map(|s| SubagentContract {
             spec: s.spec.clone(),
@@ -555,9 +582,6 @@ where
                 return Err(LoopError::IncompatibleHistory);
             }
             if let Some(previous) = options.previous {
-                if previous.descriptor.requires_user_policy {
-                    return Err(LoopError::UserContinuationPolicyRequired);
-                }
                 if previous.descriptor.contract != options.contract
                     || !options
                         .prompt_eq
@@ -579,7 +603,6 @@ where
                         custom_grouping,
                         root: store.put(HistoryNode::default()),
                         subagent: sub_contract,
-                        requires_user_policy: false,
                     },
                     store,
                 })
@@ -617,7 +640,11 @@ where
             next_child: 0,
             branches: HashMap::new(),
             partition: vec![root_record],
+            resolution_base: if resolve_only { recorded.clone() } else { None },
             recorded,
+            feedback: config.feedback,
+            resolve_only,
+            error: None,
             prompt_eq,
             custom_grouping,
             finals: Vec::new(),
@@ -628,6 +655,9 @@ where
             child_routes: HashMap::new(),
         };
         loop_.schedule_branch(root);
+        if let Some(error) = loop_.error {
+            return Err(error);
+        }
         Ok(loop_)
     }
 
@@ -635,6 +665,9 @@ where
     /// [`BatchLoop::is_done`] to distinguish blocked from finished.
     pub fn next_request(&mut self, kind: RequestKind) -> Option<Request<P>> {
         self.rollup_children();
+        if self.error.is_some() {
+            return None;
+        }
         if let Some(request) = self.pop_child_request(kind) {
             return Some(request);
         }
@@ -650,19 +683,30 @@ where
     }
 
     /// Deliver a completion for any outstanding root or nested request.
-    /// Validation errors leave the loop state untouched.
+    /// Validation errors leave pending requests correctable. A resolution miss or
+    /// invalid user continuation is instead terminal: pending work is cancelled,
+    /// is_done() becomes true, and result()/error() report the stored failure.
     pub fn complete(&mut self, completion: Completion<P>) -> Result<(), LoopError> {
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
         let request_id = completion.request_id().to_owned();
         if let Some(route) = self.child_routes.get(&request_id) {
             let child_key = route.child_key.clone();
-            self.children
+            let child = &mut self
+                .children
                 .get_mut(&child_key)
                 .expect("child route must reference a live child")
-                .child
-                .complete(completion)?;
+                .child;
+            let result = child.complete(completion);
+            if let Some(error) = child.error.clone() {
+                self.fail(error.clone());
+                return Err(error);
+            }
+            result?;
             self.child_routes.remove(&request_id);
             self.rollup_children();
-            return Ok(());
+            return self.error.clone().map_or(Ok(()), Err);
         }
 
         let request = self
@@ -682,10 +726,10 @@ where
             }
             _ => unreachable!("completion kind was validated"),
         }
-        Ok(())
+        self.error.clone().map_or(Ok(()), Err)
     }
 
-    /// True only when no root or nested work is runnable or outstanding.
+    /// True on success or terminal failure; result() returns the stored error on failure.
     pub fn is_done(&mut self) -> bool {
         self.rollup_children();
         self.ready_llm.is_empty()
@@ -724,11 +768,35 @@ where
     }
 
     /// Build the immutable trie, final classes, and per-environment results.
+    /// A terminal resolution/history failure returns its stored error, not a partial result.
     pub fn result(&mut self) -> Result<BatchResult<P>, LoopError> {
-        if !self.is_done() {
+        let done = self.is_done();
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
+        if !done {
             return Err(LoopError::NotDone);
         }
         Ok(self.finalize())
+    }
+
+    /// Terminal resolution/history error, not a correctable completion validation error.
+    pub fn error(&self) -> Option<&LoopError> {
+        self.error.as_ref()
+    }
+
+    fn fail(&mut self, error: LoopError) {
+        self.error = Some(error);
+        if let Some(base) = self.resolution_base.take() {
+            self.recorded = Some(base);
+        }
+        self.ready_llm.clear();
+        self.ready_tool.clear();
+        self.outstanding.clear();
+        self.child_routes.clear();
+        self.children.clear();
+        self.branches.clear();
+        self.finals.clear();
     }
 
     /// A structurally shared snapshot; builders and pending requests are not persisted.
@@ -762,11 +830,13 @@ where
         Some(snapshot)
     }
 
-    /// Resolve one stable environment through ordinary replay first, then fork
-    /// an open user continuation. No session ID or endpoint handle is exposed.
-    /// Selection/inheritance policy is deliberately not implemented: replay of
-    /// the returned descriptor reports UserContinuationPolicyRequired.
+    /// Fork an open shared-path continuation of an already completed run. This
+    /// legacy helper does not resume this loop. Prefer with_feedback for strict
+    /// replay-only resolution before resumption. No endpoint ID is accepted.
     pub fn append_user_message(&mut self, content: P) -> Result<History<P>, LoopError> {
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
         if !self.is_done() || self.finals.len() != 1 || self.finals[0].env_ids.len() != 1 {
             return Err(LoopError::UnresolvedConversation);
         }
@@ -779,7 +849,6 @@ where
             resolved_env_id: Some(self.finals[0].env_ids[0].clone()),
         });
         snapshot.replace_node(path, node);
-        snapshot.descriptor.requires_user_policy = true;
         Ok(snapshot)
     }
 
@@ -857,12 +926,20 @@ where
     }
 
     fn rollup_children(&mut self) {
-        loop {
+        while self.error.is_none() {
             let done_keys: Vec<String> = self
                 .children
                 .iter_mut()
                 .filter_map(|(key, link)| link.child.is_done().then(|| key.clone()))
                 .collect();
+            if let Some(error) = self
+                .children
+                .values()
+                .find_map(|link| link.child.error.clone())
+            {
+                self.fail(error);
+                return;
+            }
             self.recorded = self.history();
             if done_keys.is_empty() {
                 return;
@@ -882,6 +959,9 @@ where
                     .insert(link.call.id, child_result.results);
                 if branch.turn_results.len() == branch.turn_calls.len() {
                     self.advance_turn(branch);
+                    if self.error.is_some() {
+                        return;
+                    }
                 } else {
                     self.branches.insert(branch.branch_id.clone(), branch);
                 }
@@ -912,16 +992,35 @@ where
         }
     }
 
-    fn schedule_branch(&mut self, branch: Branch<P>) {
-        if let Some(message) = self.recorded.as_ref().and_then(|h| {
-            let node = h.node(&branch.history_path);
-            assert!(
-                node.user_continuations.is_empty(),
-                "invalid imported history: descriptor missing user-policy marker"
-            );
-            node.assistant.clone()
-        }) {
-            self.accept_assistant(branch, message);
+    fn schedule_branch(&mut self, mut branch: Branch<P>) {
+        if self.error.is_some() {
+            return;
+        }
+        while let Some(history) = &self.recorded {
+            let node = history.node(&branch.history_path);
+            if !node.user_continuations.is_empty()
+                && (node.user_continuations.len() != 1
+                    || !node
+                        .assistant
+                        .as_ref()
+                        .is_some_and(|m| m.tool_calls.is_empty())
+                    || node.user_continuations[0].message.role != Role::User
+                    || !node.user_continuations[0].message.tool_calls.is_empty()
+                    || node.user_continuations[0].message.tool_call_id.is_some())
+            {
+                self.fail(LoopError::InvalidUserContinuation);
+                return;
+            }
+            let Some(message) = node.assistant.clone() else {
+                break;
+            };
+            let Some(next) = self.accept_assistant(branch, message) else {
+                return;
+            };
+            branch = next;
+        }
+        if self.resolve_only {
+            self.fail(LoopError::FeedbackResolutionMiss);
             return;
         }
         if let Some(budget) = &self.budget
@@ -968,13 +1067,19 @@ where
             .branches
             .remove(&request.branch_id)
             .expect("LLM request must reference an active branch");
-        self.accept_assistant(
+        if let Some(branch) = self.accept_assistant(
             branch,
             Message::assistant(completion.content, completion.tool_calls),
-        );
+        ) {
+            self.schedule_branch(branch);
+        }
     }
 
-    fn accept_assistant(&mut self, mut branch: Branch<P>, message: Message<P>) {
+    fn accept_assistant(
+        &mut self,
+        mut branch: Branch<P>,
+        message: Message<P>,
+    ) -> Option<Branch<P>> {
         if let Some(history) = &mut self.recorded {
             let mut node = history.node(&branch.history_path).as_ref().clone();
             node.assistant.get_or_insert_with(|| message.clone());
@@ -984,8 +1089,28 @@ where
         branch.steps += 1;
         branch.messages.push(message.clone());
         if message.tool_calls.is_empty() {
+            if let Some(history) = &mut self.recorded {
+                let mut node = history.node(&branch.history_path).as_ref().clone();
+                if node.user_continuations.is_empty()
+                    && let Some(content) = self.feedback.take()
+                {
+                    node.user_continuations.push(UserContinuation {
+                        message: Message::user(content),
+                        continuation: history.store.put(HistoryNode::default()),
+                        resolved_env_id: Some(branch.env_ids[0].clone()),
+                    });
+                    history.replace_node(&branch.history_path, node.clone());
+                    self.resolve_only = false;
+                    self.resolution_base = None;
+                }
+                if let Some(edge) = node.user_continuations.first() {
+                    branch.messages.push(edge.message.clone());
+                    branch.history_path.push(PathStep::User(0));
+                    return Some(branch);
+                }
+            }
             self.finish_branch(branch, message.content);
-            return;
+            return None;
         }
 
         branch.turn_calls = message.tool_calls;
@@ -1000,11 +1125,15 @@ where
             } else {
                 self.request_tool(&branch, call);
             }
+            if self.error.is_some() {
+                return None;
+            }
         }
         self.branches.insert(branch.branch_id.clone(), branch);
         // Attach newly spawned (possibly still open) children once, so repeated
         // snapshots and rejected completions retain the same root reference.
         self.recorded = self.history();
+        None
     }
 
     fn handle_tool(&mut self, request: ToolRequest, completion: ToolCompletion<P>) {
@@ -1047,6 +1176,14 @@ where
                 prompt_eq: self.prompt_eq,
             }
         });
+        if self.resolve_only
+            && history_options
+                .as_ref()
+                .is_none_or(|h| h.previous.is_none())
+        {
+            self.fail(LoopError::FeedbackResolutionMiss);
+            return;
+        }
         let tool_specs = (subagent.sub_tool_specs)(&branch.env_ids[0])
             .into_iter()
             .filter(|spec| child_subagent.is_some() || spec.name != subagent.spec.name)
@@ -1058,6 +1195,7 @@ where
             subagent: child_subagent,
             budget: self.budget.clone(),
             history: history_options,
+            feedback: None,
         };
         // Routing paths contain only internal counters, never opaque provider
         // call IDs. The counter spans all branches/turns: retired invocations
@@ -1072,8 +1210,20 @@ where
             Arc::clone(&self.group_by),
             format!("{}{child_key}", self.id_prefix),
             self.custom_grouping,
-        )
-        .expect("subagent callback violated the recorded compatibility contract");
+            self.resolve_only,
+        );
+        let child = match child {
+            Ok(child) => child,
+            Err(
+                error @ (LoopError::FeedbackResolutionMiss | LoopError::InvalidUserContinuation),
+            ) => {
+                self.fail(error);
+                return;
+            }
+            Err(error) => {
+                panic!("subagent callback violated the recorded compatibility contract: {error}")
+            }
+        };
         self.children.insert(
             child_key,
             ChildLink {
@@ -1129,6 +1279,10 @@ where
                         .collect();
                     old_key == key
                 });
+                if self.resolve_only && matched.is_none() {
+                    self.fail(LoopError::FeedbackResolutionMiss);
+                    return;
+                }
                 let index = matched.unwrap_or(node.observations.len());
                 if matched.is_none() {
                     node.observations.push(Observation {
@@ -1143,7 +1297,7 @@ where
                     messages.push(Message::tool(output.tool_output.clone(), call.id.clone()));
                 }
                 history.replace_node(&history_path, node);
-                history_path.push(index);
+                history_path.push(PathStep::Observation(index));
             } else {
                 Self::append_tool_messages(
                     &mut messages,
@@ -1179,6 +1333,9 @@ where
                 env_ids,
             });
             self.schedule_branch(child);
+            if self.error.is_some() {
+                return;
+            }
         }
     }
 

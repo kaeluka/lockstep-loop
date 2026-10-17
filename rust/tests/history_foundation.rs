@@ -515,13 +515,16 @@ fn user_continuations_belong_to_resolved_investigation_not_answer_value() {
             .user_continuations
             .is_empty()
     );
-    assert!(!resolved.history().unwrap().descriptor.requires_user_policy);
-    let config = LoopConfig::new("inspect".into(), vec!["a".into()], vec![specs()[0].clone()])
-        .with_replay(extended.clone(), "simple/v1");
-    assert!(matches!(
-        BatchLoop::new(config),
-        Err(LoopError::UserContinuationPolicyRequired)
-    ));
+    let resolved_history = resolved.history().unwrap();
+    assert!(
+        resolved_history
+            .load(&resolved_history.root().observations[0].continuation)
+            .user_continuations
+            .is_empty()
+    );
+    let mut resumed = simple(&["a"], Some(extended.clone()));
+    assert_eq!(sequential(&mut resumed, &[("a", "A")], 1), 1);
+    assert_eq!(resumed.result().unwrap().results["a"], "same final");
 
     // Representation of more tools, the SAME answer, and another user message.
     // This is storage-level construction, NOT a session ID or inheritance policy.

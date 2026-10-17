@@ -151,33 +151,73 @@ writes and loaded records; no eviction/GC is built in. Path copying can produce
 quadratic write volume on deep paths, and observation-edge lookup is linear.
 These are explicit performance limits, not an eager-loading requirement.
 
-### User continuations without a new conversation identity
+### Feedback: shared-path inheritance in the new snapshot
 
-A no-tool assistant answer ends **execution**, not the history's representation.
-`HistoryNode.user_continuations` can retain arbitrary user messages and references
-to open or subsequently fulfilled continuations, including further tool turns
-that produce the **same answer** and more user messages. The old answer is never
-replaced, and feedback is not keyed by its value.
+Feedback improves an **investigation**, not an environment ID or answer value.
+Start a new loop with a compatible **history snapshot + exactly one stable
+environment + explicit feedback** (`feedback=Feedback(content)` in Python;
+`config.with_replay(...).with_feedback(content)` in Rust). The core:
 
-To attach context, instantiate a loop from the **snapshot + one stable
-environment**, replay its tools to resolve the investigation, then call
-`append_user_message(content)`. It returns a NEW snapshot with a user edge and an
-OPEN continuation at that resolved path; the loop's prior snapshot and all other
-paths remain unchanged. The edge records the resolved environment as provenance,
-not as an inheritance predicate. There is no public session ID or cached endpoint
-handle. Node references exist only for storage/inspection, not as conversation
-selectors.
+1. Resolves the existing completed conversation by replaying recorded reasoning
+   and re-executing tools, including nested child tools. No fresh LLM work is
+   allowed merely to locate a feedback target.
+2. Preserves the old final assistant answer and appends one user-feedback message
+   after it. A new immutable root points to an OPEN continuation. The next LLM
+   request contains the original prompt, prior investigation, answer and feedback.
+3. Resumes normal serving: more tools/LLM turns can follow, and the revised answer
+   may equal the old answer. Equality is never a feedback trigger.
+4. Returns the revised result and new snapshot. A NEW explicit feedback operation
+   resolves the latest completed continuation and appends another intervention,
+   even when its message content is identical. No global deduplication occurs.
 
-**Policy decision still needed:** which user continuation to select, and whether
-an environment sharing earlier observations should inherit another environment's
-feedback. This revision deliberately does not choose. Descriptors containing user
-continuations carry `requires_user_policy = true`; replay rejects them explicitly
-(`ValueError` / `UserContinuationPolicyRequired`) until a selection/inheritance
-API is agreed. This includes unrelated paths in that descriptor, conservatively.
-Old descriptors remain replayable. Representation, append and immutability are
-implemented; feedback execution/routing, assets, DAG scheduling and UI are not.
-For caller-constructed records, the descriptor marker must be true whenever any
-reachable node has a user continuation.
+**Scope is shared-path, within the new snapshot.** If A and B had identical
+pre-feedback observations, feedback resolved using A also applies to B and a new
+C when they reach that path in the new snapshot. They run the additional tools
+and may split on new evidence. Unrelated paths are unaffected. The old snapshot
+still yields the original investigation and answer. There are **no environment
+scope gates, value-to-feedback maps, public session IDs, or endpoint shortcuts**.
+Existing `resolved_env_id` metadata is provenance only; it never selects a path.
+
+**Caller caveat:** this revises the investigation for the entire path, not a
+private annotation on one environment. An assertion such as “this commit
+introduces vulnerability X” is not automatically safe to generalize. Prefer
+transferable investigative instructions such as “check whether X”, or retain a
+separate snapshot. The library does not rewrite/classify feedback or offer
+alternate scope modes. Under custom lossy grouping, inheritance uses the same
+explicit grouping policy and retains original representative context plus exact
+per-environment evidence.
+
+History uses the same shallow `UserContinuation(message, continuation, ...)`
+records and lazy loader. There is one user successor per answered endpoint;
+successive interventions form a chain. Imported multiple competing user edges
+are rejected on traversal rather than implicitly merged/selected. The provisional
+`requires_user_policy` descriptor flag has been removed now that this policy is
+settled. The existing `append_user_message` helper still forks an already completed
+live run into an open snapshot without resuming that loop; constructor feedback
+is the replay-only resolution/resumption operation. Neither accepts node IDs as
+conversation selectors.
+
+**Explicit failure:** if the selected path is unseen or unfulfilled, including
+an open earlier feedback continuation or unseen child observation, feedback
+resolution fails instead of generating a target. A root miss may fail construction;
+a later miss surfaces from completion or the loop's terminal error state.
+`done`/`is_done()` is true, `error`/`error()` reports
+`FeedbackResolutionError` / `LoopError::FeedbackResolutionMiss`, and `result()`
+raises/returns that error, not a partial result. Pending work is logically
+cancelled (caller-owned executors must stop/ignore it). Further completions return
+the stored failure. `history` reverts to the supplied snapshot; append-only stores
+may retain orphan writes. A **valid** differing tool result causing a miss is
+consumed and terminal; an **invalid completion** remains correctable and does not
+consume its request. Start a new operation to retry after a resolution failure.
+
+Only the selected path must already be completed; unrelated branches may be open.
+Ordinary replay without new feedback may still extend an open continuation.
+Feedback targets this loop's terminal no-tool assistant answer; no new nested
+asset/endpoint-selection or result-tool publication API is introduced. Existing
+nested investigations replay during resolution, and new subagents can run after
+injection. There is no crash-safe exactly-once claim: “once” is per live operation.
+Independent feedback snapshots are not automatically reconciled. Assets, DAG
+scheduling and UI remain out of scope.
 
 ### Other limits
 
@@ -201,6 +241,10 @@ Executable caller-side persistence/replay examples (no provider needed):
 ```sh
 (cd python && PYTHONPATH=src python examples/history_replay.py)
 cargo run -p lockstep-loop --example history_replay
+
+# Feedback, inheritance, repeated interventions, persistence, explicit replay miss
+(cd python && PYTHONPATH=src python examples/feedback.py)
+cargo run -p lockstep-loop --example feedback
 ```
 
 See the [Python API/example](python/README.md#recording-and-replay) and

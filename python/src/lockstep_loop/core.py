@@ -45,6 +45,7 @@ from .history import (
     SubagentContract,
     SubagentHistory,
     UserContinuation,
+    _HistoryPath,
 )
 
 #: Conversation payload type: message content, tool results, final answers.
@@ -286,6 +287,24 @@ class BatchResult(Generic[P]):
     history: History[P] | None = None
 
 
+@dataclass(frozen=True)
+class Feedback(Generic[P]):
+    """An explicit one-time intervention; Feedback(None) is not absence."""
+
+    content: P
+
+
+class FeedbackResolutionError(RuntimeError):
+    """Replay could not locate an existing completed conversation. Terminal failure."""
+
+
+class InvalidHistoryError(RuntimeError):
+    """The selected path contains unsupported/ambiguous user continuations."""
+
+
+_ExecutionError: TypeAlias = FeedbackResolutionError | InvalidHistoryError
+
+
 @dataclass
 class _Branch(Generic[P]):
     """Mutable internal state for one live conversation branch."""
@@ -298,7 +317,7 @@ class _Branch(Generic[P]):
     messages: list[Message[P]]
     split_depth: int
     steps: int = 0
-    history_path: tuple[int, ...] = ()
+    history_path: _HistoryPath = ()
     final_content: P | None = None
     turn_calls: tuple[ToolCall, ...] = ()
     turn_results: dict[str, dict[str, P]] = field(default_factory=dict)
@@ -366,7 +385,9 @@ class BatchLoop(Generic[P]):
         history_contract: str | None = None,
         history: History[P] | None = None,
         record_store: RecordStore[P] | None = None,
+        feedback: Feedback[P] | None = None,
         _id_prefix: str = "",
+        _resolve_only: bool = False,
     ) -> None:
         envs = tuple(env_ids)
         if not envs:
@@ -384,8 +405,10 @@ class BatchLoop(Generic[P]):
             if subagent
             else None
         )
-        if history is not None and history.descriptor.requires_user_policy:
-            raise ValueError("user continuation selection/inheritance policy required")
+        if feedback is not None and not isinstance(feedback, Feedback):
+            raise TypeError("feedback must be Feedback(content), or None for no intervention")
+        if feedback is not None and (history is None or len(envs) != 1):
+            raise ValueError("feedback requires a supplied history and exactly one environment")
         if history is not None and history_contract is None:
             raise ValueError("replay requires an explicit history_contract")
         if history_contract is not None:
@@ -423,6 +446,10 @@ class BatchLoop(Generic[P]):
             raise ValueError("record_store requires history_contract")
         self._custom_grouping = group_by is not None
         self._recorded = history
+        self._feedback = feedback
+        self._resolve_only = feedback is not None or _resolve_only
+        self._resolution_base = history if self._resolve_only else None
+        self._error: _ExecutionError | None = None
         self._next_branch = 0
         self._next_child = 0
         self._subagent = subagent
@@ -458,6 +485,7 @@ class BatchLoop(Generic[P]):
         self._branches[root.branch_id] = root
         self._partition.append(root)
         self._request_llm(root)
+        self._raise_if_failed()
 
     @overload
     def next_request(self, kind: Literal["llm"]) -> LlmRequest[P] | None: ...
@@ -478,6 +506,8 @@ class BatchLoop(Generic[P]):
         """
         with self._lock:
             self._rollup_children()
+            if self._error is not None:
+                return None
             req = self._pop_children(kind)
             if req is not None:
                 return req
@@ -502,22 +532,31 @@ class BatchLoop(Generic[P]):
         Unknown/answered IDs, duplicate call IDs and invalid environment result
         sets raise ValueError; wrong completion kinds raise TypeError. Validation
         (including tool grouping) runs before fulfillment, leaving pending work
-        recoverable. Caller callbacks must be pure; side effects are not rolled back.
+        recoverable. FeedbackResolutionError/InvalidHistoryError instead indicate
+        terminal execution failure: pending work is cancelled and result() raises
+        the stored error. Caller callbacks must be pure; side effects are not rolled back.
         """
         with self._lock:
+            self._raise_if_failed()
             child = self._child_ids.get(completion.request_id)
             if child is not None:
                 # A child final answer becomes a parent tool output. Validate its
                 # grouping contract before fulfilling the child's final request.
                 if isinstance(completion, LlmCompletion) and not completion.tool_calls:
                     hash(self._group_by(completion.content))
-                child.complete(completion)
+                try:
+                    child.complete(completion)
+                except (FeedbackResolutionError, InvalidHistoryError):
+                    if child.error is not None:
+                        self._fail(child.error)
+                    raise
                 del self._child_ids[completion.request_id]
                 if isinstance(completion, LlmCompletion):
                     self._out_llm -= 1
                 else:
                     self._out_tool -= 1
                 self._rollup_children()
+                self._raise_if_failed()
                 return
             request = self._outstanding.get(completion.request_id)
             if request is None:
@@ -531,6 +570,7 @@ class BatchLoop(Generic[P]):
                 if len(set(ids)) != len(ids):
                     raise ValueError("duplicate tool call id in one assistant turn")
                 self._handle_llm(request, completion)
+                self._raise_if_failed()
                 del self._outstanding[completion.request_id]
                 self._out_llm -= 1
             else:
@@ -539,8 +579,32 @@ class BatchLoop(Generic[P]):
                         f"ToolRequest {request.request_id} must be answered with ToolCompletion"
                     )
                 self._handle_tool(request, completion)
+                self._raise_if_failed()
                 del self._outstanding[completion.request_id]
                 self._out_tool -= 1
+
+    @property
+    def error(self) -> _ExecutionError | None:
+        """Terminal resolution/history failure, if any; validation errors are not terminal."""
+        with self._lock:
+            return self._error
+
+    def _raise_if_failed(self) -> None:
+        if self._error is not None:
+            raise self._error
+
+    def _fail(self, error: _ExecutionError) -> None:
+        self._error = error
+        if self._resolution_base is not None:
+            self._recorded = self._resolution_base
+        self._ready_llm.clear()
+        self._ready_tool.clear()
+        self._outstanding.clear()
+        self._child_ids.clear()
+        self._children.clear()
+        self._branches.clear()
+        self._finals.clear()
+        self._out_llm = self._out_tool = 0
 
     @property
     def history(self) -> History[P] | None:
@@ -552,11 +616,13 @@ class BatchLoop(Generic[P]):
     def append_user_message(self, content: P) -> History[P]:
         """Fork an OPEN continuation after resolving one environment by replay.
 
-        No endpoint/session ID is returned or accepted. This does not execute
-        feedback or choose inheritance: replay of the new edge requires policy
-        not implemented yet, and raises explicitly. The old snapshot is unchanged.
+        This legacy helper forks an already completed run; it does not resume
+        this loop. All environments reaching the path in the returned snapshot
+        inherit the user message. Prefer the constructor's feedback option to
+        enforce replay-only resolution before resumption. No endpoint ID exists.
         """
         with self._lock:
+            self._raise_if_failed()
             if self._recorded is None or len(self._finals) != 1 or self._branches:
                 raise ValueError("resolve a recorded single-environment run first")
             branch = self._finals[0]
@@ -572,17 +638,15 @@ class BatchLoop(Generic[P]):
                 branch.history_path,
                 replace(node, user_continuations=(*node.user_continuations, edge)),
             )
-            return replace(
-                snapshot, descriptor=replace(snapshot.descriptor, requires_user_policy=True)
-            )
+            return snapshot
 
-    def _set_history_node(self, path: tuple[int, ...], node: HistoryNode[P]) -> None:
+    def _set_history_node(self, path: _HistoryPath, node: HistoryNode[P]) -> None:
         assert self._recorded is not None
         self._recorded = self._recorded._replace_node(path, node)
 
     @property
     def done(self) -> bool:
-        """True when nothing is runnable and nothing is outstanding (recursively)."""
+        """True on success or terminal failure; result() raises on failure."""
         with self._lock:
             self._rollup_children()
             return (
@@ -614,10 +678,12 @@ class BatchLoop(Generic[P]):
     def result(self) -> BatchResult[P]:
         """The final snapshot: split trie, equivalence classes, results.
 
-        Raises RuntimeError unless the loop is done.
+        Raises RuntimeError unless the loop is done, or the stored terminal
+        execution error when resolution failed. No partial revised result is published.
         """
         with self._lock:
             self._rollup_children()
+            self._raise_if_failed()
             if not (
                 not self._ready_llm
                 and not self._ready_tool
@@ -664,8 +730,12 @@ class BatchLoop(Generic[P]):
 
     def _rollup_children(self) -> None:
         """Fold finished children into their parent's suspended branch."""
-        while True:
+        while self._error is None:
             finished = [(key, link) for key, link in self._children.items() if link.child.done]
+            for _, link in finished:
+                if link.child.error is not None:
+                    self._fail(link.child.error)
+                    return
             self._sync_child_histories()
             if not finished:
                 return
@@ -682,6 +752,8 @@ class BatchLoop(Generic[P]):
                 del self._children[key]
                 if plan is not None:
                     self._advance_turn(branch, plan)
+                    if self._error is not None:
+                        return
             # Replayed parent turns may spawn children already finished by replay.
             # Settle those too, without producing a false stalled frontier.
 
@@ -700,27 +772,35 @@ class BatchLoop(Generic[P]):
             entry = next((e for e in node.subagents if e.call_id == call.id), None)
             if entry is not None:
                 previous = History(entry.history, self._recorded.store)
+        if self._resolve_only and previous is None:
+            self._fail(FeedbackResolutionError("no recorded subagent conversation"))
+            return
         # Only internal counters form routing paths. Opaque provider call IDs
         # may contain any of our delimiters; never interpolate them into addresses.
         # This counter spans all branches/turns, so old invocation IDs stay retired.
         self._next_child += 1
         child_key = f"sub:{self._next_child}/"
-        child: BatchLoop[P] = BatchLoop(
-            prompt=sub.build_prompt(call.args),
-            env_ids=branch.env_ids,
-            tool_specs=tuple(
-                spec
-                for spec in sub.sub_tool_specs(branch.env_ids[0])
-                if child_subagent is not None or spec.name != sub.name
-            ),
-            subagent=child_subagent,
-            group_by=self._group_by if self._custom_grouping else None,
-            budget=self._budget,
-            history_contract=self._recorded.contract if self._recorded else None,
-            history=previous,
-            record_store=self._recorded.store if self._recorded else None,
-            _id_prefix=f"{self._id_prefix}{child_key}",
-        )
+        try:
+            child: BatchLoop[P] = BatchLoop(
+                prompt=sub.build_prompt(call.args),
+                env_ids=branch.env_ids,
+                tool_specs=tuple(
+                    spec
+                    for spec in sub.sub_tool_specs(branch.env_ids[0])
+                    if child_subagent is not None or spec.name != sub.name
+                ),
+                subagent=child_subagent,
+                group_by=self._group_by if self._custom_grouping else None,
+                budget=self._budget,
+                history_contract=self._recorded.contract if self._recorded else None,
+                history=previous,
+                record_store=self._recorded.store if self._recorded else None,
+                _id_prefix=f"{self._id_prefix}{child_key}",
+                _resolve_only=self._resolve_only,
+            )
+        except (FeedbackResolutionError, InvalidHistoryError) as error:
+            self._fail(error)
+            return
         self._children[child_key] = _ChildLink(child=child, branch_id=branch.branch_id, call=call)
 
     def _pop_any(self) -> Request[P] | None:
@@ -748,13 +828,29 @@ class BatchLoop(Generic[P]):
         self._finals.append(branch)
 
     def _request_llm(self, branch: _Branch[P]) -> None:
-        if self._recorded is not None:
+        if self._error is not None:
+            return
+        while self._recorded is not None:
             node = self._recorded._node(branch.history_path)
-            if node.user_continuations:
-                raise ValueError("user continuation selection/inheritance policy required")
-            if node.assistant is not None:
-                self._accept_assistant(branch, node.assistant)
+            if node.user_continuations and (
+                len(node.user_continuations) != 1
+                or node.assistant is None
+                or node.assistant.tool_calls
+                or node.user_continuations[0].message.role != "user"
+                or node.user_continuations[0].message.tool_calls
+                or node.user_continuations[0].message.tool_call_id is not None
+            ):
+                self._fail(
+                    InvalidHistoryError("expected one user continuation after a final answer")
+                )
                 return
+            if node.assistant is None:
+                break
+            if not self._accept_assistant(branch, node.assistant):
+                return
+        if self._resolve_only:
+            self._fail(FeedbackResolutionError("no recorded completed conversation at this path"))
+            return
         max_steps = self._budget.max_steps_per_branch if self._budget else None
         if max_steps is not None and branch.steps >= max_steps:
             self._finish(
@@ -788,12 +884,14 @@ class BatchLoop(Generic[P]):
 
     def _handle_llm(self, request: LlmRequest[P], completion: LlmCompletion[P]) -> None:
         branch = self._branches[request.branch_id]
-        self._accept_assistant(
+        if self._accept_assistant(
             branch,
             Message(role="assistant", content=completion.content, tool_calls=completion.tool_calls),
-        )
+        ):
+            self._request_llm(branch)
 
-    def _accept_assistant(self, branch: _Branch[P], message: Message[P]) -> None:
+    def _accept_assistant(self, branch: _Branch[P], message: Message[P]) -> bool:
+        """Return True to schedule the next node after a user continuation."""
         if self._recorded is not None:
             node = self._recorded._node(branch.history_path)
             self._set_history_node(
@@ -807,8 +905,25 @@ class BatchLoop(Generic[P]):
         branch.steps += 1
         branch.messages.append(message)
         if not message.tool_calls:
+            if self._recorded is not None:
+                node = self._recorded._node(branch.history_path)
+                if not node.user_continuations and self._feedback is not None:
+                    edge = UserContinuation(
+                        Message(role="user", content=self._feedback.content),
+                        self._recorded.store.put(HistoryNode()),
+                        resolved_env_id=branch.env_ids[0],
+                    )
+                    node = replace(node, user_continuations=(edge,))
+                    self._set_history_node(branch.history_path, node)
+                    self._feedback = None  # once per explicit operation, never by answer equality
+                    self._resolve_only = False
+                    self._resolution_base = None
+                if node.user_continuations:
+                    branch.messages.append(node.user_continuations[0].message)
+                    branch.history_path = (*branch.history_path, ("user", 0))
+                    return True
             self._finish(branch, message.content)
-            return
+            return False
         branch.turn_calls = message.tool_calls
         branch.turn_results = {}
         for call in message.tool_calls:
@@ -816,6 +931,9 @@ class BatchLoop(Generic[P]):
                 self._spawn_child(branch, call)
             else:
                 self._request_tool(branch, call)
+            if self._error is not None:
+                return False
+        return False
 
     def _handle_tool(self, request: ToolRequest, completion: ToolCompletion[P]) -> None:
         branch = self._branches[request.branch_id]
@@ -869,6 +987,9 @@ class BatchLoop(Generic[P]):
     ) -> None:
         if plan is None:
             plan = self._plan_turn(branch, branch.turn_results)
+        if self._resolve_only and any(match is None for _, match, _ in plan):
+            self._fail(FeedbackResolutionError("unseen tool observation while resolving feedback"))
+            return
         split = len(plan) > 1
         for envs, match, group_label in plan:
             path = branch.history_path
@@ -904,7 +1025,7 @@ class BatchLoop(Generic[P]):
                     messages.append(
                         Message(role="tool", content=output.tool_output, tool_call_id=call.id)
                     )
-                path = (*path, match)
+                path = (*path, ("observation", match))
             else:
                 self._append_tool_messages(
                     messages, branch.turn_calls, branch.turn_results, envs[0]
@@ -931,6 +1052,8 @@ class BatchLoop(Generic[P]):
                 branch.turn_calls = ()
                 branch.turn_results = {}
                 self._request_llm(branch)
+            if self._error is not None:
+                return
         if split:
             del self._branches[branch.branch_id]
 
