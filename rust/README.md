@@ -161,14 +161,24 @@ and folds child final answers into parent matching. Parent classes do not split
 merely because child traces differ when their answers agree. Active-child
 snapshots preserve fulfilled turns without serializing pending tool builders.
 
-**Compatibility:** prompt equality, ordered tool specs, default/custom grouping
-mode and nested subagent specs/allowlists/depth are checked. Child prompts/specs
+**Compatibility:** prompt equality, ordered tool specs and nested subagent
+specs/allowlists/depth are checked. Child prompts/specs
 are checked on entry. `with_agent` requires `P: PartialEq` for prompt checking
 (recording alone does not). Pure tools are re-executed: implementation changes
 with equal observations reuse reasoning; different observations branch, without
 any manual version key. Provider/adapter settings and custom grouping semantics
 cannot be inferred. Callers own external cache isolation and snapshot selection
 when those policies change.
+
+Default grouping is identity (value cloning). Neither default/custom mode nor
+callback identity is persisted or compared. The current function compares **both**
+fresh raw outputs and stored representatives. Stricter keys can miss despite a
+match in old per-environment evidence; coarser keys choose the first matching
+existing edge in stored observation order when several now match. Replay keeps
+that historical representative in context and appends full fresh evidence, without
+merging edges, retroactively regrouping evidence, or mutating old roots. The
+callback must accept historical outputs and remain stable during execution.
+
 Payload `Clone` must have immutable value semantics: interior-mutable aliases must
 not change submitted facts. Grouping, equality and hashing must be deterministic;
 callback panics are not recoverable validation errors. Child prompts, specs and
@@ -258,7 +268,7 @@ Children inherit the parent's environment set and read the same study packets.
 
 `with_agent_resolver` accepts a synchronous caller callback returning
 `Result<Option<AgentDescriptor<P>>, LoopError>` for an `AgentQuery<P>` containing
-only child prompt, ordered tools, grouping mode and nested configuration, never
+only child prompt, ordered tools and nested configuration, never
 parent identity, invocation/call IDs or env membership. It requires `P: PartialEq`,
 like `with_agent`, for full compatibility checks. Return None for a miss; return a
 chosen descriptor for a hit. Index hashes or abbreviated keys never replace core
@@ -301,8 +311,8 @@ cache hit. There is no DAG invalidation/propagation service here.
 Duplicate names and conflicting ordinary/subagent specs are rejected; an exactly
 matching `ToolSpec` is accepted as a redundant legacy advertisement. Serial drivers
 now register all `ToolEntry::Subagent` entries and reject actual callable/subagent
-name collisions, even with identical specs. The default serial driver records
-exact-equality grouping; `_by` records explicit custom grouping. Use direct
+name collisions, even with identical specs. The default serial driver uses
+exact-equality grouping; `_by` uses a custom function, without persisting a mode. Use direct
 `BatchLoop` for resolver-driven serving. `SubagentTool::with_subagents` defines the
 child allowlist: empty is a leaf, None preserves bounded self-recursion, never all
 parent siblings. Nested depths are clamped to the remaining allowance; disabled
@@ -318,8 +328,9 @@ binding/remapping, new system-role API, logical asset registry or scheduler is a
 
 **API/schema migration:** manual contract arguments, fields and builders are removed,
 not renamed. Record type aliases and provenance `history` fields remain. Old
-`contract`/`history_contract` fields are ignored by self-describing Serde (tested
-with the unchanged JSON fixture), and omitted on new writes. Positional/binary
+`contract`/`history_contract` fields and `custom_grouping` mode are ignored by
+self-describing Serde (tested with the unchanged JSON fixture), and omitted on
+new writes. Remove mode flags from caller cache indices too. Positional/binary
 codecs may require caller migration. Earlier singular `subagent` schemas still
 require migration; no general cross-version wire guarantee is made. See the [exact mapping](../docs/agent-assets.md#preferred-names-and-compatibility).
 

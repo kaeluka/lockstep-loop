@@ -76,17 +76,16 @@ class HistoryQuery(Generic[P]):
     """Child structural configuration, independent of parent/invocation identity.
 
     External provider/grouping policy isolation is caller-owned. The legacy class
-    path is retained for persisted codecs; old pickle contract labels are ignored.
+    path is retained for codecs; old contract labels and grouping mode are ignored.
     """
 
     prompt: P
     tools: tuple[ToolSpec, ...]
-    custom_grouping: bool
     subagents: tuple[SubagentContract, ...] = ()
 
     def __setstate__(self, state: dict[str, object]) -> None:
         for name, value in state.items():
-            if name != "contract":
+            if name not in ("contract", "custom_grouping"):
                 object.__setattr__(self, name, value)
 
 
@@ -100,17 +99,16 @@ class HistoryDescriptor(Generic[P]):
 
     prompt: P
     tools: tuple[ToolSpec, ...]
-    custom_grouping: bool
     root: NodeRef
     subagents: tuple[SubagentContract, ...] = ()
 
     def __setstate__(self, state: dict[str, object]) -> None:
         for name, value in state.items():
-            if name != "contract":
+            if name not in ("contract", "custom_grouping"):
                 object.__setattr__(self, name, value)
 
     def query(self) -> AgentQuery[P]:
-        return AgentQuery(self.prompt, self.tools, self.custom_grouping, self.subagents)
+        return AgentQuery(self.prompt, self.tools, self.subagents)
 
     @property
     def subagent(self) -> SubagentContract | None:
@@ -434,7 +432,7 @@ class Asset(Generic[P]):
 
 
 # One implementation/model. Legacy class names remain valid pickle/codec tags.
-# Deprecated contract labels are discarded on pickle load.
+# Deprecated contract labels and grouping mode are discarded on pickle load.
 History = Agent
 AgentDescriptor = HistoryDescriptor
 AgentQuery = HistoryQuery

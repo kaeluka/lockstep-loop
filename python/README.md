@@ -169,8 +169,8 @@ child final answers enter the parent's result tuple. Divergent child traces with
 identical answers do not split the parent. Active child snapshots retain fulfilled
 turns, not partial tool collections.
 
-**Compatibility:** replay checks equal prompts, ordered tool specs, default/custom
-grouping mode, and nested subagent specs/allowlists/depth. Child prompts and specs
+**Compatibility:** replay checks equal prompts, ordered tool specs and nested
+subagent specs/allowlists/depth. Child prompts and specs
 are checked on entry. Pure tools are always re-executed: changed implementation
 with equal observations reuses reasoning; different observations branch. No manual
 version key is needed. Provider/adapter settings and custom grouping semantics
@@ -178,6 +178,15 @@ cannot be inferred; callers own external cache isolation and snapshot selection
 when those policies change. Payloads, arguments and schemas are **borrowed immutable values**: do not
 mutate nested contents through any alias after handing them to the loop. Convert
 mutable provider objects to stable values or make your own copies first.
+
+Default `group_by` is identity. Neither default/custom mode nor callback identity
+is persisted or compared. The current function compares **both** fresh raw outputs
+and stored representative outputs. Stricter keys can miss despite a match in old
+per-environment evidence; coarser keys can reuse the first matching existing edge
+in stored observation order, even if several now match. Replay preserves that
+edge's historical representative context and appends full fresh evidence. It does
+not merge historical edges, retroactively regroup evidence, or mutate old roots.
+The callback must accept historical outputs and remain stable during execution.
 
 ### Inspecting assets
 
@@ -247,7 +256,7 @@ PYTHONPATH=src python examples/specialized_subagents.py
 # Changed parent: 2 fresh parent LLM calls, 0 child LLM calls, 1 child tool rerun
 ```
 
-An agent resolver receives `AgentQuery(prompt, tools, custom_grouping, subagents)`
+An agent resolver receives `AgentQuery(prompt, tools, subagents)`
 and returns a caller-selected **AgentDescriptor**, or None for a miss. Lookup is
 independent of parent prompt/identity, invocation/call IDs, and env membership.
 No child key is required. A recorded parent or resolver enables child recording;
@@ -262,7 +271,7 @@ nodes lazily. Its loader must resolve all selected descriptor references. For
 in-memory reuse, share the same store; for persistence, save immutable record
 writes first, publish child descriptors, and attach a new writer with a loader
 covering those records. Do not return a live `Agent` from the metadata callback
-or assume the descriptor carries its records. Full prompt/spec/grouping/nested
+or assume the descriptor carries its records. Full prompt/spec/nested
 configuration compatibility is checked even if the caller indexes only by a
 hash or prompt. An incompatible hit raises, never silently falls back.
 
@@ -306,8 +315,9 @@ introduced.
 
 **API/schema migration:** manual contract arguments, fields, and builders have
 been removed, not renamed. Legacy pickle class aliases and provenance `history`
-fields remain; old `contract`/`history_contract` labels are discarded on load and
-omitted on new writes. Immutable fixtures still load and replay. Earlier singular
+fields remain; old `contract`/`history_contract` labels and `custom_grouping` mode
+are discarded on pickle load and omitted on new writes. Remove mode flags from
+caller cache indices too. Custom codecs may need migration. Immutable fixtures still load and replay. Earlier singular
 `subagent` schemas still need caller migration. See the
 [exact mapping and wire guarantees](../docs/agent-assets.md#preferred-names-and-compatibility).
 

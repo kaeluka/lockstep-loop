@@ -530,7 +530,7 @@ pub enum LoopError {
     SubagentPreparation(String),
     #[error("history resolution failed: {0}")]
     HistoryResolution(String),
-    #[error("incompatible history prompt, tools, grouping, subagents or record store")]
+    #[error("incompatible history prompt, tools, subagents or record store")]
     IncompatibleHistory,
     #[error("recorded history does not yet support budgets")]
     UnsupportedHistory,
@@ -689,7 +689,6 @@ pub struct BatchLoop<P, K = P> {
     resolution_base: Option<Agent<P>>,
     error: Option<LoopError>,
     prompt_eq: Option<fn(&P, &P) -> bool>,
-    custom_grouping: bool,
     finals: Vec<FinalBranch<P>>,
     child_histories: Vec<ChildAgentUpdate<P>>,
     ready_llm: VecDeque<LlmRequest<P>>,
@@ -710,7 +709,6 @@ where
             Arc::new(Clone::clone),
             String::new(),
             false,
-            false,
             HashSet::new(),
         )
     }
@@ -730,7 +728,6 @@ where
             config,
             Arc::new(group_by),
             String::new(),
-            true,
             false,
             HashSet::new(),
         )
@@ -740,7 +737,6 @@ where
         config: LoopConfig<P>,
         group_by: Arc<GroupFunction<P, K>>,
         id_prefix: String,
-        custom_grouping: bool,
         resolve_only: bool,
         mut unavailable_subagents: HashSet<String>,
     ) -> Result<Self, LoopError> {
@@ -807,7 +803,6 @@ where
                     .prompt_eq
                     .is_some_and(|eq| eq(&previous.descriptor.prompt, &config.prompt))
                     || previous.descriptor.tools != registry.specs
-                    || previous.descriptor.custom_grouping != custom_grouping
                     || previous.descriptor.subagents != registry.contracts
                 {
                     return Err(LoopError::IncompatibleHistory);
@@ -822,7 +817,6 @@ where
                     descriptor: AgentDescriptor {
                         prompt: config.prompt.clone(),
                         tools: registry.specs.clone(),
-                        custom_grouping,
                         root: store.put(HistoryNode::default()),
                         subagents: registry.contracts,
                     },
@@ -876,7 +870,6 @@ where
             resolve_only,
             error: None,
             prompt_eq,
-            custom_grouping,
             finals: Vec::new(),
             child_histories: Vec::new(),
             ready_llm: VecDeque::new(),
@@ -1516,7 +1509,6 @@ where
             let query = AgentQuery {
                 prompt: prompt.clone(),
                 tools: registry.specs.clone(),
-                custom_grouping: self.custom_grouping,
                 subagents: registry.contracts,
             };
             if let Some(descriptor) = (resolver.resolve)(&query)? {
@@ -1553,7 +1545,6 @@ where
             config,
             Arc::clone(&self.group_by),
             format!("{}{child_key}", self.id_prefix),
-            self.custom_grouping,
             self.resolve_only,
             unavailable,
         )?;
@@ -1603,6 +1594,8 @@ where
                             .collect(),
                     })
                     .collect();
+                // Today's function compares both sides. First existing match wins
+                // if a coarser function now equates multiple historical edges.
                 let matched = node.observations.iter().position(|edge| {
                     let old_key: Vec<K> = edge
                         .representative
@@ -1796,15 +1789,7 @@ where
     TF: Fn(&str) -> Vec<ToolEntry<P>>,
     LF: FnMut(&LlmRequest<P>) -> LlmCompletion<P>,
 {
-    run_to_completion_inner(
-        prompt,
-        env_ids,
-        tools,
-        complete_llm,
-        Clone::clone,
-        budget,
-        false,
-    )
+    run_to_completion_inner(prompt, env_ids, tools, complete_llm, Clone::clone, budget)
 }
 
 /// Synchronous convenience driver with a caller-provided grouping key.
@@ -1823,7 +1808,7 @@ where
     LF: FnMut(&LlmRequest<P>) -> LlmCompletion<P>,
     G: Fn(&P) -> K + Send + Sync + 'static,
 {
-    run_to_completion_inner(prompt, env_ids, tools, complete_llm, group_by, budget, true)
+    run_to_completion_inner(prompt, env_ids, tools, complete_llm, group_by, budget)
 }
 
 fn run_to_completion_inner<P, K, TF, LF, G>(
@@ -1833,7 +1818,6 @@ fn run_to_completion_inner<P, K, TF, LF, G>(
     mut complete_llm: LF,
     group_by: G,
     budget: Option<Budget<P>>,
-    custom_grouping: bool,
 ) -> Result<BatchResult<P>, LoopError>
 where
     P: Clone + 'static,
@@ -1870,7 +1854,6 @@ where
         config,
         Arc::new(group_by),
         String::new(),
-        custom_grouping,
         false,
         HashSet::new(),
     )?;

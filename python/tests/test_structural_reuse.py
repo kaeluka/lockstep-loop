@@ -77,10 +77,10 @@ def test_provider_and_custom_grouping_policy_are_external_not_inferred():
     assert count == 0 and replay.results == old.results
     evidence = replay.agent.root.observations[0].evidence
     assert [e.outputs[0].tool_output for e in evidence] == ["same ", "SAME"]
-    # Only default/custom mode is checked. Selecting an isolated cache/snapshot
-    # when changing provider or lossy grouping semantics belongs to the caller.
-    with pytest.raises(ValueError, match="incompatible"):
-        config(agent=old.agent)
+    # Neither mode nor function identity is checked: today's function compares
+    # raw outputs to historical representatives. Provider policy remains external.
+    exact, count = drive(config(agent=old.agent), lambda _: "same ", changed_provider)
+    assert count == 0 and exact.results == old.results
 
 
 def test_legacy_pickle_labels_are_discarded_even_in_child_cache_identity():
@@ -92,9 +92,13 @@ def test_legacy_pickle_labels_are_discarded_even_in_child_cache_identity():
     # Simulate separately imported historical labels without touching the fixture.
     legacy = pickle.loads(pickle.dumps(selected))
     object.__setattr__(legacy, "contract", "unrelated old label")
+    object.__setattr__(legacy, "custom_grouping", False)
     imported = pickle.loads(pickle.dumps(legacy))
     assert imported == selected and imported.query() == selected.query()
-    assert "contract" not in vars(imported)
+    assert "contract" not in vars(imported) and "custom_grouping" not in vars(imported)
+    legacy_query = selected.query()
+    object.__setattr__(legacy_query, "custom_grouping", True)
+    assert pickle.loads(pickle.dumps(legacy_query)) == selected.query()
     nested = root.subagents[0]
     object.__setattr__(nested, "history_contract", "another deprecated label")
     restored_nested = pickle.loads(pickle.dumps(nested))
@@ -109,10 +113,15 @@ def test_legacy_pickle_labels_are_discarded_even_in_child_cache_identity():
     tool = SubagentTool(
         "delegate", "child investigation", {}, lambda _: b"child", lambda _: (), subagents=()
     )
-    for parent in (b"parent one", b"changed parent"):
+    for parent, grouping in ((b"parent one", bytes.strip), (b"changed parent", None)):
         loop = BatchLoop(
-            prompt=parent, env_ids=["new"], tool_specs=[], subagents=[tool],
-            agent_resolver=resolve, record_store=store, group_by=bytes.strip,
+            prompt=parent,
+            env_ids=["new"],
+            tool_specs=[],
+            subagents=[tool],
+            agent_resolver=resolve,
+            record_store=store,
+            group_by=grouping,
         )
         r = loop.next_request()
         loop.complete(LlmCompletion(r.request_id, b"delegate", (ToolCall("c", "delegate", {}),)))
@@ -126,6 +135,102 @@ def test_legacy_pickle_labels_are_discarded_even_in_child_cache_identity():
     assert Agent(root, store).prompt == root.prompt
 
 
+@pytest.mark.parametrize("initial_custom", [False, True])
+def test_default_and_custom_identity_reuse_each_other(initial_custom):
+    identity = lambda value: value  # noqa: E731
+    old, _ = drive(
+        config(recording=True, group_by=identity if initial_custom else None), lambda _: "same"
+    )
+    before = old.agent.root
+    replay, count = drive(
+        config(agent=old.agent, group_by=None if initial_custom else identity), lambda _: "same"
+    )
+    assert count == 0 and replay.results == old.results
+    assert old.agent.root == before and len(before.observations[0].evidence) == 1
+    assert len(replay.agent.root.observations[0].evidence) == 2
+    assert not hasattr(replay.agent.descriptor.query(), "custom_grouping")
+
+
+@pytest.mark.parametrize("strict", [None, lambda value: value])
+def test_stricter_keys_match_representatives_not_old_evidence(strict):
+    old, _ = drive(config(recording=True, group_by=str.strip), lambda _: "same ")
+    grouped, count = drive(config(agent=old.agent, group_by=str.strip), lambda _: "same")
+    assert count == 0
+    before = grouped.agent.root
+    # "same" is in historical evidence but differs from the representative "same ".
+    changed, count = drive(
+        config(agent=grouped.agent, group_by=strict),
+        lambda _: "same",
+        lambda r: "strict:" + r.messages[-1].content,
+    )
+    assert count == 1 and changed.results == {"e": "strict:same"}
+    assert len(changed.agent.root.observations) == 2
+    assert grouped.agent.root == before and len(old.agent.root.observations) == 1
+    assert [e.outputs[0].tool_output for e in before.observations[0].evidence] == ["same ", "same"]
+    assert changed.agent.root.observations[1].representative[0].tool_output == "same"
+    assert next(grouped.agent.assets()).messages[-2].content == "same "
+
+
+def test_coarser_keys_choose_first_existing_edge_without_merging_history():
+    first, _ = drive(config(recording=True), lambda _: "A", lambda _: "first")
+    old, count = drive(config(agent=first.agent), lambda _: "a", lambda _: "second")
+    assert count == 1
+    before = old.agent.root
+    replay, count = drive(
+        config(agent=old.agent, group_by=lambda v: v.strip().lower()), lambda _: "a "
+    )
+    assert count == 0 and replay.results == {"e": "first"}
+    edges = replay.agent.root.observations
+    assert len(edges) == 2 and edges[1] == before.observations[1]
+    assert [e.outputs[0].tool_output for e in edges[0].evidence] == ["A", "a "]
+    assert edges[0].representative[0].tool_output == "A"
+    assert next(replay.agent.assets()).messages[-2].content == "A"
+    assert old.agent.root == before and len(first.agent.root.observations) == 1
+    exact, count = drive(config(agent=replay.agent), lambda _: "a")
+    assert count == 0 and exact.results == {"e": "second"}
+
+
+def test_child_query_and_execution_do_not_distinguish_default_from_custom_identity():
+    tool = SubagentTool("child", "", {}, lambda _: "child prompt", lambda _: (READ,), subagents=())
+    selected = None
+    store = RecordStore()
+    queries = []
+
+    def resolve(query):
+        queries.append(query)
+        return selected if selected is not None and query == selected.query() else None
+
+    for grouping in (None, lambda v: v, None):
+        loop = BatchLoop(
+            prompt="parent",
+            env_ids=["e"],
+            tool_specs=[],
+            subagents=[tool],
+            agent_resolver=resolve,
+            record_store=store,
+            group_by=grouping,
+        )
+        r = loop.next_request()
+        loop.complete(LlmCompletion(r.request_id, "delegate", (ToolCall("c", "child", {}),)))
+        child_llms = 0
+        while not loop.done:
+            r = loop.next_request()
+            if isinstance(r, LlmRequest):
+                if r.messages[0].content == "parent":
+                    loop.complete(LlmCompletion(r.request_id, r.messages[-1].content))
+                else:
+                    child_llms += 1
+                    calls = (ToolCall("r", "read", {}),) if len(r.messages) == 1 else ()
+                    loop.complete(LlmCompletion(r.request_id, "child answer", calls))
+            else:
+                loop.complete(ToolCompletion(r.request_id, (("e", "same"),)))
+        assert child_llms == (2 if selected is None else 0)
+        update = loop.result().child_agents[0]
+        assert update.base == selected
+        selected = update.agent.descriptor
+    assert queries[0] == queries[1] == queries[2]
+
+
 def test_recording_switch_not_structural_identity_and_legacy_budget_stays_available():
     tool = SubagentTool("child", "", {}, lambda _: "child", lambda _: (), subagents=())
     loop = BatchLoop(prompt="p", env_ids=["e"], tool_specs=[], subagents=[tool], recording=True)
@@ -133,14 +238,20 @@ def test_recording_switch_not_structural_identity_and_legacy_budget_stays_availa
     loop.complete(LlmCompletion(r.request_id, "done"))
     # Toggling child recording does not change the replay compatibility header.
     replay = BatchLoop(
-        prompt="p", env_ids=["e"], tool_specs=[],
-        subagents=[replace(tool, recording=True)], agent=loop.agent,
+        prompt="p",
+        env_ids=["e"],
+        tool_specs=[],
+        subagents=[replace(tool, recording=True)],
+        agent=loop.agent,
     )
     assert replay.done
     legacy = BatchLoop(prompt="p", env_ids=["e"], tool_specs=[], subagents=[tool], budget=Budget(1))
     assert legacy.agent is None
     with pytest.raises(ValueError, match="budgets"):
         BatchLoop(
-            prompt="p", env_ids=["e"], tool_specs=[],
-            subagents=[replace(tool, recording=True)], budget=Budget(1),
+            prompt="p",
+            env_ids=["e"],
+            tool_specs=[],
+            subagents=[replace(tool, recording=True)],
+            budget=Budget(1),
         )

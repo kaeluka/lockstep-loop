@@ -617,9 +617,7 @@ fn incompatible_resolver_results_and_malformed_args_leave_fresh_requests_recover
     wrong_nested.subagents = old.history.as_ref().unwrap().descriptor.subagents.clone();
     let mut wrong_tools = descriptor.clone();
     wrong_tools.tools.clear();
-    let mut wrong_group = descriptor.clone();
-    wrong_group.custom_grouping = true;
-    for bad in [wrong_prompt, wrong_nested, wrong_tools, wrong_group] {
+    for bad in [wrong_prompt, wrong_nested, wrong_tools] {
         let config = config("parent-invalid", &["old"])
             .with_record_store(store(&backend))
             .with_history_resolver(move |_| Ok(Some(bad.clone())));
@@ -819,12 +817,12 @@ fn registration_legacy_advertisements_and_all_serial_driver_entries() {
     assert_eq!(result.results["e"], "imports:done|metrics:done");
     assert!(result.history.is_none());
     assert_eq!(result.child_histories.len(), 2);
-    assert!(
-        result
-            .child_histories
-            .iter()
-            .all(|u| !u.history.descriptor.custom_grouping)
-    );
+    assert!(result.child_histories.iter().all(|u| {
+        serde_json::to_value(&u.history.descriptor)
+            .unwrap()
+            .get("custom_grouping")
+            .is_none()
+    }));
     let runtime_sub = imports.clone();
     assert!(matches!(
         run_to_completion(

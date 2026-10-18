@@ -9,8 +9,8 @@ datasets, source code, and others. For concrete environment/tool designs, see
 `Agent` is the complete immutable snapshot: initial prompt, structural configuration, and
 accumulated trie. `Asset` is a read-only leaf investigation backed by its full path.
 See the [glossary, inspection API and exact compatibility mapping](agent-assets.md).
-Legacy `History` names remain aliases; deprecated contract labels are ignored on
-import and omitted on new writes. See the migration notes in the glossary.
+Legacy `History` names remain aliases; deprecated contract labels and grouping-mode
+metadata are ignored on import and omitted on new writes. See the migration notes in the glossary.
 
 ## Immutable recorded history and incremental replay
 
@@ -26,7 +26,7 @@ the original environment class. Old snapshots and old paths remain reusable.
 The history model is the replay engine's model, not a lossy export:
 
 - `Agent` pairs a small `AgentDescriptor` (prompt, ordered tool specifications,
-  grouping mode, nested configuration and root reference) with a `RecordStore` resolver.
+  nested configuration and root reference) with a `RecordStore` resolver.
 - `HistoryNode` stores the full assistant message (including tool calls/arguments)
   and the environment visits that used it. An absent assistant is an unfulfilled
   continuation, not a terminal answer.
@@ -76,8 +76,9 @@ for `list_imports(file_path="foo.py")` in code analysis. All children inherit th
 parent's environment IDs unchanged. Resolve mutable evidence sources outside the core.
 
 No caller-supplied child key is needed. Configure `agent_resolver` /
-`.with_agent_resolver(...)` to receive an `AgentQuery`: child prompt, ordered effective tool specs,
-grouping mode, and nested subagent configuration. It contains **no parent prompt,
+`.with_agent_resolver(...)` to receive an `AgentQuery`: child prompt, ordered effective
+tool specs, and nested subagent configuration. No grouping mode or function identity
+participates in lookup. It contains **no parent prompt,
 branch/invocation ID, tool-call ID, or environment membership**. The caller returns
 a chosen `AgentDescriptor`, or None for a miss (Rust wraps this in `Result`).
 Core verifies full compatibility by value; a bad hit is an error, not a silent miss.
@@ -158,11 +159,25 @@ invalidation/scheduling is included.
 ### Compatibility and ownership
 
 There is no manual contract/version key. The core rejects unequal prompts, changed
-ordered tool specs, a switch between default and custom grouping, or changed
-subagent registration, nesting allowlist or depth. Child prompts/specs are checked
+ordered tool specs, or changed subagent registration, nesting allowlist or depth. Child prompts/specs are checked
 when entered, including the actual outputs of prompt/spec-building callbacks.
 Pure tools are re-executed: changing their implementation either changes the
 observations (branch at divergence) or does not (reuse). No manual bump is needed.
+
+The default grouping function is identity. Neither default/custom mode nor function
+identity is persisted or compared. On every checkpoint, the **current** function
+is applied to both the fresh raw output tuple and each stored representative tuple.
+Default and custom identity functions therefore reuse each other's histories.
+A stricter function can miss even if the fresh raw output occurs in an old edge's
+per-environment evidence: matching uses the representative, not any past evidence.
+A coarser function can match several existing edges; the **first matching edge in
+stored observation order** wins deterministically for that snapshot. Edges and
+continuations are not merged or rewritten. Replay keeps the chosen historical
+representative in conversation context and appends exact fresh outputs to evidence;
+old roots remain unchanged. Changing keys does not retroactively refine old evidence
+or regenerate old reasoning. The current callback must accept historical outputs,
+not just today's outputs, and be stable for the duration of an execution.
+
 Provider/adapter settings and the semantics of custom grouping are external policy,
 not inferred from closures or specs. Callers choose compatible snapshots and isolate
 external caches when those policies require different reasoning; the core adds no
@@ -408,9 +423,9 @@ See the [Python API/example](../python/README.md#recording-and-replay) and
   Current values are terminal assistant replies, not result-tool arguments. There
   are no public asset/session/endpoint shortcuts for replay or feedback.
 - Persisted record tags and provenance `history` fields retain their names.
-  Manual `contract`/`history_contract` fields are removed: old pickle labels and
-  self-describing Serde fields are ignored, never used in matching. New writes omit
-  them. See [API/schema migration and unchanged fixtures](agent-assets.md#persistence-and-contract-removal).
+  Manual `contract`/`history_contract` fields and `custom_grouping` mode are removed:
+  old pickle metadata and self-describing Serde fields are ignored, never used in
+  matching. New writes omit them. See [API/schema migration and unchanged fixtures](agent-assets.md#persistence-and-contract-removal).
 - Dependency-DAG scheduling and push updates remain future work
   ([issue #1](https://github.com/kaeluka/lockstep-loop/issues/1)). Updated child
   histories do not automatically revise completed parents.

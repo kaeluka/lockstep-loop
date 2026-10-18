@@ -218,7 +218,6 @@ def test_final_only_replay_and_explicit_compatibility_and_unsupported_modes():
     for kwargs in (
         {"prompt": "changed prompt"},
         {"tool_specs": []},
-        {"group_by": str.strip},
         {"budget": Budget(1)},
         {"subagent": SubagentTool("s", "", {}, lambda _: "", lambda _: [])},
     ):

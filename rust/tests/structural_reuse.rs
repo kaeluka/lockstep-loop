@@ -120,12 +120,15 @@ fn provider_and_custom_grouping_policy_are_caller_owned_not_inferred() {
         .map(|e| e.outputs[0].tool_output.as_str())
         .collect();
     assert_eq!(evidence, ["same ", "SAME"]);
-    // Only default/custom mode is checked; callers select isolated caches/snapshots
-    // when their provider or lossy grouping policy requires different reasoning.
-    assert!(matches!(
-        BatchLoop::new(config().with_agent(old.into_agent().unwrap())),
-        Err(LoopError::IncompatibleHistory)
-    ));
+    // Mode and function identity are not checked. Today's function compares raw
+    // outputs to historical representatives; provider policy remains external.
+    let (exact, count) = drive(
+        BatchLoop::new(config().with_agent(old.agent().unwrap().clone())).unwrap(),
+        |_| "same ".into(),
+        || panic!("recorded provider answer must be reused"),
+    );
+    assert_eq!(count, 0);
+    assert_eq!(exact.results, old.results);
 }
 
 #[derive(Deserialize)]
@@ -145,6 +148,8 @@ fn imported_legacy_labels_do_not_poison_structural_child_cache_matching() {
                 for (name, value) in fields {
                     if name == "contract" || name == "history_contract" {
                         *value = json!("unrelated legacy label");
+                    } else if name == "custom_grouping" {
+                        *value = json!(false);
                     } else {
                         relabel(value);
                     }
@@ -181,7 +186,7 @@ fn imported_legacy_labels_do_not_poison_structural_child_cache_matching() {
         1,
     )
     .with_subagents(vec![]);
-    for parent in ["parent one", "changed parent"] {
+    for (parent, custom) in [("parent one", true), ("changed parent", false)] {
         let seen = queries.clone();
         let candidate = selected.clone();
         let config = LoopConfig::new(parent.to_owned(), vec!["new".into()], vec![])
@@ -191,7 +196,12 @@ fn imported_legacy_labels_do_not_poison_structural_child_cache_matching() {
                 seen.lock().unwrap().push(q.clone());
                 Ok((*q == candidate.query()).then(|| candidate.clone()))
             });
-        let mut loop_ = BatchLoop::with_group_by(config, |s: &String| s.trim().to_owned()).unwrap();
+        let mut loop_ = if custom {
+            BatchLoop::with_group_by(config, |s: &String| s.trim().to_owned())
+        } else {
+            BatchLoop::new(config)
+        }
+        .unwrap();
         let r = loop_.next_request(RequestKind::Any).unwrap();
         loop_
             .complete(Completion::Llm(LlmCompletion {
@@ -219,6 +229,229 @@ fn imported_legacy_labels_do_not_poison_structural_child_cache_matching() {
     }
     let queries = queries.lock().unwrap();
     assert_eq!(queries[0], queries[1]);
+}
+
+#[test]
+fn default_and_custom_identity_reuse_each_other() {
+    for initial_custom in [false, true] {
+        let c = config().with_recording();
+        let initial = if initial_custom {
+            BatchLoop::with_group_by(c, Clone::clone)
+        } else {
+            BatchLoop::new(c)
+        }
+        .unwrap();
+        let (old, _) = drive(initial, |_| "same".into(), answer);
+        let agent = old.agent().unwrap();
+        let before = agent.root();
+        let c = config().with_agent(agent.clone());
+        let replay = if initial_custom {
+            BatchLoop::new(c)
+        } else {
+            BatchLoop::with_group_by(c, Clone::clone)
+        }
+        .unwrap();
+        let (replay, count) = drive(replay, |_| "same".into(), answer);
+        assert_eq!(count, 0);
+        assert_eq!(replay.results, old.results);
+        assert_eq!(agent.root(), before);
+        assert_eq!(before.observations[0].evidence.len(), 1);
+        assert_eq!(
+            replay.agent().unwrap().root().observations[0]
+                .evidence
+                .len(),
+            2
+        );
+        assert!(
+            serde_json::to_value(agent.descriptor.query())
+                .unwrap()
+                .get("custom_grouping")
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn stricter_keys_match_representatives_not_old_evidence() {
+    let (old, _) = drive(
+        BatchLoop::with_group_by(config().with_recording(), |v: &String| v.trim().to_owned())
+            .unwrap(),
+        |_| "same ".into(),
+        answer,
+    );
+    let (grouped, count) = drive(
+        BatchLoop::with_group_by(
+            config().with_agent(old.agent().unwrap().clone()),
+            |v: &String| v.trim().to_owned(),
+        )
+        .unwrap(),
+        |_| "same".into(),
+        answer,
+    );
+    assert_eq!(count, 0);
+    let agent = grouped.agent().unwrap();
+    let before = agent.root();
+    for custom in [false, true] {
+        let c = config().with_agent(agent.clone());
+        let strict = if custom {
+            BatchLoop::with_group_by(c, Clone::clone)
+        } else {
+            BatchLoop::new(c)
+        }
+        .unwrap();
+        // "same" occurs in old evidence, but not in its representative "same ".
+        let (changed, count) = drive(strict, |_| "same".into(), || "strict".into());
+        assert_eq!(count, 1);
+        assert_eq!(changed.results["e"], "strict");
+        assert_eq!(changed.agent().unwrap().root().observations.len(), 2);
+        assert_eq!(
+            changed.agent().unwrap().root().observations[1].representative[0].tool_output,
+            "same"
+        );
+        assert_eq!(agent.root(), before);
+    }
+    assert_eq!(old.agent().unwrap().root().observations.len(), 1);
+    assert_eq!(
+        before.observations[0]
+            .evidence
+            .iter()
+            .map(|e| e.outputs[0].tool_output.as_str())
+            .collect::<Vec<_>>(),
+        ["same ", "same"]
+    );
+    assert_eq!(
+        agent.assets().next().unwrap().messages()[2].content,
+        "same "
+    );
+}
+
+#[test]
+fn coarser_keys_choose_first_existing_edge_without_merging_history() {
+    let (first, _) = drive(
+        BatchLoop::new(config().with_recording()).unwrap(),
+        |_| "A".into(),
+        || "first".into(),
+    );
+    let (old, count) = drive(
+        BatchLoop::new(config().with_agent(first.agent().unwrap().clone())).unwrap(),
+        |_| "a".into(),
+        || "second".into(),
+    );
+    assert_eq!(count, 1);
+    let agent = old.agent().unwrap();
+    let before = agent.root();
+    let (replay, count) = drive(
+        BatchLoop::with_group_by(config().with_agent(agent.clone()), |v: &String| {
+            v.trim().to_lowercase()
+        })
+        .unwrap(),
+        |_| "a ".into(),
+        answer,
+    );
+    assert_eq!(count, 0);
+    assert_eq!(replay.results["e"], "first");
+    let root = replay.agent().unwrap().root();
+    assert_eq!(root.observations.len(), 2);
+    assert_eq!(root.observations[1], before.observations[1]);
+    assert_eq!(
+        root.observations[0]
+            .evidence
+            .iter()
+            .map(|e| e.outputs[0].tool_output.as_str())
+            .collect::<Vec<_>>(),
+        ["A", "a "]
+    );
+    assert_eq!(root.observations[0].representative[0].tool_output, "A");
+    assert_eq!(
+        replay.agent().unwrap().assets().next().unwrap().messages()[2].content,
+        "A"
+    );
+    assert_eq!(agent.root(), before);
+    assert_eq!(first.agent().unwrap().root().observations.len(), 1);
+    let (exact, count) = drive(
+        BatchLoop::new(config().with_agent(replay.into_agent().unwrap())).unwrap(),
+        |_| "a".into(),
+        answer,
+    );
+    assert_eq!(count, 0);
+    assert_eq!(exact.results["e"], "second");
+}
+
+#[test]
+fn child_query_and_execution_ignore_default_custom_mode() {
+    let tool = SubagentTool::new(
+        ToolSpec::new("child", "", json!({})),
+        |_| "child prompt".to_owned(),
+        |_| vec![specs()[0].clone()],
+        1,
+    )
+    .with_subagents(vec![]);
+    let mut selected: Option<AgentDescriptor<String>> = None;
+    let store = RecordStore::new("child-mode");
+    let queries = Arc::new(Mutex::new(vec![]));
+    for custom in [false, true, false] {
+        let candidate = selected.clone();
+        let seen = queries.clone();
+        let c = LoopConfig::new("parent".to_owned(), vec!["e".into()], vec![])
+            .with_subagent(tool.clone())
+            .with_record_store(store.clone())
+            .with_agent_resolver(move |q| {
+                seen.lock().unwrap().push(q.clone());
+                Ok(candidate.as_ref().filter(|d| d.query() == *q).cloned())
+            });
+        let mut loop_ = if custom {
+            BatchLoop::with_group_by(c, Clone::clone)
+        } else {
+            BatchLoop::new(c)
+        }
+        .unwrap();
+        let r = loop_.next_request(RequestKind::Any).unwrap();
+        loop_
+            .complete(Completion::Llm(LlmCompletion {
+                request_id: r.request_id().into(),
+                content: "delegate".into(),
+                tool_calls: vec![ToolCall::new("c", "child", json!({}))],
+            }))
+            .unwrap();
+        let mut child_llms = 0;
+        while !loop_.is_done() {
+            let reply = match loop_.next_request(RequestKind::Any).unwrap() {
+                Request::Llm(r) => {
+                    if r.messages[0].content == "parent" {
+                        Completion::Llm(LlmCompletion::final_answer(
+                            r.request_id,
+                            r.messages.last().unwrap().content.clone(),
+                        ))
+                    } else {
+                        child_llms += 1;
+                        let calls = if r.messages.len() == 1 {
+                            vec![ToolCall::new("r", "read", json!({}))]
+                        } else {
+                            vec![]
+                        };
+                        Completion::Llm(LlmCompletion {
+                            request_id: r.request_id,
+                            content: "child answer".into(),
+                            tool_calls: calls,
+                        })
+                    }
+                }
+                Request::Tool(r) => Completion::Tool(ToolCompletion {
+                    request_id: r.request_id,
+                    results: vec![("e".into(), "same".into())],
+                }),
+            };
+            loop_.complete(reply).unwrap();
+        }
+        assert_eq!(child_llms, if selected.is_none() { 2 } else { 0 });
+        let result = loop_.result().unwrap();
+        let update = &result.child_agents()[0];
+        assert_eq!(update.base, selected);
+        selected = Some(update.agent().descriptor.clone());
+    }
+    let queries = queries.lock().unwrap();
+    assert_eq!(queries[0], queries[1]);
+    assert_eq!(queries[1], queries[2]);
 }
 
 #[test]

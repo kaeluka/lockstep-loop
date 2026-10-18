@@ -380,10 +380,11 @@ fn structural_checks_final_only_replay_and_unsupported_budget() {
         BatchLoop::new(changed),
         Err(LoopError::IncompatibleHistory)
     ));
-    assert!(matches!(
-        BatchLoop::with_group_by(config(&["new"], Some(history)), Clone::clone),
-        Err(LoopError::IncompatibleHistory)
-    ));
+    assert!(
+        BatchLoop::with_group_by(config(&["new"], Some(history)), Clone::clone)
+            .unwrap()
+            .is_done()
+    );
     assert!(matches!(
         BatchLoop::new(
             config(&["new"], None)

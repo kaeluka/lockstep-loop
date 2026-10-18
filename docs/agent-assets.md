@@ -112,6 +112,7 @@ Legacy constructors, fields and methods remain usable where listed.
 | Rust `with_recording(label)` | `with_recording()` | Fresh-root opt-in, no version. |
 | Rust `with_agent(agent, label)` / `with_replay(agent, label)` | `with_agent(agent)` / `with_replay(agent)` | Supplying an Agent implies replay and recording. |
 | Descriptor/query/options `contract`, `Agent.contract` / `contract()` | Removed | Query identity is structural; no replacement namespace. |
+| Descriptor/query `custom_grouping` | Removed | No mode or function identity gate. Current `group_by` compares fresh outputs and historical representatives. |
 
 `Agent.prompt` / `prompt()` exposes the descriptor prompt. `SubagentContract` retains
 its class name for compatibility but contains only spec, depth and nested allowlist.
@@ -133,17 +134,18 @@ example filenames remain valid structural names.
 
 Legacy record class aliases and provenance **`history`** fields remain. However,
 manual **`contract`** fields in descriptors/queries and **`history_contract`** in
-nested subagent configurations are removed from the API and new writes. Python
+nested subagent configurations are removed from the API and new writes. The obsolete
+**`custom_grouping`** mode in descriptors/queries is also removed. Python
 pickle restoration discards these old fields; self-describing Rust Serde formats
 such as JSON ignore them as unknown fields. Different historical labels cannot
-poison otherwise matching structural cache entries. Do not retain those labels
-in a caller cache's matching key when importing old data.
+poison otherwise matching structural cache entries. Do not retain those labels or
+mode flags in a caller cache's matching key when importing old data.
 
 The unchanged **2c6d901** pickle/JSON fixtures still load, inspect and replay,
 including child histories, feedback and full evidence. Re-encoding intentionally
 omits the deprecated labels, so this is not byte/schema identity with old output.
 Positional/binary Serde formats and custom codecs may need caller migration; older
-readers that require contract fields are not promised to read new writes. Earlier
+readers that require contract or grouping-mode fields are not promised to read new writes. Earlier
 singular `subagent` schemas still require explicit migration. There is no general
 cross-language or cross-version wire guarantee.
 
@@ -152,12 +154,20 @@ legacy record classes/structs. Do not rename provenance keys merely because the
 API uses `.agent_descriptor`. Persist descriptors and shallow records, not live
 Agent/resolver objects or Asset views. No second model or core I/O is added.
 
-Compatibility checks cover prompt equality, ordered tool specs, default/custom
-grouping mode and nested subagent specs/allowlists/depth. Actual child prompts and
+Compatibility checks cover prompt equality, ordered tool specs and nested subagent
+specs/allowlists/depth. Actual child prompts and
 specs are checked on entry. Tools are re-executed: changed implementations with
 unchanged observations reuse; changed observations branch. External provider,
 adapter and custom grouping policies remain caller-owned, including cache isolation
 and snapshot selection. No manual version or namespace replaces the removed key.
+
+Default grouping is identity; default/custom mode and callback identity are not
+cache identity. Replay applies the current function to **both** fresh outputs and
+recorded representatives. Stricter keys can miss despite matching an old evidence
+item; coarser keys may match several edges, selecting the first in stored order.
+The chosen historical representative remains conversation context; exact new
+outputs are appended as evidence. Historical branches and old roots are preserved,
+not merged or retroactively regrouped. See [matching details](history-reference.md#compatibility-and-ownership).
 
 ## End-to-end examples
 

@@ -263,7 +263,6 @@ fn asset_enumeration_is_lazy_read_only_and_does_not_clone_payloads() {
         descriptor: AgentDescriptor {
             prompt: NonClone("prompt"),
             tools: vec![],
-            custom_grouping: false,
             root,
             subagents: vec![],
         },
@@ -334,6 +333,7 @@ fn pre_rename_fixture_loads_inspects_replays_and_omits_legacy_labels() {
             Value::Object(fields) => {
                 fields.remove("contract");
                 fields.remove("history_contract");
+                fields.remove("custom_grouping");
                 fields.values_mut().for_each(strip_labels);
             }
             Value::Array(values) => values.iter_mut().for_each(strip_labels),
@@ -502,7 +502,6 @@ fn deep_asset_paths_are_iterative_and_inspection_never_writes_records() {
         descriptor: AgentDescriptor {
             prompt: "inspect".into(),
             tools: vec![spec()],
-            custom_grouping: false,
             root,
             subagents: vec![],
         },

@@ -38,10 +38,15 @@ The documentation preserves these boundaries:
 | Naming aliases and legacy contract imports preserve full evidence | [Pickle fixture](../python/tests/fixtures/README.md), [Serde fixture](../rust/tests/fixtures/README.md), both asset suites |
 | No keys needed; implementation changes reuse or branch; external policy is caller-owned | [Python structural reuse](../python/tests/test_structural_reuse.py), [Rust structural reuse](../rust/tests/structural_reuse.rs), specialist suites |
 
-## Checks for contract removal
+Both structural-reuse suites additionally verify default/custom identity reuse in
+both directions, stricter-key misses against representatives rather than old evidence,
+coarser-key first-existing-edge selection, preserved representative context and fresh
+evidence, unchanged old roots, mode-independent child lookup, and legacy mode imports.
 
-- Python: **100 tests**, strict mypy on the core, Ruff lint.
-- Rust: **65 integration tests**, Clippy with warnings denied, formatting checks.
+## Checks for contract and grouping-mode removal
+
+- Python: **106 tests**, strict mypy on the core, Ruff lint.
+- Rust: **69 integration tests**, Clippy with warnings denied, formatting checks.
 - All **ten provider-free examples**: `product_screening`, `agent_assets`,
   `history_replay`, `feedback`, and `specialized_subagents` in both languages.
 - The new product examples assert **3 LLM calls for 3 initial products in 2
@@ -53,8 +58,8 @@ The documentation preserves these boundaries:
   previews are kept in sync. No public upload or shared-canvas mutation is needed.
 
 The file-inspection demos remain protocol examples, not the library's only
-application. Contract removal changes the source API and omits old labels from
-new wire output. Unchanged legacy fixtures still load and replay; see
+application. Contract and grouping-mode removal changes the source API and omits
+old labels/modes from new wire output. Unchanged legacy fixtures still load and replay; see
 [API/schema compatibility and limitations](agent-assets.md#persistence-and-contract-removal).
 Transactional preparation, full opaque records, immutable snapshots, feedback,
 asset views, request routing, arbitrary completion order and structural cost guards

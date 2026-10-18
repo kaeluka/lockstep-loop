@@ -77,8 +77,11 @@ Opt into fresh-root recording with Python `recording=True` or Rust
 `with_recording()`; supplying an `Agent` implies replay and recording. Persist
 Agent descriptors and full records with your own codecs and storage. No manual
 version key is needed: pure tools are rerun, so implementation changes either
-preserve observations (reuse) or change them (branch). External provider/grouping
-policy and cache isolation remain caller responsibilities. This is observation-based reuse, not
+preserve observations (reuse) or change them (branch). The current grouping function
+compares fresh outputs and recorded representatives; default/custom mode and
+function identity are not cache keys. Coarser keys select the first matching stored
+edge without merging history. External provider/grouping policy and cache isolation
+remain caller responsibilities. This is observation-based reuse, not
 semantic similarity search, model training, or a guarantee of exhaustive research.
 
 ## Go deeper

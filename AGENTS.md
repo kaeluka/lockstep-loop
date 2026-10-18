@@ -60,8 +60,13 @@ The existing final partition trie alone is insufficient for replay.
 - Expose the immutable records/root needed to save and restore history.
 - Design references/loading so history can be traversed lazily, loading only a new
   environment's relevant path, without making the caller implement replay logic.
-- Check prompt equality, ordered tool specs, default/custom grouping mode and nested
-  subagent specs/allowlists/depth; check actual child prompts/specs on entry.
+- Check prompt equality, ordered tool specs and nested subagent specs/allowlists/depth;
+  check actual child prompts/specs on entry. Do not key compatibility or child queries
+  on default/custom grouping mode or function identity. The default is identity.
+- Apply the current grouping function to BOTH fresh raw outputs and historical
+  representatives. Stricter keys may miss even if the raw output occurs in old evidence;
+  coarser keys select the first matching existing edge in stored order. Preserve
+  historical representative context, exact new evidence and all old roots/edges.
 - Do not add manual agent contract/version/namespace keys. Pure tools are re-executed:
   implementation changes with equal observations reuse; different observations branch.
   Independent child queries use child structural configuration, never parent identity.
@@ -70,8 +75,9 @@ The existing final partition trie alone is insufficient for replay.
 - Fresh root recording is opt-in (`recording=True` / `with_recording()`); supplying
   an Agent implies replay plus recording. A recorded parent or resolver records children;
   an optional child recording switch enables standalone recording, never cache identity.
-- Retain legacy record class aliases. Ignore deprecated persisted contract labels as
-  metadata, never matching keys; document source/wire migration and codec limitations.
+- Retain legacy record class aliases. Ignore deprecated persisted contract labels
+  and `custom_grouping` metadata, never matching keys; document source/wire migration
+  and codec limitations.
 - Distinguish completed-history reuse from crash recovery of in-flight execution;
   do not claim the latter unless its protocol is implemented and tested.
 
@@ -98,6 +104,8 @@ Preserve existing request/completion behavior and tests. Add tests demonstrating
 - changed observations branch at the first divergence, including previously
   non-splitting turns;
 - old snapshots remain unchanged and both old and new paths remain reusable;
+- default/custom identity replay works in both directions, including child lookup;
+  stricter keys branch and coarser keys choose the first existing match deterministically;
 - full evidence survives replay, including custom grouping and opaque payloads;
 - parallel/multi-tool completions work in arbitrary order;
 - invalid completions leave pending work recoverable;

@@ -55,12 +55,11 @@ pub struct SubagentContract {
 
 /// AgentQuery: child structural configuration, without parent/invocation/environment IDs.
 /// External provider/grouping policy isolation is caller-owned. The legacy struct
-/// name is retained; self-describing Serde ignores old contract labels.
+/// name is retained; self-describing Serde ignores old contract/grouping metadata.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HistoryQuery<P> {
     pub prompt: P,
     pub tools: Vec<ToolSpec>,
-    pub custom_grouping: bool,
     pub subagents: Vec<SubagentContract>,
 }
 
@@ -100,12 +99,11 @@ impl<P> fmt::Debug for HistoryResolver<P> {
 }
 
 /// AgentDescriptor: small persistence envelope; publish AFTER its referenced records.
-/// Legacy struct name retained; self-describing Serde ignores old contract labels.
+/// Legacy struct name retained; self-describing Serde ignores old contract/grouping metadata.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HistoryDescriptor<P> {
     pub prompt: P,
     pub tools: Vec<ToolSpec>,
-    pub custom_grouping: bool,
     pub root: NodeRef,
     pub subagents: Vec<SubagentContract>,
 }
@@ -327,7 +325,6 @@ impl<P: Clone> HistoryDescriptor<P> {
         AgentQuery {
             prompt: self.prompt.clone(),
             tools: self.tools.clone(),
-            custom_grouping: self.custom_grouping,
             subagents: self.subagents.clone(),
         }
     }

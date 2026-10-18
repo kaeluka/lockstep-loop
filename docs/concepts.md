@@ -77,7 +77,7 @@ Consider a dataset-intake agent that has already checked schemas, column
 statistics, and units. Next month's release is a **new environment**, not
 necessarily a new investigation from scratch.
 
-Reuse the agent under the same prompt and compatible tool/grouping configuration.
+Reuse the agent under the same prompt and compatible tool/nested configuration.
 Rerun its recorded tools, follow matching observations, and reuse assistant turns.
 A fully matching completed path needs **zero new LLM requests**. At the first
 unseen observation—for example a different unit definition—ask for new reasoning.
@@ -90,7 +90,10 @@ and records using its own storage. Changed prompts or tool specs require compati
 history selection or a fresh investigation. Pure tool implementation changes need
 no version bump: tools rerun, matching outputs reuse, different outputs branch.
 External provider and custom grouping policy isolation remains caller-owned;
-this is not fuzzy caching.
+this is not fuzzy caching. Current grouping compares fresh outputs and historical
+representatives, regardless of the function used to record them. Stricter keys can
+branch; coarser keys choose the first matching stored continuation without merging
+history. Full new evidence and the original representative context are preserved.
 
 The cache validates only what was observed. If units matter but no tool checked
 them, replay cannot discover that omission. That is where evaluation and feedback

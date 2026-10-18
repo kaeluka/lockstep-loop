@@ -368,7 +368,6 @@ def test_resolver_compatibility_failures_and_argument_errors_are_transactional()
         replace(descriptor, prompt="other prompt"),
         replace(descriptor, subagents=(old.history.descriptor.subagents[0],)),
         replace(descriptor, tools=()),
-        replace(descriptor, custom_grouping=True),
     ):
         loop = make(resolver=lambda _, bad=bad: bad, store=loader(backend))
         request = loop.next_request()
@@ -482,7 +481,7 @@ def test_registration_rules_legacy_advertisements_and_serial_driver():
     )
     assert result.results == {"e": "imports:done|metrics:done"}
     assert len(result.child_histories) == 2 and result.history is None
-    assert all(not u.history.descriptor.custom_grouping for u in result.child_histories)
+    assert all(not hasattr(u.history.descriptor, "custom_grouping") for u in result.child_histories)
     with pytest.raises(ValueError, match="duplicate tool implementation"):
         run_to_completion(
             prompt="parent-driver",

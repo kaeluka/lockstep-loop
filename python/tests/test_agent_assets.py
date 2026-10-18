@@ -232,7 +232,7 @@ def test_pre_rename_pickle_fixture_loads_replays_and_preserves_wire_names():
         return {arg for op, arg, _ in pickletools.genops(data) if op.name.endswith("UNICODE")}
 
     assert wire_strings(encoded) - wire_strings(reencoded) == {
-        "contract", "history_contract", "fixture/v1", "child/v1"
+        "contract", "history_contract", "custom_grouping", "fixture/v1", "child/v1"
     }
     assert isinstance(wire["descriptor"], AgentDescriptor)
     assert isinstance(wire["query"], AgentQuery)
@@ -291,7 +291,7 @@ def test_deep_asset_inspection_is_iterative_and_read_only():
                 observations=(Observation(outputs, (EnvObservation("A", outputs),), root),),
             )
         )
-    agent = Agent(AgentDescriptor("inspect", (READ,), False, root), store)
+    agent = Agent(AgentDescriptor("inspect", (READ,), root), store)
     before = len(store.records())
     asset = next(agent.assets())
     assert len(asset.observations) == 1500

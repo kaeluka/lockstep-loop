@@ -607,12 +607,10 @@ class BatchLoop(Generic[P]):
             if history is not None and (
                 history.descriptor.prompt != prompt
                 or history.descriptor.tools != self._specs
-                or history.descriptor.custom_grouping != (group_by is not None)
                 or history.descriptor.subagents != sub_contracts
             ):
                 raise ValueError(
-                    "incompatible history prompt, tools, grouping "
-                    "or subagent configuration"
+                    "incompatible history prompt, tools or subagent configuration"
                 )
             if history is None:
                 store = record_store if record_store is not None else RecordStore[P]()
@@ -620,7 +618,6 @@ class BatchLoop(Generic[P]):
                     AgentDescriptor(
                         prompt,
                         self._specs,
-                        group_by is not None,
                         store.put(HistoryNode()),
                         sub_contracts,
                     ),
@@ -631,7 +628,6 @@ class BatchLoop(Generic[P]):
         self._record_store = history.store if history else record_store
         if self._record_store is None and independent:
             self._record_store = RecordStore()
-        self._custom_grouping = group_by is not None
         self._recorded = history
         self._feedback = feedback
         self._resolve_only = feedback is not None or _resolve_only
@@ -1175,7 +1171,7 @@ class BatchLoop(Generic[P]):
         if previous is None and self._history_resolver is not None:
             assert self._record_store is not None
             selected = self._history_resolver(
-                AgentQuery(prompt, child_specs, self._custom_grouping, child_contracts)
+                AgentQuery(prompt, child_specs, child_contracts)
             )
             if selected is not None:
                 if not isinstance(selected, AgentDescriptor):
@@ -1189,7 +1185,7 @@ class BatchLoop(Generic[P]):
             tool_specs=child_specs,
             subagents=nested,
             history_resolver=self._history_resolver,
-            group_by=self._group_by if self._custom_grouping else None,
+            group_by=self._group_by,
             budget=self._budget,
             recording=recording,
             history=previous,
@@ -1399,6 +1395,8 @@ class BatchLoop(Generic[P]):
         for key, envs in groups.items():
             match = None
             if node is not None:
+                # Apply today's function to both sides; first existing match wins
+                # if a coarser function now equates multiple historical edges.
                 for index, edge in enumerate(node.observations):
                     if key == tuple(self._group_by(o.tool_output) for o in edge.representative):
                         match = index
