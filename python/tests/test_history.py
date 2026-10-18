@@ -27,7 +27,6 @@ def make_loop(envs=("old",), history=None, **kwargs):
         prompt="inspect",
         env_ids=envs,
         tool_specs=SPECS,
-        recording=True,
         history=history,
         **kwargs,
     )
@@ -214,7 +213,7 @@ def test_validation_is_transactional_including_partial_turn_and_grouping_errors(
     assert loop.done
 
 
-def test_final_only_replay_and_explicit_compatibility_and_unsupported_modes():
+def test_final_only_replay_and_structural_compatibility():
     loop = make_loop()
     request = loop.next_request()
     loop.complete(LlmCompletion(request.request_id, "done"))
@@ -223,10 +222,11 @@ def test_final_only_replay_and_explicit_compatibility_and_unsupported_modes():
     assert replay.done
     assert replay.next_request() is None
     assert replay.result().results == {"new": "done"}
+    bounded = make_loop(("new",), history, budget=Budget(1))
+    assert bounded.done and bounded.result().results == {"new": "done"}
     for kwargs in (
         {"prompt": "changed prompt"},
         {"tool_specs": []},
-        {"budget": Budget(1)},
         {"subagent": SubagentTool("s", "", {}, lambda _: "", lambda _: [])},
     ):
         options = dict(

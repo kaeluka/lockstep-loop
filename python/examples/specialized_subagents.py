@@ -59,7 +59,6 @@ def investigate(parent_prompt, env, cache, backend):
         env_ids=[env],
         tool_specs=[],
         subagents=[IMPORTS],
-        recording=True,
         record_store=store,
         agent_resolver=resolve,
     )

@@ -14,9 +14,8 @@ metadata are ignored on import and omitted on new writes. See the migration note
 
 ## Immutable recorded history and incremental replay
 
-Both implementations offer **opt-in recording on `BatchLoop`**: Python
-`recording=True`, Rust `LoopConfig::with_recording()` (no argument). Supplying an
-`Agent` implies replay plus recording. Keep an
+Both implementations **always record an immutable Agent**, on `BatchLoop` and
+convenience drivers, including children. Supplying a prior `Agent` enables replay. Keep an
 `Agent` snapshot, then start a new loop with that snapshot and new environment
 IDs. The core reuses recorded assistant turns, emits their tool requests again,
 and follows the matching **ordered tuple of observations**. Only an unseen
@@ -134,11 +133,8 @@ callers, an exactly matching `ToolSpec` is accepted as a redundant advertisement
 of a reserved subagent, not as another executor. Serial drivers register **all**
 subagent entries and reject actual callable/subagent name collisions even when
 specs match. Subagent specs are automatically advertised, so callers need not
-repeat them. A recorded parent or resolver enables child recording. Without either,
-Python `SubagentTool(recording=True, ...)` or Rust `SubagentTool::with_recording()`
-optionally enables standalone child recording. This is only a switch, never a
-lookup key or structural compatibility field. A resolver does not enable recording
-of a fresh root. A tool definition is not the persisted child agent itself.
+repeat them. Every parent and child records an immutable Agent, independently of
+whether a resolver is supplied. A tool definition is not the persisted child agent itself.
 
 Each definition may declare its own child `subagents` allowlist. Empty means leaf;
 None preserves legacy **self** recursion, never all parent siblings. At each spawn,
@@ -351,9 +347,9 @@ roots into the returned immutable snapshot and can allocate path-copy records;
 it does not have Python's reentrant callback/undo-journal protocol.
 
 Python's structural cost tests forbid traversing/copying sibling and historical
-conversation containers during single pulls/completions (with and without
-recording), without relying on timing thresholds. The split/finalize workload can
-also be measured from `python/` (100/400/1000 environments, no recording):
+conversation containers during single pulls/completions, without relying on timing
+thresholds. The split/finalize workload can also be measured from `python/`
+(100/400/1000 environments):
 
 ```sh
 PYTHONPATH=src python benchmarks/split_completion.py --repeats 3
@@ -376,11 +372,17 @@ call factories again after a failure. Callbacks must not mutate borrowed payload
 
 ### Other limits
 
-Recording/replay still explicitly rejects **budgets**: a synthetic exhaustion
-answer must not silently become reusable reasoning. Non-recording budgets work
-as before. Root agent recording/replay is enabled on direct `BatchLoop`. Serial
-convenience drivers also expose child-agent updates when the child recording switch
-is enabled; resolver-driven serving uses the direct loop.
+**Budgets** limit assistant steps per branch, counting both fresh and replayed
+turns. Tools for an accepted turn finish before the next step is checked. On
+exhaustion, the run returns its fallback but records no synthetic assistant reply:
+the Agent retains the real checkpoint (open on a fresh path). A later run with a
+larger or no budget re-executes tools and resumes there. A smaller replay budget
+stops before accepting the next stored turn; existing history is never truncated.
+Children have the same per-branch limit; their fallbacks are real parent tool
+outputs, not child assistant messages. Strict feedback resolution that runs out
+of budget fails without appending feedback or publishing a partial result.
+Convenience drivers expose root and child Agents; replay and resolver-driven
+serving use the direct loop.
 Partial tool collections and request queues are builders, not persisted state;
 replay restarts tools, including child tools. This is **not crash recovery**.
 Validation errors (wrong kind, duplicate call IDs, invalid environment result
@@ -412,7 +414,7 @@ See the [Python API/example](../python/README.md#recording-and-replay) and
 
 - Python methods are internally synchronized. Rust methods use `&mut self`;
   callers choose synchronization for cross-thread serving.
-- Rust non-recording budgets require a caller-supplied exhaustion function because
+- Rust budgets require a caller-supplied exhaustion function because
   an opaque payload cannot safely be fabricated from a string sentinel.
 - `BatchLoop` is the mutable execution machinery, not the agent snapshot.
   `result.tree`/`SplitNode` and `EnvClass` describe a per-run partition, not assets

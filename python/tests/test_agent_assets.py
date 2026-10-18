@@ -33,7 +33,7 @@ READ = ToolSpec("read", "read-only", {})
 
 def record():
     loop = BatchLoop(
-        prompt="inspect", env_ids=["A", "B", "D"], tool_specs=[READ], recording=True
+        prompt="inspect", env_ids=["A", "B", "D"], tool_specs=[READ]
     )
     empty = loop.agent
     initial = next(empty.assets())
@@ -146,7 +146,6 @@ def test_asset_views_keep_lossy_evidence_and_real_null_values():
         prompt=b"inspect",
         env_ids=["A", "B"],
         tool_specs=[READ],
-        recording=True,
         comparison_key=bytes.strip,
     )
     r = loop.next_request()
@@ -308,7 +307,6 @@ def test_child_agent_aliases_preserve_lookup_provenance_and_persistence():
         env_ids=["A"],
         tool_specs=[],
         subagents=[tool],
-        recording=True,
         agent_resolver=lambda _: None,
     )
     r = loop.next_request()

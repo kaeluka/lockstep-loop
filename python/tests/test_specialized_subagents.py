@@ -63,7 +63,6 @@ def make(
     store=None,
     history=None,
     registered=None,
-    recording=True,
     **options,
 ):
     return BatchLoop(
@@ -71,7 +70,6 @@ def make(
         env_ids=envs,
         tool_specs=(STATUS,),
         subagents=definitions() if registered is None else registered,
-        recording=recording,
         history=history,
         history_resolver=resolver,
         record_store=store,
@@ -451,9 +449,8 @@ def test_registration_rules_legacy_advertisements_and_serial_driver():
         )
     with pytest.raises(ValueError, match="duplicate tool"):
         BatchLoop(prompt="p", env_ids=["e"], tool_specs=[READ, READ])
-    assert make(registered=(imports,), resolver=lambda _: None).agent is not None
-    with pytest.raises(ValueError, match="budget"):
-        make(resolver=lambda _: None, budget=Budget(100))
+    assert make(registered=(imports,), resolver=lambda _: None).agent.root.assistant is None
+    assert make(resolver=lambda _: None, budget=Budget(100)).agent.root.assistant is None
     legacy = BatchLoop(
         prompt="parent",
         env_ids=["e"],
@@ -474,13 +471,12 @@ def test_registration_rules_legacy_advertisements_and_serial_driver():
     result = run_to_completion(
         prompt="parent-driver",
         env_ids=["e"],
-        tools=lambda _: [
-            replace(imports, recording=True), replace(metrics, recording=True), Local()
-        ],
+        tools=lambda _: [imports, metrics, Local()],
         complete_llm=lambda r: model(r, calls()[:2]),
     )
     assert result.results == {"e": "imports:done|metrics:done"}
-    assert len(result.child_histories) == 2 and result.history is None
+    assert len(result.child_histories) == 2
+    assert len(result.agent.root.subagents) == 2
     assert all(not hasattr(u.history.descriptor, "custom_grouping") for u in result.child_histories)
     with pytest.raises(ValueError, match="duplicate tool implementation"):
         run_to_completion(
@@ -635,7 +631,6 @@ def test_opaque_prompts_and_hash_collisions_are_verified_by_value():
         {},
         lambda a: Blob(a["value"]),
         lambda _: (),
-        recording=True,
         subagents=(),
     )
 

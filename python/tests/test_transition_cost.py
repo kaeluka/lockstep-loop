@@ -51,16 +51,14 @@ def unguard(values):
     return list(list.__iter__(values))
 
 
-@pytest.mark.parametrize("recording", [False, True])
 def test_one_leaf_completion_and_queue_pull_do_not_walk_siblings_or_past_conversations(
-    recording, monkeypatch
+    monkeypatch
 ):
     n = 1000
     loop = BatchLoop(
         prompt="p",
         env_ids=[str(i) for i in range(n)],
         tool_specs=[],
-        recording=recording,
     )
     root = loop.next_request()
     loop.complete(LlmCompletion(root.request_id, "", (ToolCall("x", "read", {}),)))
@@ -128,15 +126,13 @@ def test_one_leaf_completion_and_queue_pull_do_not_walk_siblings_or_past_convers
     assert len(loop.result().results) == n
 
 
-@pytest.mark.parametrize("recording", [False, True])
-def test_child_completion_and_pull_do_not_copy_unrelated_children(monkeypatch, recording):
+def test_child_completion_and_pull_do_not_copy_unrelated_children(monkeypatch):
     sub = SubagentTool("child", "", {}, lambda a: a["prompt"], lambda _: [])
     loop = BatchLoop(
         prompt="parent",
         env_ids=["e"],
         tool_specs=[],
         subagent=sub,
-        recording=recording,
     )
     root = loop.next_request()
     loop.complete(
@@ -206,7 +202,6 @@ def test_callback_history_reads_never_publish_a_root_that_later_rolls_back():
             env_ids=[env],
             tool_specs=specs,
             subagent=sub,
-            recording=True,
             history=history,
         )
 
@@ -253,7 +248,7 @@ def test_callback_cannot_reenter_serving_and_issue_uncommitted_requests():
 
     sub = SubagentTool("child", "", {}, build, lambda _: [])
     current = BatchLoop(
-        prompt="p", env_ids=["e"], tool_specs=[], subagent=sub, recording=True
+        prompt="p", env_ids=["e"], tool_specs=[], subagent=sub
     )
     root = current.next_request()
     before = current.history
@@ -283,7 +278,6 @@ def test_rollback_restores_child_serving_order_without_cloning_siblings():
             env_ids=["a", "b"],
             tool_specs=specs,
             subagent=sub,
-            recording=True,
             history=history,
         )
 

@@ -94,12 +94,11 @@ Legacy constructors, fields and methods remain usable where listed.
 | `HistoryDescriptor` | `AgentDescriptor` | Persistence envelope (prompt/configuration/root reference), not an executor; exact type alias. |
 | `HistoryQuery` | `AgentQuery` | Lookup compatibility header; exact type alias. |
 | `HistoryResolver` | `AgentResolver` | Caller-owned agent revision selection; alias, not another loading interface. |
-| Rust `HistoryOptions` | `AgentOptions` | Configuration alias; no corresponding Python wrapper is needed. |
 | `SubagentHistory` | `SubagentRecord` | Parent-call provenance slot, not a complete agent by itself. |
 | `ChildHistoryRun` | `ChildAgentRun` | One invocation's selected base and resulting descriptor. |
 | `ChildHistoryUpdate` | `ChildAgentUpdate` | A completed invocation update carrying the complete child agent. |
 | Python `BatchLoop(history=...)` | `BatchLoop(agent=...)` | Old keyword retained; supplying both non-None spellings is rejected. |
-| Python loop `history_contract=` / `agent_contract=` | `recording=True` for fresh roots; `agent=snapshot` for replay | Version arguments removed; the boolean only enables recording. |
+| Python loop `history_contract=` / `agent_contract=` | Removed; use `agent=snapshot` for replay | Every loop records an Agent; identity is structural. |
 | Python `history_resolver=` | `agent_resolver=` | Same callback and lookup policy; both non-None spellings are rejected. |
 | Rust `with_replay(...)` | `with_agent(...)` | Same replay-based initialization; both set the same configuration field. |
 | Rust `with_history_resolver(...)` | `with_agent_resolver(...)` | Same setter semantics. |
@@ -108,15 +107,14 @@ Legacy constructors, fields and methods remain usable where listed.
 | `result.child_histories` | Python `result.child_agents`; Rust `child_agents()` | Same completed invocation updates. |
 | `update.history` | Python `update.agent`; Rust `agent()` / `into_agent()` | Same complete child agent. |
 | `entry.history`, `run.history` | Python `.agent_descriptor`; Rust `agent_descriptor()` | These are descriptors; attach the store with `agent.child(entry)`. |
-| Child `history_contract`, `with_history_contract`, `with_agent_contract`, and contract getters | Removed | A parent recording or resolver suffices. Optional Python `recording=True` / Rust `with_recording()` enables standalone child recording, not a key. |
-| Rust `with_recording(label)` | `with_recording()` | Fresh-root opt-in, no version. |
+| Child `history_contract`, `with_history_contract`, `with_agent_contract`, and contract getters | Removed | Every child records an Agent; identity is structural. |
 | Rust `with_agent(agent, label)` / `with_replay(agent, label)` | `with_agent(agent)` / `with_replay(agent)` | Supplying an Agent implies replay and recording. |
-| Descriptor/query/options `contract`, `Agent.contract` / `contract()` | Removed | Query identity is structural; no replacement namespace. |
+| Descriptor/query `contract`, `Agent.contract` / `contract()` | Removed | Query identity is structural; no replacement namespace. |
 | Descriptor/query `custom_grouping` | Removed | No mode or function identity gate. Current `comparison_key` compares fresh outputs and historical representatives. |
 
 `Agent.prompt` / `prompt()` exposes the descriptor prompt. `SubagentContract` retains
 its class name for compatibility but contains only spec, depth and nested allowlist.
-Recording switches are not part of query/descriptor identity. Rust's `Assets` is
+Every loop exposes its current Agent and every result contains an Agent. Rust's `Assets` is
 only the lazy iterator type, not another persisted or runtime model.
 
 Rust's public `LoopConfig.history`/`history_resolver` fields remain compatibility

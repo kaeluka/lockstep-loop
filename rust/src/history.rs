@@ -362,14 +362,6 @@ impl<P: Clone> Agent<P> {
     }
 }
 
-/// AgentOptions: recording/replay configuration, not a second agent snapshot model.
-#[derive(Clone, Debug)]
-pub struct HistoryOptions<P> {
-    pub previous: Option<Agent<P>>,
-    pub store: Option<RecordStore<P>>,
-    pub(crate) prompt_eq: Option<fn(&P, &P) -> bool>,
-}
-
 impl<P> SubagentHistory<P> {
     pub fn agent_descriptor(&self) -> &AgentDescriptor<P> {
         &self.history
@@ -569,7 +561,6 @@ pub use Agent as History;
 pub use ChildHistoryRun as ChildAgentRun;
 pub use ChildHistoryUpdate as ChildAgentUpdate;
 pub use HistoryDescriptor as AgentDescriptor;
-pub use HistoryOptions as AgentOptions;
 pub use HistoryQuery as AgentQuery;
 pub use HistoryResolver as AgentResolver;
 pub use SubagentHistory as SubagentRecord;

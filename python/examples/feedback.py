@@ -27,7 +27,6 @@ def investigate(envs, agent=None, feedback=None):
         prompt=PROMPT,
         env_ids=envs,
         tool_specs=SPECS,
-        recording=True,
         agent=agent,
         feedback=feedback,
     )

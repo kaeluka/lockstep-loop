@@ -60,13 +60,10 @@ fn config(
     sub: SubagentTool<String>,
     history: Option<History<String>>,
     env: &str,
-    recording: bool,
 ) -> LoopConfig<String> {
     let config = LoopConfig::new("parent".into(), vec![env.into()], specs()).with_subagent(sub);
     if let Some(history) = history {
         config.with_replay(history)
-    } else if recording {
-        config.with_recording()
     } else {
         config
     }
@@ -146,42 +143,37 @@ fn persisted(history: &History<String>) -> History<String> {
 
 #[test]
 fn children_are_prepared_once_and_corrected_completions_replay_consistently() {
-    for recording in [false, true] {
-        let fault = Arc::new(AtomicBool::new(false));
-        let calls = Arc::new(Mutex::new(vec![]));
-        let sub = subagent(&fault, &calls, Mismatch::Prompt, 1);
-        let mut loop_ = BatchLoop::new(config(sub.clone(), None, "old", recording)).unwrap();
-        let request = llm(&mut loop_);
-        let before = loop_.history();
-        let duplicate = ToolCall::new("same", "investigate", json!({"required": "bad"}));
-        assert!(matches!(
-            loop_.complete(Completion::Llm(LlmCompletion {
-                request_id: request.request_id.clone(),
-                content: "rejected".into(),
-                tool_calls: vec![duplicate.clone(), duplicate],
-            })),
-            Err(LoopError::DuplicateToolCallId(_))
-        ));
-        assert!(calls.lock().unwrap().is_empty());
-        assert_eq!(loop_.history(), before);
-        assert_eq!(loop_.outstanding_llm(), 1);
-        loop_.complete(mixed(&request.request_id)).unwrap();
-        let expected_calls = vec!["specs", "prompt:good", "specs", "prompt:bad"];
-        assert_eq!(*calls.lock().unwrap(), expected_calls);
-        let expected = "local|answer:good|answer:bad";
-        assert_eq!(finish(&mut loop_, false)["old"], expected);
-        assert_eq!(*calls.lock().unwrap(), expected_calls); // no factory rerun after commit
-        if recording {
-            let history = loop_.history().unwrap();
-            assert_eq!(
-                history.root().assistant.as_ref().unwrap().content,
-                "delegate"
-            );
-            let mut replay =
-                BatchLoop::new(config(sub, Some(persisted(&history)), "new", true)).unwrap();
-            assert_eq!(finish(&mut replay, true)["new"], expected);
-        }
-    }
+    let fault = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(Mutex::new(vec![]));
+    let sub = subagent(&fault, &calls, Mismatch::Prompt, 1);
+    let mut loop_ = BatchLoop::new(config(sub.clone(), None, "old")).unwrap();
+    let request = llm(&mut loop_);
+    let before = loop_.history();
+    let duplicate = ToolCall::new("same", "investigate", json!({"required": "bad"}));
+    assert!(matches!(
+        loop_.complete(Completion::Llm(LlmCompletion {
+            request_id: request.request_id.clone(),
+            content: "rejected".into(),
+            tool_calls: vec![duplicate.clone(), duplicate],
+        })),
+        Err(LoopError::DuplicateToolCallId(_))
+    ));
+    assert!(calls.lock().unwrap().is_empty());
+    assert_eq!(loop_.history(), before);
+    assert_eq!(loop_.outstanding_llm(), 1);
+    loop_.complete(mixed(&request.request_id)).unwrap();
+    let expected_calls = vec!["specs", "prompt:good", "specs", "prompt:bad"];
+    assert_eq!(*calls.lock().unwrap(), expected_calls);
+    let expected = "local|answer:good|answer:bad";
+    assert_eq!(finish(&mut loop_, false)["old"], expected);
+    assert_eq!(*calls.lock().unwrap(), expected_calls); // no factory rerun after commit
+    let history = loop_.history();
+    assert_eq!(
+        history.root().assistant.as_ref().unwrap().content,
+        "delegate"
+    );
+    let mut replay = BatchLoop::new(config(sub, Some(persisted(&history)), "new")).unwrap();
+    assert_eq!(finish(&mut replay, true)["new"], expected);
 }
 
 #[test]
@@ -191,7 +183,7 @@ fn incompatible_nested_history_is_rejected_without_panic_at_construction_or_afte
             let fault = Arc::new(AtomicBool::new(false));
             let calls = Arc::new(Mutex::new(vec![]));
             let sub = subagent(&fault, &calls, mismatch, 1);
-            let mut original = BatchLoop::new(config(sub.clone(), None, "old", true)).unwrap();
+            let mut original = BatchLoop::new(config(sub.clone(), None, "old")).unwrap();
             if delayed {
                 let request = llm(&mut original);
                 original
@@ -214,7 +206,7 @@ fn incompatible_nested_history_is_rejected_without_panic_at_construction_or_afte
             let request = llm(&mut original);
             original.complete(mixed(&request.request_id)).unwrap();
             let expected = finish(&mut original, false)["old"].clone();
-            let history = original.history().unwrap();
+            let history = original.history();
             let old_turn = if delayed {
                 history.load(&history.root().observations[0].continuation)
             } else {
@@ -223,8 +215,7 @@ fn incompatible_nested_history_is_rejected_without_panic_at_construction_or_afte
             fault.store(true, Ordering::Relaxed);
             if delayed {
                 let mut replay =
-                    BatchLoop::new(config(sub.clone(), Some(history.clone()), "new", true))
-                        .unwrap();
+                    BatchLoop::new(config(sub.clone(), Some(history.clone()), "new")).unwrap();
                 let Request::Tool(tool) = replay.next_request(RequestKind::Tool).unwrap() else {
                     panic!()
                 };
@@ -245,7 +236,7 @@ fn incompatible_nested_history_is_rejected_without_panic_at_construction_or_afte
                     replay.complete(completion),
                     Err(LoopError::IncompatibleHistory)
                 );
-                let rejected = replay.history().unwrap();
+                let rejected = replay.history();
                 let turn = rejected.load(&rejected.root().observations[0].continuation);
                 // A prior ordinary observation was accepted, but the incompatible
                 // assistant turn has NOT been fulfilled/visited for the new env.
@@ -253,7 +244,7 @@ fn incompatible_nested_history_is_rejected_without_panic_at_construction_or_afte
                 assert_eq!(turn.as_ref(), old_turn.as_ref());
             } else {
                 assert!(matches!(
-                    BatchLoop::new(config(sub.clone(), Some(history.clone()), "new", true)),
+                    BatchLoop::new(config(sub.clone(), Some(history.clone()), "new")),
                     Err(LoopError::IncompatibleHistory)
                 ));
             }
@@ -261,7 +252,7 @@ fn incompatible_nested_history_is_rejected_without_panic_at_construction_or_afte
             assert_eq!(history.root().env_ids, ["old"]);
             fault.store(false, Ordering::Relaxed);
             let mut retry =
-                BatchLoop::new(config(sub, Some(persisted(&history)), "again", true)).unwrap();
+                BatchLoop::new(config(sub, Some(persisted(&history)), "again")).unwrap();
             assert_eq!(finish(&mut retry, true)["again"], expected);
         }
     }
@@ -272,7 +263,7 @@ fn late_incompatibility_in_a_grandchild_cancels_root_routes_coherently() {
     let fault = Arc::new(AtomicBool::new(false));
     let calls = Arc::new(Mutex::new(vec![]));
     let sub = subagent(&fault, &calls, Mismatch::Prompt, 2);
-    let mut original = BatchLoop::new(config(sub.clone(), None, "old", true)).unwrap();
+    let mut original = BatchLoop::new(config(sub.clone(), None, "old")).unwrap();
     let request = llm(&mut original);
     original
         .complete(Completion::Llm(LlmCompletion {
@@ -314,9 +305,9 @@ fn late_incompatibility_in_a_grandchild_cancels_root_routes_coherently() {
         }))
         .unwrap();
     finish(&mut original, false);
-    let history = original.history().unwrap();
+    let history = original.history();
     fault.store(true, Ordering::Relaxed);
-    let mut replay = BatchLoop::new(config(sub, Some(history.clone()), "new", true)).unwrap();
+    let mut replay = BatchLoop::new(config(sub, Some(history.clone()), "new")).unwrap();
     let Request::Tool(child_tool) = replay.next_request(RequestKind::Tool).unwrap() else {
         panic!()
     };

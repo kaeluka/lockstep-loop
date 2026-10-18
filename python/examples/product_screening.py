@@ -67,7 +67,6 @@ def screen(
         prompt=PROMPT,
         env_ids=tuple(evidence),
         tool_specs=(RATINGS,),
-        recording=True,
         agent=agent,
     )
     llm_calls = tool_executions = 0
@@ -96,7 +95,6 @@ def main() -> None:
     )
     assert (llms, reads, len(initial.classes)) == (3, 3, 2)
     old = initial.agent
-    assert old is not None
     print(f"Initial: {llms} LLM calls, {reads} tool executions, {len(initial.classes)} classes")
 
     matching, llms, reads = screen({"product-d/v1": outdoor}, old)
@@ -107,7 +105,6 @@ def main() -> None:
     changed, llms, reads = screen({"product-a/v2": ratings("IP65", 0, 50)}, matching.agent)
     assert (llms, reads) == (1, 1)
     assert changed.results["product-a/v2"] == "does not meet toy requirements"
-    assert changed.agent is not None
     assert len(list(old.assets())) == 2 and len(list(changed.agent.assets())) == 3
     print(f"Revised specifications: {llms} LLM call, {reads} tool execution")
     for asset in changed.agent.assets():

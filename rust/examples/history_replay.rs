@@ -23,9 +23,7 @@ fn investigate(
     );
     let config = match previous {
         Some(agent) => config.with_agent(agent),
-        None => config
-            .with_recording()
-            .with_record_store(RecordStore::new("writer-1")),
+        None => config.with_record_store(RecordStore::new("writer-1")),
     };
     let mut loop_ = BatchLoop::new(config)?;
     let mut llm_calls = 0;
@@ -65,7 +63,7 @@ fn investigate(
     }
     let result = loop_.result()?;
     let answer = result.results[env].clone();
-    Ok((result.into_agent().unwrap(), llm_calls, answer))
+    Ok((result.into_agent(), llm_calls, answer))
 }
 
 type Backend = BTreeMap<NodeRef, Vec<u8>>;

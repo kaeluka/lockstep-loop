@@ -28,7 +28,6 @@ def nested_loop(envs, history=None, depth=2):
         prompt="main",
         env_ids=envs,
         tool_specs=SPECS,
-        recording=True,
         history=history,
         subagent=SubagentTool(
             "investigate", "", {}, lambda args: args["question"], lambda _: SPECS, depth
@@ -226,7 +225,6 @@ def simple_loop(envs, history=None, store=None):
         prompt="inspect",
         env_ids=envs,
         tool_specs=SPECS[:1],
-        recording=True,
         history=history,
         record_store=store,
     )
@@ -377,7 +375,7 @@ def test_storage_addresses_are_not_content_hashes_and_writer_reuse_is_rejected()
         invalid_writer.load(second)
 
 
-def test_non_recording_legacy_labels_and_collisions_are_preserved():
+def test_partition_labels_and_collisions_are_preserved():
     class SameRepr:
         def __init__(self, value):
             self.value = value
@@ -399,4 +397,7 @@ def test_non_recording_legacy_labels_and_collisions_are_preserved():
         result, _ = sequential(loop, outputs, 1)
         assert set(result.tree.children) == expected
         assert len({c.id for c in result.classes}) == 2
-        assert result.history is None
+        assert len(result.agent.root.observations) == 2
+        assert [e.representative[0].tool_output for e in result.agent.root.observations] == list(
+            outputs.values()
+        )

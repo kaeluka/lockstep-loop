@@ -55,7 +55,6 @@ fn investigate(
     let selected = cache.clone();
     let config = LoopConfig::new(parent_prompt.into(), vec![env.into()], vec![])
         .with_subagents(vec![imports()])
-        .with_recording()
         .with_record_store(store)
         .with_agent_resolver(move |query| {
             // Fixed configuration in this example; core still checks full compatibility.
@@ -176,7 +175,7 @@ fn main() {
     assert_eq!(update.base.as_ref(), Some(&selected));
     assert_ne!(update.agent().descriptor.root, selected.root);
     assert_eq!(original.root().env_ids, ["repo@commit-1"]);
-    let parent_root = second.agent().unwrap().root();
+    let parent_root = second.agent().root();
     let provenance = parent_root.subagents[0].runs.last().unwrap();
     assert_eq!(provenance.base.as_ref(), Some(&selected));
     assert_eq!(provenance.agent_descriptor(), &update.agent().descriptor);

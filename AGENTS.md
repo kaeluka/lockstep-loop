@@ -72,9 +72,10 @@ The existing final partition trie alone is insufficient for replay.
   Independent child queries use child structural configuration, never parent identity.
 - Provider/adapter and custom grouping semantics are external policy, not inferred.
   The caller owns cache isolation and compatible snapshot selection for policy changes.
-- Fresh root recording is opt-in (`recording=True` / `with_recording()`); supplying
-  an Agent implies replay plus recording. A recorded parent or resolver records children;
-  an optional child recording switch enables standalone recording, never cache identity.
+- Every loop and convenience driver records an immutable Agent, including children.
+  Supplying a prior Agent enables replay. Budgets limit accepted assistant turns,
+  including reused turns; exhaustion returns a run fallback, never a fabricated
+  assistant record. Preserve the real checkpoint so later replay can resume.
 - Retain legacy record class aliases. Ignore deprecated persisted contract labels
   and `custom_grouping` metadata, never matching keys; document source/wire migration
   and codec limitations.

@@ -29,9 +29,7 @@ fn config(
     );
     let mut config = match previous {
         Some(agent) => config.with_agent(agent),
-        None => config
-            .with_recording()
-            .with_record_store(RecordStore::new("initial-writer")),
+        None => config.with_record_store(RecordStore::new("initial-writer")),
     };
     if let Some(content) = feedback {
         config = config.with_feedback(content.into());
@@ -131,8 +129,7 @@ fn restore(descriptor: &[u8], backend: Backend, fresh_writer: &str) -> Agent<Str
 fn main() {
     let old = investigate(&["A", "B", "D"], None, None)
         .result
-        .into_agent()
-        .unwrap();
+        .into_agent();
     let revised = investigate(&["A"], Some(old.clone()), Some(NOTE));
     assert_eq!(revised.llms.len(), 2); // both AFTER resolving the old answer
     let messages = &revised.llms[0].messages;
@@ -146,7 +143,7 @@ fn main() {
     );
     let mut backend = Backend::new();
     let old_descriptor = persist(&old, &mut backend);
-    let descriptor = persist(revised.result.agent().unwrap(), &mut backend);
+    let descriptor = persist(revised.result.agent(), &mut backend);
     let inherited = investigate(
         &["A", "B", "C", "D"],
         Some(restore(&descriptor, backend.clone(), "inherited-writer")),
@@ -170,7 +167,7 @@ fn main() {
             .filter(|r| r.tool_call.name == "foo")
             .all(|r| r.env_ids == ["A", "B", "C"])
     );
-    let descriptor = persist(inherited.result.agent().unwrap(), &mut backend);
+    let descriptor = persist(inherited.result.agent(), &mut backend);
     let repeated = investigate(
         &["B"],
         Some(restore(&descriptor, backend.clone(), "repeated-writer")),
@@ -208,7 +205,7 @@ fn main() {
     assert!(failed.is_done());
     assert_eq!(failed.error(), Some(&LoopError::FeedbackResolutionMiss));
     assert_eq!(failed.outstanding_count(), 0);
-    assert_eq!(failed.agent().unwrap(), old);
+    assert_eq!(failed.agent(), old);
     println!(
         "shared feedback: A/B/C inherit; D unchanged; old snapshot reusable; replay miss explicit"
     );

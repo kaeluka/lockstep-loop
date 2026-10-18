@@ -9,8 +9,8 @@ environments, sharing LLM work while observation paths remain equivalent:
    environment still in the class (SIMD-style fan-out).
 3. Tool results are compared and the class is refined: one sub-conversation
    per distinct result.  Branches then continue independently.
-4. The process repeats per branch until the loop finishes. With recording,
-   the immutable Agent includes prompt, structural configuration, and accumulated
+4. The process repeats per branch until the loop finishes. The immutable Agent
+   includes prompt, structural configuration, and accumulated
    conversation trie; its Asset views expose leaf investigations and their complete paths.
    EnvClass and SplitNode remain partition-only summaries, not assets or agents.
 
@@ -239,8 +239,6 @@ class SubagentTool(Generic[P]):
     """Spec provider for the child loop's tools (one env id -> all specs)."""
     max_depth: int = 1
     """Total spawn depth below this call site; nested definitions are clamped to the remainder."""
-    recording: bool = False
-    """Record children even without a recorded parent or resolver; not a cache key."""
     subagents: tuple[SubagentTool[P], ...] | None = None
     """Child allowlist. None preserves bounded self-recursion; () makes this a leaf."""
 
@@ -286,7 +284,9 @@ class Budget:
 
     Budget is shared while branches share a conversation and becomes
     per-branch after a split, so a pathological environment cannot burn
-    its siblings' budget.
+    its siblings' budget. Replayed assistant turns count too. Exhaustion returns
+    a run fallback without adding an assistant message; the real checkpoint can
+    be resumed by replay with a larger or no budget.
     """
 
     max_steps_per_branch: int | None = None
@@ -329,13 +329,13 @@ class BatchResult(Generic[P]):
     """Final partition of environments by full tool-call trace."""
 
     results: Mapping[str, P]
-    """Final assistant message per environment (identical within a class)."""
+    """Final answer or budget fallback per environment (identical within a class)."""
 
-    history: Agent[P] | None = None
+    history: Agent[P]
     child_histories: tuple[ChildAgentUpdate[P], ...] = ()
 
     @property
-    def agent(self) -> Agent[P] | None:
+    def agent(self) -> Agent[P]:
         """Updated immutable agent snapshot; history is the compatibility field."""
         return self.history
 
@@ -403,7 +403,7 @@ class _Transition(Generic[P]):
     def __init__(self) -> None:
         self.undo: list[Callable[[], None]] = []
         self.loops: list[BatchLoop[P]] = []
-        self.roots: dict[int, Agent[P] | None] = {}
+        self.roots: dict[int, Agent[P]] = {}
         self.branches: set[int] = set()
         self.removed_children: dict[int, BatchLoop[P]] = {}
 
@@ -534,10 +534,8 @@ class BatchLoop(Generic[P]):
     payloads: replay uses the historical representative and recording retains all
     raw per-environment evidence. Callable identity is never compared.
 
-    Recording: fresh roots opt in with ``recording=True``; supplying an ``Agent``
-    implies replay and recording. A recorded parent or resolver records children;
-    otherwise a child definition's ``recording=True`` is an optional switch, not
-    part of cache identity. External provider/grouping policy is caller-owned.
+    Every loop records an immutable ``Agent``, including children. Supplying a
+    prior ``Agent`` enables replay. External provider/grouping policy is caller-owned.
 
     Invariants:
         * No token is generated twice for environments that remain in the
@@ -556,7 +554,6 @@ class BatchLoop(Generic[P]):
         history_resolver: AgentResolver[P] | None = None,
         comparison_key: Callable[[P], Hashable] | None = None,
         budget: Budget | None = None,
-        recording: bool = False,
         history: Agent[P] | None = None,
         record_store: RecordStore[P] | None = None,
         agent: Agent[P] | None = None,
@@ -592,9 +589,6 @@ class BatchLoop(Generic[P]):
         self._specs, self._subagents, sub_contracts = _registration(tool_specs, definitions)
         self._history_resolver = history_resolver
         self._unavailable_subagents = _unavailable_subagents - self._subagents.keys()
-        independent = history_resolver is not None or any(s.recording for s in definitions)
-        if independent and budget is not None:
-            raise ValueError("recorded child histories do not support budgets")
         if feedback is not None and not isinstance(feedback, Feedback):
             raise TypeError("feedback must be Feedback(content), or None for no intervention")
         if feedback is not None and (history is None or len(envs) != 1):
@@ -603,33 +597,20 @@ class BatchLoop(Generic[P]):
             # Old pickles bypass __init__: do not let the new empty-tuple class
             # default silently erase their former singular registration.
             raise ValueError("migrate legacy history descriptor from subagent to subagents")
-        if recording or history is not None:
-            if budget is not None:
-                raise ValueError("recorded history does not yet support budgets")
-            if history is not None and (
-                history.descriptor.prompt != prompt
-                or history.descriptor.tools != self._specs
-                or history.descriptor.subagents != sub_contracts
-            ):
-                raise ValueError(
-                    "incompatible history prompt, tools or subagent configuration"
-                )
-            if history is None:
-                store = record_store if record_store is not None else RecordStore[P]()
-                history = Agent(
-                    AgentDescriptor(
-                        prompt,
-                        self._specs,
-                        store.put(HistoryNode()),
-                        sub_contracts,
-                    ),
-                    store,
-                )
-            elif record_store is not None and record_store is not history.store:
-                raise ValueError("replay uses the snapshot's record store")
-        self._record_store = history.store if history else record_store
-        if self._record_store is None and independent:
-            self._record_store = RecordStore()
+        if history is not None and (
+            history.descriptor.prompt != prompt
+            or history.descriptor.tools != self._specs
+            or history.descriptor.subagents != sub_contracts
+        ):
+            raise ValueError("incompatible history prompt, tools or subagent configuration")
+        if history is None:
+            store = record_store if record_store is not None else RecordStore[P]()
+            history = Agent(
+                AgentDescriptor(prompt, self._specs, store.put(HistoryNode()), sub_contracts),
+                store,
+            )
+        elif record_store is not None and record_store is not history.store:
+            raise ValueError("replay uses the snapshot's record store")
         self._recorded = history
         self._feedback = feedback
         self._resolve_only = feedback is not None or _resolve_only
@@ -664,9 +645,7 @@ class BatchLoop(Generic[P]):
             parent_id=None,
             group_key=None,
             env_ids=envs,
-            messages=[
-                Message(role="user", content=history.descriptor.prompt if history else prompt)
-            ],
+            messages=[Message(role="user", content=history.descriptor.prompt)],
             split_depth=0,
         )
         self._branches[root.branch_id] = root
@@ -918,7 +897,7 @@ class BatchLoop(Generic[P]):
         self._out_llm = self._out_tool = 0
 
     @property
-    def agent(self) -> Agent[P] | None:
+    def agent(self) -> Agent[P]:
         """Capture the committed immutable agent snapshot, even during a caller callback.
 
         Child roots are linked incrementally on advancement, not by this getter.
@@ -931,7 +910,7 @@ class BatchLoop(Generic[P]):
             return self._recorded
 
     @property
-    def history(self) -> Agent[P] | None:
+    def history(self) -> Agent[P]:
         """Compatibility spelling of agent; both return the same snapshot."""
         return self.agent
 
@@ -949,12 +928,14 @@ class BatchLoop(Generic[P]):
                     "callbacks may inspect history, but must not reenter advancement"
                 )
             self._raise_if_failed()
-            if self._recorded is None or len(self._finals) != 1 or self._branches:
+            if len(self._finals) != 1 or self._branches:
                 raise ValueError("resolve a recorded single-environment run first")
             branch = self._finals[0]
             if len(branch.env_ids) != 1:
                 raise ValueError("user continuations require one resolved environment")
             node = self._recorded._node(branch.history_path)
+            if branch.messages[-1].role != "assistant" or branch.messages[-1].tool_calls:
+                raise ValueError("resolve a completed assistant answer first")
             edge = UserContinuation(
                 Message(role="user", content=content),
                 self._recorded.store.put(HistoryNode()),
@@ -967,7 +948,6 @@ class BatchLoop(Generic[P]):
             return snapshot
 
     def _set_history_node(self, path: _HistoryPath, node: HistoryNode[P]) -> None:
-        assert self._recorded is not None
         self._watch_loop()
         self._recorded = self._recorded._replace_node(path, node)
 
@@ -1054,12 +1034,9 @@ class BatchLoop(Generic[P]):
         return None
 
     def _sync_child_history(self, link: _ChildLink[P]) -> None:
-        if self._recorded is None:
-            return
         # Internal transition code uses the working child root. Public history
         # reads deliberately return the committed root while a journal is active.
         history = link.child._recorded
-        assert history is not None
         branch = self._branches[link.branch_id]
         node = self._recorded._node(branch.history_path)
         entries = list(node.subagents)
@@ -1110,19 +1087,18 @@ class BatchLoop(Generic[P]):
                 branch.turn_results = candidate
                 for update in result.child_histories:
                     self._append(self._child_histories, update)
-                if result.history is not None:
-                    self._append(
-                        self._child_histories,
-                        ChildAgentUpdate(
-                            link.child._id_prefix,
-                            branch.branch_id,
-                            branch.steps,
-                            link.call,
-                            branch.env_ids,
-                            link.base,
-                            result.history,
-                        ),
-                    )
+                self._append(
+                    self._child_histories,
+                    ChildAgentUpdate(
+                        link.child._id_prefix,
+                        branch.branch_id,
+                        branch.steps,
+                        link.call,
+                        branch.env_ids,
+                        link.base,
+                        result.history,
+                    ),
+                )
                 if self._transaction is not None:
                     self._transaction.removed_children[id(self)] = self
                 self._delete(self._children, key)
@@ -1155,23 +1131,18 @@ class BatchLoop(Generic[P]):
             tuple(s for s in sub.sub_tool_specs(branch.env_ids[0]) if s.name not in unavailable),
             nested,
         )
-        recording = (
-            sub.recording or self._recorded is not None or self._history_resolver is not None
-        )
         previous = None
         prior_runs: tuple[ChildAgentRun[P], ...] = ()
-        if self._recorded is not None:
-            node = self._recorded._node(branch.history_path)
-            entry = next((e for e in node.subagents if e.call_id == call.id), None)
-            if entry is not None:
-                previous = Agent(entry.agent_descriptor, self._recorded.store)
-                prior_runs = entry.runs or (ChildAgentRun((), None, entry.agent_descriptor),)
+        node = self._recorded._node(branch.history_path)
+        entry = next((e for e in node.subagents if e.call_id == call.id), None)
+        if entry is not None:
+            previous = Agent(entry.agent_descriptor, self._recorded.store)
+            prior_runs = entry.runs or (ChildAgentRun((), None, entry.agent_descriptor),)
         # A recorded parent pins its revision. External cache changes must not
         # reinterpret it, nor manufacture a missing feedback-resolution target.
         if self._resolve_only and previous is None:
             return FeedbackResolutionError("no recorded subagent conversation")
         if previous is None and self._history_resolver is not None:
-            assert self._record_store is not None
             selected = self._history_resolver(
                 AgentQuery(prompt, child_specs, child_contracts)
             )
@@ -1180,7 +1151,7 @@ class BatchLoop(Generic[P]):
                     raise TypeError(
                         "agent_resolver (history_resolver) must return AgentDescriptor or None"
                     )
-                previous = Agent(selected, self._record_store)
+                previous = Agent(selected, self._recorded.store)
         child: BatchLoop[P] = BatchLoop(
             prompt=prompt,
             env_ids=branch.env_ids,
@@ -1189,9 +1160,8 @@ class BatchLoop(Generic[P]):
             history_resolver=self._history_resolver,
             comparison_key=self._comparison_key,
             budget=self._budget,
-            recording=recording,
             history=previous,
-            record_store=self._record_store,
+            record_store=self._recorded.store,
             _id_prefix=f"{self._id_prefix}{child_key}",
             _resolve_only=self._resolve_only,
             _defer_failure=True,
@@ -1237,7 +1207,14 @@ class BatchLoop(Generic[P]):
     def _request_llm(self, branch: _Branch[P]) -> None:
         if self._error is not None:
             return
-        while self._recorded is not None:
+        while True:
+            max_steps = self._budget.max_steps_per_branch if self._budget else None
+            if max_steps is not None and branch.steps >= max_steps:
+                if self._resolve_only:
+                    self._fail(FeedbackResolutionError("budget exhausted while resolving feedback"))
+                else:
+                    self._finish(branch, cast(P, f"(budget exhausted after {branch.steps} steps)"))
+                return
             node = self._recorded._node(branch.history_path)
             if node.user_continuations and (
                 len(node.user_continuations) != 1
@@ -1257,13 +1234,6 @@ class BatchLoop(Generic[P]):
                 return
         if self._resolve_only:
             self._fail(FeedbackResolutionError("no recorded completed conversation at this path"))
-            return
-        max_steps = self._budget.max_steps_per_branch if self._budget else None
-        if max_steps is not None and branch.steps >= max_steps:
-            self._finish(
-                branch,
-                cast(P, f"(budget exhausted after {branch.steps} steps)"),
-            )
             return
         stats = self._stats_for(branch)
         self._append(
@@ -1318,36 +1288,34 @@ class BatchLoop(Generic[P]):
                     return False
                 prepared[call.id] = (key, child)
         self._watch_branch(branch)
-        if self._recorded is not None:
-            node = self._recorded._node(branch.history_path)
-            self._set_history_node(
-                branch.history_path,
-                replace(
-                    node,
-                    assistant=node.assistant if node.assistant is not None else message,
-                    env_ids=(*node.env_ids, *branch.env_ids),
-                ),
-            )
+        node = self._recorded._node(branch.history_path)
+        self._set_history_node(
+            branch.history_path,
+            replace(
+                node,
+                assistant=node.assistant if node.assistant is not None else message,
+                env_ids=(*node.env_ids, *branch.env_ids),
+            ),
+        )
         branch.steps += 1
         branch.messages.append(message)
         if not message.tool_calls:
-            if self._recorded is not None:
-                node = self._recorded._node(branch.history_path)
-                if not node.user_continuations and self._feedback is not None:
-                    edge = UserContinuation(
-                        Message(role="user", content=self._feedback.content),
-                        self._recorded.store.put(HistoryNode()),
-                        resolved_env_id=branch.env_ids[0],
-                    )
-                    node = replace(node, user_continuations=(edge,))
-                    self._set_history_node(branch.history_path, node)
-                    self._feedback = None  # once per explicit operation, never by answer equality
-                    self._resolve_only = False
-                    self._resolution_base = None
-                if node.user_continuations:
-                    branch.messages.append(node.user_continuations[0].message)
-                    branch.history_path = (*branch.history_path, ("user", 0))
-                    return True
+            node = self._recorded._node(branch.history_path)
+            if not node.user_continuations and self._feedback is not None:
+                edge = UserContinuation(
+                    Message(role="user", content=self._feedback.content),
+                    self._recorded.store.put(HistoryNode()),
+                    resolved_env_id=branch.env_ids[0],
+                )
+                node = replace(node, user_continuations=(edge,))
+                self._set_history_node(branch.history_path, node)
+                self._feedback = None  # once per explicit operation, never by answer equality
+                self._resolve_only = False
+                self._resolution_base = None
+            if node.user_continuations:
+                branch.messages.append(node.user_continuations[0].message)
+                branch.history_path = (*branch.history_path, ("user", 0))
+                return True
             self._finish(branch, message.content)
             return False
         branch.turn_calls = message.tool_calls
@@ -1390,21 +1358,20 @@ class BatchLoop(Generic[P]):
         for env in branch.env_ids:
             key = tuple(self._comparison_key(results[c.id][env]) for c in branch.turn_calls)
             groups.setdefault(key, []).append(env)
-        node = self._recorded._node(branch.history_path) if self._recorded else None
+        node = self._recorded._node(branch.history_path)
         plan: list[tuple[list[str], int | None, str]] = []
         labels: set[str] = set()
         reserved = {str(key) for key in groups} if len(groups) > 1 else set()
         for key, envs in groups.items():
             match = None
-            if node is not None:
-                # Apply today's function to both sides; first existing match wins
-                # if a coarser function now equates multiple historical edges.
-                for index, edge in enumerate(node.observations):
-                    if key == tuple(
-                        self._comparison_key(o.tool_output) for o in edge.representative
-                    ):
-                        match = index
-                        break
+            # Apply today's function to both sides; first existing match wins
+            # if a coarser function now equates multiple historical edges.
+            for index, edge in enumerate(node.observations):
+                if key == tuple(
+                    self._comparison_key(o.tool_output) for o in edge.representative
+                ):
+                    match = index
+                    break
             label = str(key) if len(groups) > 1 else ""
             if label in labels:
                 suffix = 2
@@ -1427,42 +1394,37 @@ class BatchLoop(Generic[P]):
         for envs, match, group_label in plan:
             path = branch.history_path
             messages = list(branch.messages)
-            if self._recorded is not None:
-                node = self._recorded._node(path)
-                evidence = tuple(
-                    EnvObservation(
-                        env,
-                        tuple(
-                            OutputRecord(branch.turn_results[c.id][env]) for c in branch.turn_calls
-                        ),
-                    )
-                    for env in envs
+            node = self._recorded._node(path)
+            evidence = tuple(
+                EnvObservation(
+                    env,
+                    tuple(
+                        OutputRecord(branch.turn_results[c.id][env]) for c in branch.turn_calls
+                    ),
                 )
-                edges = list(node.observations)
-                if match is None:
-                    match = len(edges)
-                    edges.append(
-                        Observation(
-                            evidence[0].outputs, evidence, self._recorded.store.put(HistoryNode())
-                        )
+                for env in envs
+            )
+            edges = list(node.observations)
+            if match is None:
+                match = len(edges)
+                edges.append(
+                    Observation(
+                        evidence[0].outputs, evidence, self._recorded.store.put(HistoryNode())
                     )
-                else:
-                    edges[match] = replace(
-                        edges[match], evidence=(*edges[match].evidence, *evidence)
-                    )
-                self._set_history_node(path, replace(node, observations=tuple(edges)))
-                # Reuse the historical representative, not today's lossy-equivalent output.
-                for call, output in zip(
-                    branch.turn_calls, edges[match].representative, strict=True
-                ):
-                    messages.append(
-                        Message(role="tool", content=output.tool_output, tool_call_id=call.id)
-                    )
-                path = (*path, ("observation", match))
+                )
             else:
-                self._append_tool_messages(
-                    messages, branch.turn_calls, branch.turn_results, envs[0]
+                edges[match] = replace(
+                    edges[match], evidence=(*edges[match].evidence, *evidence)
                 )
+            self._set_history_node(path, replace(node, observations=tuple(edges)))
+            # Reuse the historical representative, not today's lossy-equivalent output.
+            for call, output in zip(
+                branch.turn_calls, edges[match].representative, strict=True
+            ):
+                messages.append(
+                    Message(role="tool", content=output.tool_output, tool_call_id=call.id)
+                )
+            path = (*path, ("observation", match))
             if split:
                 self._watch_loop()
                 self._next_branch += 1
@@ -1490,21 +1452,6 @@ class BatchLoop(Generic[P]):
                 return
         if split:
             self._delete(self._branches, branch.branch_id)
-
-    @staticmethod
-    def _append_tool_messages(
-        messages: list[Message[P]],
-        calls: tuple[ToolCall, ...],
-        results: dict[str, dict[str, P]],
-        representative_env: str,
-    ) -> None:
-        # With default value-equality grouping every env in the class holds an
-        # equal value, so any representative is exact.  A lossy comparison_key lets
-        # unequal values share a class; the conversation then records the
-        # representative's payload.
-        for call in calls:
-            result = results[call.id][representative_env]
-            messages.append(Message(role="tool", content=result, tool_call_id=call.id))
 
     def _finalize(self) -> BatchResult[P]:
         children_of: dict[str, dict[str, SplitNode]] = {}
@@ -1546,7 +1493,7 @@ def run_batch(
     when nothing is runnable but requests are outstanding); ``gen.send(None)``
     pops another queued request without delivering a completion.  When no work
     remains, ``send`` raises ``StopIteration`` whose ``value`` is the
-    ``BatchResult``.
+    ``BatchResult``, including its immutable Agent.
     """
     loop: BatchLoop[P] = BatchLoop(
         prompt=prompt,

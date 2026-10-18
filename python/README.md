@@ -115,20 +115,19 @@ separate removal of manual contract labels and `custom_grouping` metadata.
 
 ## Recording and replay
 
-Record an agent on the direct loop API; existing constructors without these
-options retain their behavior. Legacy `history` spellings remain aliases:
+Every loop and convenience driver records an immutable Agent, including children.
+Supply a prior Agent to replay. Legacy `history` spellings remain aliases:
 
 ```python
 loop = BatchLoop(
     prompt="Assess the evidence packet.", env_ids=["packet-a/v1"], tool_specs=specs,
-    recording=True,
 )
 # Drive the ordinary requests/completions as above.
 snapshot = loop.agent             # immutable agent, including fulfilled turns
 # After completion: snapshot = loop.result().agent
 next_loop = BatchLoop(
     prompt="Assess the evidence packet.", env_ids=["packet-a/v2"], tool_specs=specs,
-    agent=snapshot,  # implies replay + recording
+    agent=snapshot,  # replay prior reasoning
 )
 ```
 
@@ -162,7 +161,7 @@ restored = Agent(decode_descriptor(published), store)
 ```
 
 `RecordStore(namespace=..., load=...)` is an in-memory append-only write set/cache,
-not a backend. `BatchLoop(record_store=store, recording=True)` uses a chosen
+not a backend. `BatchLoop(record_store=store, ...)` uses a chosen
 store for a new recording; replay uses the store attached to `Agent`. Allocate
 a globally unique namespace per persistent writer. New records use exact
 `NodeRef(namespace, index)` addresses, never hashes. Persist only local writes;
@@ -250,7 +249,6 @@ study_design = SubagentTool(
 loop = BatchLoop(
     prompt="Screen the study against our review criteria.", env_ids=["study-packet/v2"],
     tool_specs=ordinary_parent_specs, subagents=[study_design, another_specialist],
-    recording=True,
     agent_resolver=lambda query: selected.get(query.prompt),  # fixed config in this sketch
     record_store=RecordStore(load=load_node),
 )
@@ -276,10 +274,8 @@ PYTHONPATH=src python examples/specialized_subagents.py
 An agent resolver receives `AgentQuery(prompt, tools, subagents)`
 and returns a caller-selected **AgentDescriptor**, or None for a miss. Lookup is
 independent of parent prompt/identity, invocation/call IDs, and env membership.
-No child key is required. A recorded parent or resolver enables child recording;
-otherwise `SubagentTool(recording=True, ...)` optionally records standalone children.
-That switch is not part of structural identity. Fresh roots still require
-`BatchLoop(recording=True)`; supplying an `Agent` implies replay plus recording.
+No child key is required. Every parent and child records an immutable Agent;
+supplying a prior Agent enables replay.
 Child grouping is inherited. External provider/grouping policy isolation belongs
 to the caller, not a core version field.
 
@@ -402,8 +398,9 @@ that loop; use constructor feedback for strict resolution and resumption.
 annotation on one environment. Express transferable instructions (“check whether
 X”), not unqualified subject-specific assertions, or retain a separate snapshot.
 There is no automatic rewriting/classification, scope switch or environment
-binding. Budgets remain rejected for recorded execution, including both resolution
-and the new continuation. “Once” is per live operation, not crash-safe publication.
+binding. Budget exhaustion during strict resolution fails without appending
+feedback; the new continuation uses the remaining step allowance.
+“Once” is per live operation, not crash-safe publication.
 
 **Transactional callback preparation:** all child prompt/spec factories (including
 spec iterators) and child constructors run before the parent assistant turn is
@@ -422,9 +419,16 @@ unreachable append-only records are not rolled back. Explicit terminal
 failures, such as `FeedbackResolutionError`, retain their cancellation semantics.
 See the [transaction boundary](../docs/history-reference.md#transactional-child-preparation-and-callback-failures).
 
-**Limits:** root agent recording/replay requires direct `BatchLoop`; serial drivers
-can expose recorded child-agent updates. Recording still rejects budgets. No core
-storage I/O, async loader, eviction/GC, independent-root merge, or crash recovery.
+**Budgets:** fresh and replayed assistant turns count toward the per-branch limit.
+Exhaustion returns the string fallback in `results`, never a fabricated assistant
+message. The Agent retains the real checkpoint (open on a fresh path), so later
+replay with a larger or no budget can resume it. Smaller replay budgets stop before
+the next stored turn without truncating old history. Child fallbacks become actual
+parent tool observations, while the child Agent stays at its real checkpoint.
+
+**Limits:** use direct `BatchLoop` for replay and resolver-driven serving;
+convenience drivers expose root and child Agents. No core storage I/O, async
+loader, eviction/GC, independent-root merge, or crash recovery.
 Stores retain local writes and cached loads; deep path copying can have quadratic
 write volume. Pending tool collections/queues are not persisted. Valid imported
 records are trusted; no stable cross-version wire format is promised. Invalid

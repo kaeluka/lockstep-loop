@@ -16,7 +16,7 @@ fn specs() -> Vec<ToolSpec> {
         .map(|name| ToolSpec::new(*name, "", json!({})))
         .collect()
 }
-fn make_loop(recording: bool, env: &str, previous: Option<History<String>>) -> BatchLoop<String> {
+fn make_loop(env: &str, previous: Option<History<String>>) -> BatchLoop<String> {
     let config = LoopConfig::new("parent".into(), vec![env.into()], specs()).with_subagent(
         SubagentTool::new(
             specs()[0].clone(),
@@ -27,8 +27,6 @@ fn make_loop(recording: bool, env: &str, previous: Option<History<String>>) -> B
     );
     let config = if let Some(history) = previous {
         config.with_replay(history)
-    } else if recording {
-        config.with_recording()
     } else {
         config
     };
@@ -165,10 +163,10 @@ fn finish(
     assert!(loop_.next_request(RequestKind::Any).is_none());
     (llms, tools)
 }
-fn exercise(recording: bool) {
+fn exercise() {
     for opaque_id in OPAQUE_IDS {
         for reverse in [false, true] {
-            let mut loop_ = make_loop(recording, "old", None);
+            let mut loop_ = make_loop("old", None);
             let mut seen = HashSet::new();
             let parent = pull_llm(&mut loop_, &mut seen);
             loop_
@@ -211,47 +209,38 @@ fn exercise(recording: bool) {
                 Err(LoopError::UnknownRequest(_))
             ));
             assert_eq!(loop_.outstanding_count(), 0);
-            if recording {
-                let history = loop_.history().unwrap();
+            let history = loop_.history();
+            assert_eq!(
+                history.root().assistant.as_ref().unwrap().tool_calls[1].id,
+                opaque_id
+            );
+            let ids: HashSet<_> = history
+                .root()
+                .subagents
+                .iter()
+                .map(|s| s.call_id.clone())
+                .collect();
+            assert_eq!(ids, HashSet::from(["a".to_owned(), opaque_id.to_owned()]));
+            for replay_reverse in [false, true] {
+                let mut replay = make_loop("new", Some(history.clone()));
                 assert_eq!(
-                    history.root().assistant.as_ref().unwrap().tool_calls[1].id,
-                    opaque_id
+                    finish(
+                        &mut replay,
+                        &mut HashSet::new(),
+                        opaque_id,
+                        replay_reverse,
+                        true
+                    ),
+                    (0, 4)
                 );
-                let ids: HashSet<_> = history
-                    .root()
-                    .subagents
-                    .iter()
-                    .map(|s| s.call_id.clone())
-                    .collect();
-                assert_eq!(ids, HashSet::from(["a".to_owned(), opaque_id.to_owned()]));
-                for replay_reverse in [false, true] {
-                    let mut replay = make_loop(true, "new", Some(history.clone()));
-                    assert_eq!(
-                        finish(
-                            &mut replay,
-                            &mut HashSet::new(),
-                            opaque_id,
-                            replay_reverse,
-                            true
-                        ),
-                        (0, 4)
-                    );
-                    assert_eq!(replay.result().unwrap().results["new"], EXPECTED);
-                }
-                assert_eq!(history.root().env_ids, ["old"]);
-            } else {
-                assert!(loop_.history().is_none());
+                assert_eq!(replay.result().unwrap().results["new"], EXPECTED);
             }
+            assert_eq!(history.root().env_ids, ["old"]);
         }
     }
 }
 
 #[test]
-fn opaque_nested_ids_route_correctly_without_recording() {
-    exercise(false);
-}
-
-#[test]
-fn opaque_nested_ids_route_correctly_with_recording_and_replay() {
-    exercise(true);
+fn opaque_nested_ids_route_correctly_and_replay() {
+    exercise();
 }

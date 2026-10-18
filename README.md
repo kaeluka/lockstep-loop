@@ -73,8 +73,8 @@ environments, and immutable payloads. Environment IDs are caller-side routing
 metadata, not model-visible context. Snapshot live sources before using them;
 recording does not make a changing web page or database query pure.
 
-Opt into fresh-root recording with Python `recording=True` or Rust
-`with_recording()`; supplying an `Agent` implies replay and recording. Persist
+Every loop and convenience driver records an immutable `Agent`, including children.
+Supplying a prior `Agent` enables replay. Persist
 Agent descriptors and full records with your own codecs and storage. No manual
 version key is needed: pure tools are rerun, so implementation changes either
 preserve observations (reuse) or change them (branch). The current grouping function

@@ -56,13 +56,9 @@ fn answer() -> String {
 
 #[test]
 fn changed_implementation_reuses_equal_outputs_and_branches_on_different_outputs() {
-    let (original, count) = drive(
-        BatchLoop::new(config().with_recording()).unwrap(),
-        |_| "same".into(),
-        answer,
-    );
+    let (original, count) = drive(BatchLoop::new(config()).unwrap(), |_| "same".into(), answer);
     assert_eq!(count, 2);
-    let old = original.agent().unwrap().clone();
+    let old = original.agent().clone();
     let (same, count) = drive(
         BatchLoop::new(config().with_agent(old.clone())).unwrap(),
         |_| ["sa", "me"].concat(),
@@ -71,16 +67,16 @@ fn changed_implementation_reuses_equal_outputs_and_branches_on_different_outputs
     assert_eq!(count, 0);
     assert_eq!(same.results, original.results);
     let (changed, count) = drive(
-        BatchLoop::new(config().with_agent(same.into_agent().unwrap())).unwrap(),
+        BatchLoop::new(config().with_agent(same.into_agent())).unwrap(),
         |_| "different".into(),
         answer,
     );
     assert_eq!(count, 1);
-    assert_eq!(changed.agent().unwrap().root().observations.len(), 2);
+    assert_eq!(changed.agent().root().observations.len(), 2);
     assert_eq!(old.root().observations.len(), 1);
     for value in ["same", "different"] {
         let (_, count) = drive(
-            BatchLoop::new(config().with_agent(changed.agent().unwrap().clone())).unwrap(),
+            BatchLoop::new(config().with_agent(changed.agent().clone())).unwrap(),
             |_| value.into(),
             answer,
         );
@@ -97,23 +93,21 @@ fn changed_implementation_reuses_equal_outputs_and_branches_on_different_outputs
 #[test]
 fn provider_and_custom_grouping_policy_are_caller_owned_not_inferred() {
     let (old, _) = drive(
-        BatchLoop::with_comparison_key(config().with_recording(), |s: &String| s.trim().to_owned())
-            .unwrap(),
+        BatchLoop::with_comparison_key(config(), |s: &String| s.trim().to_owned()).unwrap(),
         |_| "same ".into(),
         answer,
     );
     let (replay, count) = drive(
-        BatchLoop::with_comparison_key(
-            config().with_agent(old.agent().unwrap().clone()),
-            |s: &String| s.trim().to_lowercase(),
-        )
+        BatchLoop::with_comparison_key(config().with_agent(old.agent().clone()), |s: &String| {
+            s.trim().to_lowercase()
+        })
         .unwrap(),
         |_| "SAME".into(),
         || panic!("external provider change does not invalidate recorded turns"),
     );
     assert_eq!(count, 0);
     assert_eq!(replay.results, old.results);
-    let root = replay.agent().unwrap().root();
+    let root = replay.agent().root();
     let evidence: Vec<_> = root.observations[0]
         .evidence
         .iter()
@@ -123,7 +117,7 @@ fn provider_and_custom_grouping_policy_are_caller_owned_not_inferred() {
     // Mode and function identity are not checked. Today's function compares raw
     // outputs to historical representatives; provider policy remains external.
     let (exact, count) = drive(
-        BatchLoop::new(config().with_agent(old.agent().unwrap().clone())).unwrap(),
+        BatchLoop::new(config().with_agent(old.agent().clone())).unwrap(),
         |_| "same ".into(),
         || panic!("recorded provider answer must be reused"),
     );
@@ -221,7 +215,7 @@ fn imported_legacy_labels_do_not_poison_structural_child_cache_matching() {
                 "done".into(),
             )))
             .unwrap();
-        assert!(loop_.agent().is_none()); // resolver does not record the root
+        assert_eq!(loop_.agent().root().subagents.len(), 1);
         assert_eq!(
             loop_.result().unwrap().child_agents()[0].base.as_ref(),
             Some(&selected)
@@ -234,7 +228,7 @@ fn imported_legacy_labels_do_not_poison_structural_child_cache_matching() {
 #[test]
 fn default_and_custom_identity_reuse_each_other() {
     for initial_custom in [false, true] {
-        let c = config().with_recording();
+        let c = config();
         let initial = if initial_custom {
             BatchLoop::with_comparison_key(c, Clone::clone)
         } else {
@@ -242,7 +236,7 @@ fn default_and_custom_identity_reuse_each_other() {
         }
         .unwrap();
         let (old, _) = drive(initial, |_| "same".into(), answer);
-        let agent = old.agent().unwrap();
+        let agent = old.agent();
         let before = agent.root();
         let c = config().with_agent(agent.clone());
         let replay = if initial_custom {
@@ -256,12 +250,7 @@ fn default_and_custom_identity_reuse_each_other() {
         assert_eq!(replay.results, old.results);
         assert_eq!(agent.root(), before);
         assert_eq!(before.observations[0].evidence.len(), 1);
-        assert_eq!(
-            replay.agent().unwrap().root().observations[0]
-                .evidence
-                .len(),
-            2
-        );
+        assert_eq!(replay.agent().root().observations[0].evidence.len(), 2);
         assert!(
             serde_json::to_value(agent.descriptor.query())
                 .unwrap()
@@ -274,22 +263,20 @@ fn default_and_custom_identity_reuse_each_other() {
 #[test]
 fn stricter_keys_match_representatives_not_old_evidence() {
     let (old, _) = drive(
-        BatchLoop::with_comparison_key(config().with_recording(), |v: &String| v.trim().to_owned())
-            .unwrap(),
+        BatchLoop::with_comparison_key(config(), |v: &String| v.trim().to_owned()).unwrap(),
         |_| "same ".into(),
         answer,
     );
     let (grouped, count) = drive(
-        BatchLoop::with_comparison_key(
-            config().with_agent(old.agent().unwrap().clone()),
-            |v: &String| v.trim().to_owned(),
-        )
+        BatchLoop::with_comparison_key(config().with_agent(old.agent().clone()), |v: &String| {
+            v.trim().to_owned()
+        })
         .unwrap(),
         |_| "same".into(),
         answer,
     );
     assert_eq!(count, 0);
-    let agent = grouped.agent().unwrap();
+    let agent = grouped.agent();
     let before = agent.root();
     for custom in [false, true] {
         let c = config().with_agent(agent.clone());
@@ -303,14 +290,14 @@ fn stricter_keys_match_representatives_not_old_evidence() {
         let (changed, count) = drive(strict, |_| "same".into(), || "strict".into());
         assert_eq!(count, 1);
         assert_eq!(changed.results["e"], "strict");
-        assert_eq!(changed.agent().unwrap().root().observations.len(), 2);
+        assert_eq!(changed.agent().root().observations.len(), 2);
         assert_eq!(
-            changed.agent().unwrap().root().observations[1].representative[0].tool_output,
+            changed.agent().root().observations[1].representative[0].tool_output,
             "same"
         );
         assert_eq!(agent.root(), before);
     }
-    assert_eq!(old.agent().unwrap().root().observations.len(), 1);
+    assert_eq!(old.agent().root().observations.len(), 1);
     assert_eq!(
         before.observations[0]
             .evidence
@@ -328,17 +315,17 @@ fn stricter_keys_match_representatives_not_old_evidence() {
 #[test]
 fn coarser_keys_choose_first_existing_edge_without_merging_history() {
     let (first, _) = drive(
-        BatchLoop::new(config().with_recording()).unwrap(),
+        BatchLoop::new(config()).unwrap(),
         |_| "A".into(),
         || "first".into(),
     );
     let (old, count) = drive(
-        BatchLoop::new(config().with_agent(first.agent().unwrap().clone())).unwrap(),
+        BatchLoop::new(config().with_agent(first.agent().clone())).unwrap(),
         |_| "a".into(),
         || "second".into(),
     );
     assert_eq!(count, 1);
-    let agent = old.agent().unwrap();
+    let agent = old.agent();
     let before = agent.root();
     let (replay, count) = drive(
         BatchLoop::with_comparison_key(config().with_agent(agent.clone()), |v: &String| {
@@ -350,7 +337,7 @@ fn coarser_keys_choose_first_existing_edge_without_merging_history() {
     );
     assert_eq!(count, 0);
     assert_eq!(replay.results["e"], "first");
-    let root = replay.agent().unwrap().root();
+    let root = replay.agent().root();
     assert_eq!(root.observations.len(), 2);
     assert_eq!(root.observations[1], before.observations[1]);
     assert_eq!(
@@ -363,13 +350,13 @@ fn coarser_keys_choose_first_existing_edge_without_merging_history() {
     );
     assert_eq!(root.observations[0].representative[0].tool_output, "A");
     assert_eq!(
-        replay.agent().unwrap().assets().next().unwrap().messages()[2].content,
+        replay.agent().assets().next().unwrap().messages()[2].content,
         "A"
     );
     assert_eq!(agent.root(), before);
-    assert_eq!(first.agent().unwrap().root().observations.len(), 1);
+    assert_eq!(first.agent().root().observations.len(), 1);
     let (exact, count) = drive(
-        BatchLoop::new(config().with_agent(replay.into_agent().unwrap())).unwrap(),
+        BatchLoop::new(config().with_agent(replay.into_agent())).unwrap(),
         |_| "a".into(),
         answer,
     );
@@ -455,7 +442,7 @@ fn child_query_and_execution_ignore_default_custom_mode() {
 }
 
 #[test]
-fn recording_switch_is_not_identity_and_legacy_budgets_remain_supported() {
+fn child_structural_identity_and_fresh_budget() {
     let tool = SubagentTool::new(
         ToolSpec::new("child", "", json!({})),
         |_| "child".to_owned(),
@@ -463,7 +450,7 @@ fn recording_switch_is_not_identity_and_legacy_budgets_remain_supported() {
         1,
     )
     .with_subagents(vec![]);
-    let mut loop_ = BatchLoop::new(config().with_subagent(tool.clone()).with_recording()).unwrap();
+    let mut loop_ = BatchLoop::new(config().with_subagent(tool.clone())).unwrap();
     let r = loop_.next_request(RequestKind::Any).unwrap();
     loop_
         .complete(Completion::Llm(LlmCompletion::final_answer(
@@ -473,24 +460,35 @@ fn recording_switch_is_not_identity_and_legacy_budgets_remain_supported() {
         .unwrap();
     let mut replay = BatchLoop::new(
         config()
-            .with_subagent(tool.clone().with_recording())
-            .with_agent(loop_.agent().unwrap()),
+            .with_subagent(tool.clone())
+            .with_agent(loop_.agent()),
     )
     .unwrap();
     assert!(replay.is_done());
-    let legacy = BatchLoop::new(
+    let mut fresh = BatchLoop::new(
         config()
-            .with_subagent(tool.clone())
+            .with_subagent(tool)
             .with_budget(Budget::new(1, |_| "stop".into())),
     )
     .unwrap();
-    assert!(legacy.agent().is_none());
-    assert!(matches!(
-        BatchLoop::new(
-            config()
-                .with_subagent(tool.with_recording())
-                .with_budget(Budget::new(1, |_| "stop".into()))
-        ),
-        Err(LoopError::UnsupportedHistory)
-    ));
+    assert!(fresh.agent().root().assistant.is_none());
+    let request = fresh.next_request(RequestKind::Any).unwrap();
+    fresh
+        .complete(Completion::Llm(LlmCompletion::final_answer(
+            request.request_id(),
+            "done".into(),
+        )))
+        .unwrap();
+    assert_eq!(
+        fresh
+            .result()
+            .unwrap()
+            .agent()
+            .root()
+            .assistant
+            .as_ref()
+            .unwrap()
+            .content,
+        "done"
+    );
 }

@@ -18,7 +18,7 @@ EXPECTED = "child1:grandchild:observed:grandchild|child2:observed:child2"
 SPECS = (ToolSpec("investigate", "", {}), ToolSpec("probe", "", {}))
 
 
-def make_loop(recording, env="old", history=None):
+def make_loop(env="old", history=None):
     return BatchLoop(
         prompt="parent",
         env_ids=[env],
@@ -26,7 +26,6 @@ def make_loop(recording, env="old", history=None):
         subagent=SubagentTool(
             "investigate", "", {}, lambda args: args["prompt"], lambda _: SPECS, max_depth=2
         ),
-        recording=recording,
         history=history,
     )
 
@@ -107,13 +106,12 @@ def finish(loop, seen, opaque_id, reverse, *, replay=False):
     return llms, tools
 
 
-@pytest.mark.parametrize("recording", [False, True])
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("opaque_id", OPAQUE_IDS)
 def test_opaque_nested_ids_route_concurrent_completions_without_aliasing(
-    recording, reverse, opaque_id
+    reverse, opaque_id
 ):
-    loop = make_loop(recording)
+    loop = make_loop()
     seen = set()
     parent = pull(loop, seen, "llm")
     loop.complete(answer(parent, opaque_id))
@@ -139,14 +137,11 @@ def test_opaque_nested_ids_route_concurrent_completions_without_aliasing(
         loop.complete(LlmCompletion(grandchild.request_id, "stale"))
     assert loop.outstanding_count == 0
 
-    if recording:
-        history = loop.history
-        assert history.root.assistant.tool_calls[1].id == opaque_id
-        assert {entry.call_id for entry in history.root.subagents} == {"a", opaque_id}
-        for replay_reverse in (False, True):
-            replay = make_loop(True, "new", history)
-            assert finish(replay, set(), opaque_id, replay_reverse, replay=True) == (0, 4)
-            assert replay.result().results == {"new": EXPECTED}
-        assert history.root.env_ids == ("old",)
-    else:
-        assert loop.history is None
+    history = loop.history
+    assert history.root.assistant.tool_calls[1].id == opaque_id
+    assert {entry.call_id for entry in history.root.subagents} == {"a", opaque_id}
+    for replay_reverse in (False, True):
+        replay = make_loop("new", history)
+        assert finish(replay, set(), opaque_id, replay_reverse, replay=True) == (0, 4)
+        assert replay.result().results == {"new": EXPECTED}
+    assert history.root.env_ids == ("old",)

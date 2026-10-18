@@ -42,7 +42,7 @@ fn config(envs: &[&str], history: Option<History<String>>) -> LoopConfig<String>
     );
     match history {
         Some(h) => config.with_replay(h),
-        None => config.with_recording(),
+        None => config,
     }
 }
 
@@ -111,13 +111,13 @@ fn drive<K: Eq + Hash + fmt::Debug + 'static>(
 #[test]
 fn non_splitting_checkpoints_replay_branch_and_share_old_paths() {
     let mut loop_ = BatchLoop::new(config(&["old"], None)).unwrap();
-    let empty = loop_.history().unwrap();
+    let empty = loop_.history();
     let values = [("same", "one"), ("same", "two")];
     assert_eq!(drive(&mut loop_, &[("old", &values)], 2).len(), 3);
     let result = loop_.result().unwrap();
     assert!(result.tree.children.is_empty());
     assert!(empty.root().assistant.is_none());
-    let old = result.history.unwrap();
+    let old = result.history;
     let root = old.root();
     let first = &root.observations[0];
     let first_next = old.load(&first.continuation);
@@ -135,12 +135,7 @@ fn non_splitting_checkpoints_replay_branch_and_share_old_paths() {
     assert!(drive(&mut replay, &[("new", &values)], 2).is_empty());
     assert_eq!(replay.result().unwrap().results["new"], "two");
     assert_eq!(first.evidence.len(), 1);
-    assert_eq!(
-        replay.history().unwrap().root().observations[0]
-            .evidence
-            .len(),
-        2
-    );
+    assert_eq!(replay.history().root().observations[0].evidence.len(), 2);
 
     let changed_values = [("same", "one"), ("same", "CHANGED")];
     let mut changed = BatchLoop::new(config(&["tomorrow"], Some(old.clone()))).unwrap();
@@ -148,7 +143,7 @@ fn non_splitting_checkpoints_replay_branch_and_share_old_paths() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].stats.depth, 2);
     assert_eq!(requests[0].messages.last().unwrap().content, "CHANGED");
-    let extended = changed.history().unwrap();
+    let extended = changed.history();
     let next = extended.load(&extended.root().observations[0].continuation);
     let edges = &next.observations;
     assert_eq!(edges.len(), 2);
@@ -174,7 +169,7 @@ fn non_splitting_checkpoints_replay_branch_and_share_old_paths() {
 fn concurrent_branches_and_round_trip_keep_all_paths() {
     let mut old_loop = BatchLoop::new(config(&["old"], None)).unwrap();
     drive(&mut old_loop, &[("old", &[("x", "y")])], 1);
-    let old = old_loop.history().unwrap();
+    let old = old_loop.history();
     let mut extended = BatchLoop::new(config(&["same", "a", "b"], Some(old.clone()))).unwrap();
     assert_eq!(
         drive(
@@ -191,7 +186,7 @@ fn concurrent_branches_and_round_trip_keep_all_paths() {
     );
     let result = extended.result().unwrap();
     assert_eq!(result.classes.len(), 3);
-    let history = result.history.unwrap();
+    let history = result.history;
     assert_eq!(history.root().observations.len(), 3);
     assert_eq!(old.root().observations.len(), 1);
     // Codec and storage belong entirely to the caller. Each record is shallow.
@@ -219,7 +214,7 @@ fn comparison_key_applies_to_new_outputs_and_stored_representatives() {
     let messages = &llms.last().unwrap().messages;
     assert_eq!(messages[messages.len() - 2].content, "one ");
     assert_eq!(messages[messages.len() - 1].content, "two ");
-    let history = loop_.history().unwrap();
+    let history = loop_.history();
     let root = history.root();
     let edge = &root.observations[0];
     assert_eq!(edge.representative[1].tool_output, "two ");
@@ -232,9 +227,9 @@ fn comparison_key_applies_to_new_outputs_and_stored_representatives() {
         .unwrap();
     assert!(drive(&mut replay, &[("c", &[("one\n", "two\n")])], 1).is_empty());
     assert_eq!(replay.result().unwrap().results["c"], "two ");
-    assert_eq!(replay.history().unwrap().root().observations.len(), 1);
+    assert_eq!(replay.history().root().observations.len(), 1);
     assert_eq!(
-        replay.history().unwrap().root().observations[0].evidence[2].outputs[1].tool_output,
+        replay.history().root().observations[0].evidence[2].outputs[1].tool_output,
         "two\n"
     );
     assert_eq!(edge.evidence.len(), 2);
@@ -274,7 +269,7 @@ fn hash_and_debug_collisions_cannot_conflate_records() {
         result.tree.children[0].group_key,
         result.tree.children[1].group_key
     );
-    let history = result.history.unwrap();
+    let history = result.history;
     assert_eq!(history.root().observations.len(), 2);
     for value in ["a", "b"] {
         let mut replay = BatchLoop::with_comparison_key(
@@ -299,7 +294,7 @@ fn invalid_completions_do_not_fulfill_history_and_can_be_corrected() {
     let Request::Llm(llm) = loop_.next_request(RequestKind::Any).unwrap() else {
         panic!()
     };
-    let empty = loop_.history().unwrap();
+    let empty = loop_.history();
     let call = ToolCall::new("dup", "read", json!({}));
     assert!(matches!(
         loop_.complete(Completion::Llm(LlmCompletion {
@@ -309,7 +304,7 @@ fn invalid_completions_do_not_fulfill_history_and_can_be_corrected() {
         })),
         Err(LoopError::DuplicateToolCallId(_))
     ));
-    assert!(Arc::ptr_eq(&empty.root(), &loop_.history().unwrap().root()));
+    assert!(Arc::ptr_eq(&empty.root(), &loop_.history().root()));
     assert_eq!(loop_.outstanding_llm(), 1);
     loop_
         .complete(Completion::Llm(LlmCompletion {
@@ -321,7 +316,7 @@ fn invalid_completions_do_not_fulfill_history_and_can_be_corrected() {
     let Request::Tool(tool) = loop_.next_request(RequestKind::Any).unwrap() else {
         panic!()
     };
-    let snapshot = loop_.history().unwrap();
+    let snapshot = loop_.history();
     for results in [
         vec![("a".into(), "x".into())],
         vec![("a".into(), "x".into()), ("a".into(), "x".into())],
@@ -334,10 +329,7 @@ fn invalid_completions_do_not_fulfill_history_and_can_be_corrected() {
             Err(LoopError::InvalidToolCompletion(_))
         ));
         assert_eq!(loop_.outstanding_tool(), 1);
-        assert!(Arc::ptr_eq(
-            &snapshot.root(),
-            &loop_.history().unwrap().root()
-        ));
+        assert!(Arc::ptr_eq(&snapshot.root(), &loop_.history().root()));
     }
     let valid = Completion::Tool(ToolCompletion {
         request_id: tool.request_id,
@@ -362,7 +354,7 @@ fn invalid_completions_do_not_fulfill_history_and_can_be_corrected() {
 }
 
 #[test]
-fn structural_checks_final_only_replay_and_unsupported_budget() {
+fn structural_checks_final_only_replay_and_fresh_budget() {
     let mut loop_ = BatchLoop::new(config(&["old"], None)).unwrap();
     let request = loop_.next_request(RequestKind::Any).unwrap();
     loop_
@@ -371,7 +363,7 @@ fn structural_checks_final_only_replay_and_unsupported_budget() {
             "done".into(),
         )))
         .unwrap();
-    let history = loop_.history().unwrap();
+    let history = loop_.history();
     let mut replay = BatchLoop::new(config(&["new"], Some(history.clone()))).unwrap();
     assert!(replay.is_done());
     assert!(replay.next_request(RequestKind::Any).is_none());
@@ -395,13 +387,11 @@ fn structural_checks_final_only_replay_and_unsupported_budget() {
             .unwrap()
             .is_done()
     );
-    assert!(matches!(
-        BatchLoop::new(
-            config(&["new"], None)
-                .with_budget(lockstep_loop::Budget::new(1, |_| "exhausted".into()))
-        ),
-        Err(LoopError::UnsupportedHistory)
-    ));
+    let fresh = BatchLoop::new(
+        config(&["new"], None).with_budget(lockstep_loop::Budget::new(1, |_| "exhausted".into())),
+    )
+    .unwrap();
+    assert!(fresh.agent().root().assistant.is_none());
 }
 
 #[test]
@@ -422,7 +412,7 @@ fn reverse_branch_completions_keep_siblings_and_never_merge() {
             results: vec![("a".into(), "one".into()), ("b".into(), "two".into())],
         }))
         .unwrap();
-    let before = loop_.history().unwrap();
+    let before = loop_.history();
     let first = loop_.next_request(RequestKind::Any).unwrap();
     let second = loop_.next_request(RequestKind::Any).unwrap();
     for request in [second, first] {
@@ -442,7 +432,7 @@ fn reverse_branch_completions_keep_siblings_and_never_merge() {
             .iter()
             .all(|e| before.load(&e.continuation).assistant.is_none())
     );
-    let history = result.history.unwrap();
+    let history = result.history;
     assert!(history.root().observations.iter().all(|e| {
         history
             .load(&e.continuation)
@@ -457,7 +447,7 @@ fn reverse_branch_completions_keep_siblings_and_never_merge() {
 #[test]
 fn opaque_bytes_and_fulfilled_assistant_snapshot_restart_tools() {
     let make_config = |env: &str| LoopConfig::new(vec![0, 255], vec![env.into()], specs());
-    let mut loop_ = BatchLoop::new(make_config("old").with_recording()).unwrap();
+    let mut loop_ = BatchLoop::new(make_config("old")).unwrap();
     let request = loop_.next_request(RequestKind::Any).unwrap();
     loop_
         .complete(Completion::Llm(LlmCompletion {
@@ -466,7 +456,7 @@ fn opaque_bytes_and_fulfilled_assistant_snapshot_restart_tools() {
             tool_calls: vec![ToolCall::new("read", "read", json!({}))],
         }))
         .unwrap();
-    let snapshot = loop_.history().unwrap();
+    let snapshot = loop_.history();
     let mut replay = BatchLoop::new(make_config("new").with_replay(snapshot.clone())).unwrap();
     let Request::Tool(tool) = replay.next_request(RequestKind::Any).unwrap() else {
         panic!()
@@ -484,7 +474,7 @@ fn opaque_bytes_and_fulfilled_assistant_snapshot_restart_tools() {
             vec![3, 252],
         )))
         .unwrap();
-    let history = replay.history().unwrap();
+    let history = replay.history();
     assert_eq!(
         history.root().observations[0].evidence[0].outputs[0].tool_output,
         [2, 253]

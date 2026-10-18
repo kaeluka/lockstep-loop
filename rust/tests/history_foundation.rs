@@ -31,7 +31,7 @@ fn nested_config(
     ));
     match previous {
         Some(h) => config.with_replay(h),
-        None => config.with_recording(),
+        None => config,
     }
 }
 struct Driven {
@@ -124,7 +124,7 @@ fn nested_drive(mut loop_: BatchLoop<String>, values: &[(&str, &str)]) -> Driven
                 }
             }
             if early.is_none() {
-                early = loop_.history();
+                early = Some(loop_.history());
             }
         }
     }
@@ -181,7 +181,7 @@ fn nested_histories_mixed_calls_depth_equal_parent_answers_and_snapshots() {
     assert_eq!(driven.result.classes.len(), 1);
     assert_eq!(driven.result.classes[0].env_ids, ["a", "b"]);
     assert_eq!(driven.llms.iter().filter(|s| *s == "main").count(), 2);
-    let old = driven.result.history.unwrap();
+    let old = driven.result.history;
     let grand = child(&child(&old, "child"), "nested");
     assert!(grand.descriptor.subagents.is_empty());
     assert!(
@@ -235,7 +235,7 @@ fn nested_histories_mixed_calls_depth_equal_parent_answers_and_snapshots() {
     assert!(!changed.llms.is_empty());
     assert!(changed.llms.iter().all(|scope| scope != "main"));
     assert_eq!(changed.result.classes.len(), 1);
-    let extended = changed.result.history.unwrap();
+    let extended = changed.result.history;
     assert_eq!(
         child(&child(&extended, "child"), "nested")
             .root()
@@ -302,7 +302,7 @@ fn repeated_subagent_call_ids_cannot_accept_stale_completions() {
             "done".into(),
         )))
         .unwrap();
-    let old = loop_.history().unwrap();
+    let old = loop_.history();
     assert!(loop_.is_done());
     let mut replay = BatchLoop::new(nested_config(&["next"], Some(old.clone()), 2)).unwrap();
     assert!(replay.is_done());
@@ -327,7 +327,7 @@ fn invalid_nested_completion_preserves_routes_and_snapshot() {
         }))
         .unwrap();
     let child_request = loop_.next_request(RequestKind::Any).unwrap();
-    let before = loop_.history().unwrap();
+    let before = loop_.history();
     let duplicate = ToolCall::new("p", "probe", json!({}));
     assert!(matches!(
         loop_.complete(Completion::Llm(LlmCompletion {
@@ -337,7 +337,7 @@ fn invalid_nested_completion_preserves_routes_and_snapshot() {
         })),
         Err(LoopError::DuplicateToolCallId(_))
     ));
-    assert_eq!(loop_.history().unwrap(), before);
+    assert_eq!(loop_.history(), before);
     assert_eq!(loop_.outstanding_llm(), 1);
     loop_
         .complete(Completion::Llm(LlmCompletion {
@@ -347,7 +347,7 @@ fn invalid_nested_completion_preserves_routes_and_snapshot() {
         }))
         .unwrap();
     let tool = loop_.next_request(RequestKind::Any).unwrap();
-    let before = loop_.history().unwrap();
+    let before = loop_.history();
     assert!(matches!(
         loop_.complete(Completion::Tool(ToolCompletion {
             request_id: tool.request_id().into(),
@@ -356,7 +356,7 @@ fn invalid_nested_completion_preserves_routes_and_snapshot() {
         Err(LoopError::InvalidToolCompletion(_))
     ));
     assert_eq!(loop_.outstanding_tool(), 1);
-    assert_eq!(loop_.history().unwrap(), before);
+    assert_eq!(loop_.history(), before);
     loop_
         .complete(Completion::Tool(ToolCompletion {
             request_id: tool.request_id().into(),
@@ -375,11 +375,7 @@ fn invalid_nested_completion_preserves_routes_and_snapshot() {
     assert!(loop_.is_done());
     assert!(child(&before, "child").root().observations.is_empty());
     assert_eq!(
-        child(&loop_.history().unwrap(), "child")
-            .root()
-            .observations[0]
-            .evidence[1]
-            .env_id,
+        child(&loop_.history(), "child").root().observations[0].evidence[1].env_id,
         "b"
     );
 }
@@ -392,9 +388,7 @@ fn simple(envs: &[&str], previous: Option<History<String>>) -> BatchLoop<String>
     );
     BatchLoop::new(match previous {
         Some(h) => config.with_replay(h),
-        None => config
-            .with_recording()
-            .with_record_store(RecordStore::new("initial-writer")),
+        None => config.with_record_store(RecordStore::new("initial-writer")),
     })
     .unwrap()
 }
@@ -444,7 +438,7 @@ fn sequential<K: Eq + std::hash::Hash + std::fmt::Debug + 'static>(
 fn deep_individual_records_roundtrip_and_lazy_traversal_then_publish_new_path() {
     let mut original = simple(&["left", "right"], None);
     sequential(&mut original, &[("left", "L"), ("right", "R")], 256);
-    let old = original.history().unwrap();
+    let old = original.history();
     let mut backend = Backend::new();
     // Each record AND envelope deserialize using ordinary serde_json defaults.
     // No recursion-limit increase, recursive export tree, or caller replay logic.
@@ -458,7 +452,7 @@ fn deep_individual_records_roundtrip_and_lazy_traversal_then_publish_new_path() 
     assert_eq!(loads.lock().unwrap().len(), 257);
     assert!(!loads.lock().unwrap().contains(&right));
     assert_eq!(old.root().observations[0].evidence.len(), 1);
-    let new_descriptor = save(&replay.history().unwrap(), &mut backend);
+    let new_descriptor = save(&replay.history(), &mut backend);
     let restored = restore(
         &new_descriptor,
         backend.clone(),
@@ -467,7 +461,7 @@ fn deep_individual_records_roundtrip_and_lazy_traversal_then_publish_new_path() 
     );
     let mut changed = simple(&["new"], Some(restored));
     assert_eq!(sequential(&mut changed, &[("new", "NEW")], 1), 1);
-    let extended_descriptor = save(&changed.history().unwrap(), &mut backend);
+    let extended_descriptor = save(&changed.history(), &mut backend);
     for (index, value) in ["L", "R", "NEW"].iter().enumerate() {
         let restored = restore(
             &extended_descriptor,
@@ -496,7 +490,7 @@ fn deep_individual_records_roundtrip_and_lazy_traversal_then_publish_new_path() 
 fn user_continuations_belong_to_resolved_investigation_not_answer_value() {
     let mut original = simple(&["a", "b"], None);
     sequential(&mut original, &[("a", "A"), ("b", "B")], 1);
-    let old = original.history().unwrap();
+    let old = original.history();
     let mut resolved = simple(&["a"], Some(old.clone()));
     assert_eq!(sequential(&mut resolved, &[("a", "A")], 1), 0);
     let extended = resolved
@@ -515,7 +509,7 @@ fn user_continuations_belong_to_resolved_investigation_not_answer_value() {
             .user_continuations
             .is_empty()
     );
-    let resolved_history = resolved.history().unwrap();
+    let resolved_history = resolved.history();
     assert!(
         resolved_history
             .load(&resolved_history.root().observations[0].continuation)
@@ -606,7 +600,7 @@ impl std::hash::Hash for CollidingKey {
 }
 
 #[test]
-fn non_recording_colliding_labels_do_not_identify_or_drop_groups() {
+fn colliding_partition_labels_do_not_identify_or_drop_groups() {
     let config = LoopConfig::new(
         "inspect".into(),
         vec!["a".into(), "b".into()],
@@ -624,7 +618,7 @@ fn non_recording_colliding_labels_do_not_identify_or_drop_groups() {
 }
 
 #[test]
-fn non_recording_legacy_labels_retain_meaning() {
+fn partition_labels_retain_meaning() {
     let mut loop_ = BatchLoop::new(LoopConfig::new(
         "inspect".into(),
         vec!["a".into(), "b".into()],
@@ -633,7 +627,7 @@ fn non_recording_legacy_labels_retain_meaning() {
     .unwrap();
     sequential(&mut loop_, &[("a", "A"), ("b", "B")], 1);
     let result = loop_.result().unwrap();
-    assert!(result.history.is_none());
+    assert_eq!(result.agent().root().observations.len(), 2);
     assert_eq!(
         result
             .tree

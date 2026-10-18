@@ -97,15 +97,13 @@ fn restore(descriptor: &[u8], backend: Backend, fresh_writer: &str) -> Agent<Str
 fn main() {
     let recorded = serve(
         BatchLoop::new(
-            config(&["A", "B", "D"])
-                .with_recording()
-                .with_record_store(RecordStore::new("initial-writer")),
+            config(&["A", "B", "D"]).with_record_store(RecordStore::new("initial-writer")),
         )
         .unwrap(),
     )
     .0;
     let mut backend = Backend::new();
-    let original_descriptor = persist(recorded.agent().unwrap(), &mut backend);
+    let original_descriptor = persist(recorded.agent(), &mut backend);
     let original = restore(&original_descriptor, backend.clone(), "replay-writer");
     let original_assets: Vec<_> = original.assets().collect();
     assert_eq!(original_assets.len(), 2);
@@ -114,7 +112,7 @@ fn main() {
     let (replayed, llms) =
         serve(BatchLoop::new(config(&["C"]).with_agent(original.clone())).unwrap());
     assert_eq!(llms, 0);
-    let before = replayed.into_agent().unwrap();
+    let before = replayed.into_agent();
     let old_asset = before.assets().next().unwrap();
     assert_eq!(old_asset.env_ids(), ["A", "B", "C"]);
     println!("Agent prompt: {}", before.prompt());
@@ -136,7 +134,7 @@ fn main() {
             results: vec![("C".into(), "shared".into())],
         }))
         .unwrap();
-    let opened = loop_.agent().unwrap();
+    let opened = loop_.agent();
     let pending = opened.assets().next().unwrap();
     assert!(!pending.is_complete() && pending.value().unwrap() == "no issues");
     let Request::Llm(request) = loop_.next_request(RequestKind::Any).unwrap() else {
@@ -164,7 +162,7 @@ fn main() {
             "no issues".into(),
         )))
         .unwrap();
-    let revised = loop_.result().unwrap().into_agent().unwrap();
+    let revised = loop_.result().unwrap().into_agent();
     let revised_asset = revised.assets().next().unwrap();
     assert!(revised_asset.is_complete());
     assert_eq!(revised_asset.value(), old_asset.value());
@@ -178,7 +176,7 @@ fn main() {
     let loaded = restore(&descriptor, backend.clone(), "inherited-writer");
     let (inherited, _) =
         serve(BatchLoop::new(config(&["A", "B", "C", "D"]).with_agent(loaded)).unwrap());
-    let agent = inherited.agent().unwrap();
+    let agent = inherited.agent();
     let assets: Vec<_> = agent.assets().collect();
     assert_eq!(assets.len(), 3);
     assert_eq!(inherited.results["B"], "found");

@@ -14,11 +14,10 @@
 mod history;
 use history::PathStep;
 pub use history::{
-    Agent, AgentDescriptor, AgentOptions, AgentQuery, AgentResolver, Asset, Assets, ChildAgentRun,
+    Agent, AgentDescriptor, AgentQuery, AgentResolver, Asset, Assets, ChildAgentRun,
     ChildAgentUpdate, ChildHistoryRun, ChildHistoryUpdate, EnvObservation, History,
-    HistoryDescriptor, HistoryNode, HistoryOptions, HistoryQuery, HistoryResolver, NodeRef,
-    Observation, OutputRecord, RecordStore, SubagentContract, SubagentHistory, SubagentRecord,
-    UserContinuation,
+    HistoryDescriptor, HistoryNode, HistoryQuery, HistoryResolver, NodeRef, Observation,
+    OutputRecord, RecordStore, SubagentContract, SubagentHistory, SubagentRecord, UserContinuation,
 };
 
 use indexmap::IndexMap;
@@ -217,6 +216,9 @@ impl<P> Completion<P> {
 ///
 /// Rust cannot fabricate the Python implementation's string sentinel for an
 /// arbitrary `P`, so the caller supplies the payload to use on exhaustion.
+/// Both fresh and replayed assistant turns count toward the per-branch limit.
+/// The fallback is a run result, not an assistant message: the Agent retains its
+/// real checkpoint for replay with a larger or no budget.
 pub struct Budget<P> {
     pub max_steps_per_branch: usize,
     exhausted: Arc<BudgetFallback<P>>,
@@ -257,8 +259,6 @@ impl<P> Debug for Budget<P> {
 pub struct SubagentTool<P> {
     pub spec: ToolSpec,
     pub max_depth: usize,
-    /// Record children without a recorded parent or resolver; never a cache key.
-    pub recording: bool,
     /// None preserves bounded self-recursion; Some is an explicit child allowlist.
     pub subagents: Option<Vec<SubagentTool<P>>>,
     build_prompt: Arc<PromptBuilder<P>>,
@@ -290,17 +290,10 @@ impl<P> SubagentTool<P> {
         Self {
             spec,
             max_depth,
-            recording: false,
             subagents: None,
             build_prompt: Arc::new(build_prompt),
             sub_tool_specs: Arc::new(sub_tool_specs),
         }
-    }
-
-    /// Enable child recording independently of its parent. Not part of identity.
-    pub fn with_recording(mut self) -> Self {
-        self.recording = true;
-        self
     }
 
     pub fn with_subagents(mut self, subagents: Vec<SubagentTool<P>>) -> Self {
@@ -323,7 +316,6 @@ impl<P> SubagentTool<P> {
         Self {
             spec: self.spec.clone(),
             max_depth,
-            recording: self.recording,
             subagents: self.subagents.clone(),
             build_prompt: Arc::clone(&self.build_prompt),
             sub_tool_specs: Arc::clone(&self.sub_tool_specs),
@@ -342,13 +334,13 @@ impl<P> Debug for SubagentTool<P> {
         f.debug_struct("SubagentTool")
             .field("spec", &self.spec)
             .field("max_depth", &self.max_depth)
-            .field("recording", &self.recording)
             .field("subagents", &self.subagents)
             .finish_non_exhaustive()
     }
 }
 
 /// Configuration shared by default and custom-grouping constructors.
+/// Every loop records an immutable [`Agent`]; [`Self::with_agent`] supplies prior history.
 #[derive(Clone, Debug)]
 pub struct LoopConfig<P> {
     pub prompt: P,
@@ -360,8 +352,9 @@ pub struct LoopConfig<P> {
     pub history_resolver: Option<AgentResolver<P>>,
     pub record_store: Option<RecordStore<P>>,
     pub budget: Option<Budget<P>>,
-    /// Compatibility field; configure recorded agents with with_agent/with_recording.
-    pub history: Option<AgentOptions<P>>,
+    /// Optional prior snapshot for replay; configure with with_agent.
+    pub history: Option<Agent<P>>,
+    prompt_eq: Option<fn(&P, &P) -> bool>,
     /// Some(payload) is one intervention; even Some(None) for an optional payload.
     pub feedback: Option<P>,
 }
@@ -378,18 +371,9 @@ impl<P> LoopConfig<P> {
             record_store: None,
             budget: None,
             history: None,
+            prompt_eq: None,
             feedback: None,
         }
-    }
-
-    /// Enable recording for a fresh root loop.
-    pub fn with_recording(mut self) -> Self {
-        self.history = Some(AgentOptions {
-            previous: None,
-            store: None,
-            prompt_eq: None,
-        });
-        self
     }
 
     /// Replay and record a snapshot under compatible structural configuration.
@@ -397,11 +381,8 @@ impl<P> LoopConfig<P> {
     where
         P: PartialEq,
     {
-        self.history = Some(AgentOptions {
-            previous: Some(previous),
-            store: None,
-            prompt_eq: Some(PartialEq::eq),
-        });
+        self.history = Some(previous);
+        self.prompt_eq = Some(PartialEq::eq);
         self
     }
 
@@ -495,18 +476,19 @@ pub struct EnvClass {
 pub struct BatchResult<P> {
     pub tree: SplitNode,
     pub classes: Vec<EnvClass>,
+    /// Final answers or budget fallbacks, separate from recorded model evidence.
     pub results: BTreeMap<String, P>,
     /// Compatibility field; prefer agent() for the recorded agent snapshot.
-    pub history: Option<Agent<P>>,
+    pub history: Agent<P>,
     /// Compatibility field; prefer child_agents().
     pub child_histories: Vec<ChildAgentUpdate<P>>,
 }
 
 impl<P> BatchResult<P> {
-    pub fn agent(&self) -> Option<&Agent<P>> {
-        self.history.as_ref()
+    pub fn agent(&self) -> &Agent<P> {
+        &self.history
     }
-    pub fn into_agent(self) -> Option<Agent<P>> {
+    pub fn into_agent(self) -> Agent<P> {
         self.history
     }
     pub fn child_agents(&self) -> &[ChildAgentUpdate<P>] {
@@ -532,8 +514,6 @@ pub enum LoopError {
     HistoryResolution(String),
     #[error("incompatible history prompt, tools, subagents or record store")]
     IncompatibleHistory,
-    #[error("recorded history does not yet support budgets")]
-    UnsupportedHistory,
     #[error("feedback requires a supplied history and exactly one environment")]
     InvalidFeedback,
     #[error("no recorded completed conversation on the feedback resolution path")]
@@ -590,6 +570,8 @@ struct BranchRecord {
 
 #[derive(Clone)]
 struct FinalBranch<P> {
+    // Budget fallbacks are results, but cannot be targets for user continuations.
+    answered: bool,
     history_path: Vec<PathStep>,
     branch_id: String,
     env_ids: Vec<String>,
@@ -672,7 +654,6 @@ pub struct BatchLoop<P, K = P> {
     specs: Vec<ToolSpec>,
     subagents: IndexMap<String, SubagentTool<P>>,
     history_resolver: Option<AgentResolver<P>>,
-    record_store: Option<RecordStore<P>>,
     unavailable_subagents: HashSet<String>,
     comparison_key: Arc<ComparisonKeyFunction<P, K>>,
     budget: Option<Budget<P>>,
@@ -683,7 +664,7 @@ pub struct BatchLoop<P, K = P> {
     next_child: u64,
     branches: HashMap<String, Branch<P>>,
     partition: Vec<BranchRecord>, // legacy per-run partition summary
-    recorded: Option<Agent<P>>,
+    recorded: Agent<P>,
     feedback: Option<P>,
     resolve_only: bool,
     resolution_base: Option<Agent<P>>,
@@ -764,83 +745,38 @@ where
             .unwrap_or_else(|| config.subagent.into_iter().collect());
         let registry = register(config.tool_specs, definitions)?;
         unavailable_subagents.retain(|name| !registry.subagents.contains_key(name));
-        let independent =
-            config.history_resolver.is_some() || registry.subagents.values().any(|s| s.recording);
-        if independent && config.budget.is_some() {
-            return Err(LoopError::UnsupportedHistory);
-        }
-
-        if config.feedback.is_some()
-            && (config.env_ids.len() != 1
-                || config.history.as_ref().is_none_or(|h| h.previous.is_none()))
-        {
+        if config.feedback.is_some() && (config.env_ids.len() != 1 || config.history.is_none()) {
             return Err(LoopError::InvalidFeedback);
         }
         let resolve_only = resolve_only || config.feedback.is_some();
         let prompt_eq = config
-            .history
-            .as_ref()
-            .and_then(|h| h.prompt_eq)
+            .prompt_eq
             .or_else(|| config.history_resolver.as_ref().map(|r| r.prompt_eq));
-        let recorded = if let Some(options) = config.history {
-            if options
-                .store
+        let recorded = if let Some(previous) = config.history {
+            if config
+                .record_store
                 .as_ref()
-                .zip(config.record_store.as_ref())
-                .is_some_and(|(a, b)| !a.same_store(b))
+                .is_some_and(|s| !s.same_store(&previous.store))
+                || !prompt_eq.is_some_and(|eq| eq(&previous.descriptor.prompt, &config.prompt))
+                || previous.descriptor.tools != registry.specs
+                || previous.descriptor.subagents != registry.contracts
             {
                 return Err(LoopError::IncompatibleHistory);
             }
-            if config.budget.is_some() {
-                return Err(LoopError::UnsupportedHistory);
-            }
-            if let Some(previous) = options.previous {
-                if config
-                    .record_store
-                    .as_ref()
-                    .is_some_and(|s| !s.same_store(&previous.store))
-                    || options
-                        .store
-                        .as_ref()
-                        .is_some_and(|s| !s.same_store(&previous.store))
-                {
-                    return Err(LoopError::IncompatibleHistory);
-                }
-                if !options
-                    .prompt_eq
-                    .is_some_and(|eq| eq(&previous.descriptor.prompt, &config.prompt))
-                    || previous.descriptor.tools != registry.specs
-                    || previous.descriptor.subagents != registry.contracts
-                {
-                    return Err(LoopError::IncompatibleHistory);
-                }
-                Some(previous)
-            } else {
-                let store = options
-                    .store
-                    .or_else(|| config.record_store.clone())
-                    .unwrap_or_default();
-                Some(Agent {
-                    descriptor: AgentDescriptor {
-                        prompt: config.prompt.clone(),
-                        tools: registry.specs.clone(),
-                        root: store.put(HistoryNode::default()),
-                        subagents: registry.contracts,
-                    },
-                    store,
-                })
-            }
+            previous
         } else {
-            None
+            let store = config.record_store.unwrap_or_default();
+            Agent {
+                descriptor: AgentDescriptor {
+                    prompt: config.prompt,
+                    tools: registry.specs.clone(),
+                    root: store.put(HistoryNode::default()),
+                    subagents: registry.contracts,
+                },
+                store,
+            }
         };
-        let record_store = recorded
-            .as_ref()
-            .map(|h| h.store.clone())
-            .or(config.record_store)
-            .or_else(|| independent.then(RecordStore::default));
-        let prompt = recorded
-            .as_ref()
-            .map_or(config.prompt, |h| h.descriptor.prompt.clone());
+        let prompt = recorded.descriptor.prompt.clone();
         let root = Branch {
             branch_id: "root".to_owned(),
             env_ids: config.env_ids.clone(),
@@ -861,7 +797,6 @@ where
             specs: registry.specs,
             subagents: registry.subagents,
             history_resolver: config.history_resolver,
-            record_store,
             unavailable_subagents,
             comparison_key,
             budget: config.budget,
@@ -871,7 +806,7 @@ where
             next_child: 0,
             branches: HashMap::new(),
             partition: vec![root_record],
-            resolution_base: if resolve_only { recorded.clone() } else { None },
+            resolution_base: resolve_only.then(|| recorded.clone()),
             recorded,
             feedback: config.feedback,
             resolve_only,
@@ -1021,7 +956,7 @@ where
     fn fail(&mut self, error: LoopError) {
         self.error = Some(error);
         if let Some(base) = self.resolution_base.take() {
-            self.recorded = Some(base);
+            self.recorded = base;
         }
         self.ready_llm.clear();
         self.ready_tool.clear();
@@ -1033,13 +968,10 @@ where
     }
 
     /// A structurally shared snapshot; builders and pending requests are not persisted.
-    pub fn agent(&self) -> Option<Agent<P>> {
-        let mut snapshot = self.recorded.clone()?;
+    pub fn agent(&self) -> Agent<P> {
+        let mut snapshot = self.recorded.clone();
         for link in self.children.values() {
-            let child = link
-                .child
-                .agent()
-                .expect("recorded parent has recorded child agents");
+            let child = link.child.agent();
             let branch = &self.branches[&link.branch_id];
             let current = snapshot.node(&branch.history_path);
             if current.subagents.iter().any(|old| {
@@ -1072,11 +1004,11 @@ where
             }
             snapshot.replace_node(&branch.history_path, node);
         }
-        Some(snapshot)
+        snapshot
     }
 
     /// Compatibility spelling of agent().
-    pub fn history(&self) -> Option<Agent<P>> {
+    pub fn history(&self) -> Agent<P> {
         self.agent()
     }
 
@@ -1087,10 +1019,14 @@ where
         if let Some(error) = &self.error {
             return Err(error.clone());
         }
-        if !self.is_done() || self.finals.len() != 1 || self.finals[0].env_ids.len() != 1 {
+        if !self.is_done()
+            || self.finals.len() != 1
+            || self.finals[0].env_ids.len() != 1
+            || !self.finals[0].answered
+        {
             return Err(LoopError::UnresolvedConversation);
         }
-        let mut snapshot = self.history().ok_or(LoopError::UnresolvedConversation)?;
+        let mut snapshot = self.history();
         let path = &self.finals[0].history_path;
         let mut node = snapshot.node(path).as_ref().clone();
         node.user_continuations.push(UserContinuation {
@@ -1211,17 +1147,15 @@ where
                     .turn_results
                     .insert(link.call.id.clone(), child_result.results);
                 self.child_histories.extend(child_result.child_histories);
-                if let Some(history) = child_result.history {
-                    self.child_histories.push(ChildAgentUpdate {
-                        request_prefix: link.child.id_prefix.clone(),
-                        branch_id: branch.branch_id.clone(),
-                        depth: branch.steps,
-                        tool_call: link.call,
-                        env_ids: branch.env_ids.clone(),
-                        base: link.base,
-                        history,
-                    });
-                }
+                self.child_histories.push(ChildAgentUpdate {
+                    request_prefix: link.child.id_prefix.clone(),
+                    branch_id: branch.branch_id.clone(),
+                    depth: branch.steps,
+                    tool_call: link.call,
+                    env_ids: branch.env_ids.clone(),
+                    base: link.base,
+                    history: child_result.history,
+                });
                 if branch.turn_results.len() == branch.turn_calls.len() {
                     self.advance_turn(branch);
                     if self.error.is_some() {
@@ -1261,8 +1195,19 @@ where
         if self.error.is_some() {
             return;
         }
-        while let Some(history) = &self.recorded {
-            let node = history.node(&branch.history_path);
+        loop {
+            if let Some(budget) = &self.budget
+                && branch.steps >= budget.max_steps_per_branch
+            {
+                if self.resolve_only {
+                    self.fail(LoopError::FeedbackResolutionMiss);
+                } else {
+                    let content = (budget.exhausted)(branch.steps);
+                    self.finish_branch(branch, content);
+                }
+                return;
+            }
+            let node = self.recorded.node(&branch.history_path);
             if !node.user_continuations.is_empty()
                 && (node.user_continuations.len() != 1
                     || !node
@@ -1286,13 +1231,6 @@ where
         }
         if self.resolve_only {
             self.fail(LoopError::FeedbackResolutionMiss);
-            return;
-        }
-        if let Some(budget) = &self.budget
-            && branch.steps >= budget.max_steps_per_branch
-        {
-            let content = (budget.exhausted)(branch.steps);
-            self.finish_branch(branch, content);
             return;
         }
         let stats = self.next_stats(&branch);
@@ -1320,6 +1258,10 @@ where
 
     fn finish_branch(&mut self, branch: Branch<P>, content: P) {
         self.finals.push(FinalBranch {
+            answered: branch
+                .messages
+                .last()
+                .is_some_and(|m| m.role == Role::Assistant && m.tool_calls.is_empty()),
             history_path: branch.history_path,
             branch_id: branch.branch_id,
             env_ids: branch.env_ids,
@@ -1387,34 +1329,31 @@ where
         mut prepared: PreparedChildren<P, K>,
     ) -> Option<Branch<P>> {
         self.branches.remove(&branch.branch_id);
-        if let Some(history) = &mut self.recorded {
-            let mut node = history.node(&branch.history_path).as_ref().clone();
-            node.assistant.get_or_insert_with(|| message.clone());
-            node.env_ids.extend(branch.env_ids.clone());
-            history.replace_node(&branch.history_path, node);
-        }
+        let history = &mut self.recorded;
+        let mut node = history.node(&branch.history_path).as_ref().clone();
+        node.assistant.get_or_insert_with(|| message.clone());
+        node.env_ids.extend(branch.env_ids.clone());
+        history.replace_node(&branch.history_path, node);
         branch.steps += 1;
         branch.messages.push(message.clone());
         if message.tool_calls.is_empty() {
-            if let Some(history) = &mut self.recorded {
-                let mut node = history.node(&branch.history_path).as_ref().clone();
-                if node.user_continuations.is_empty()
-                    && let Some(content) = self.feedback.take()
-                {
-                    node.user_continuations.push(UserContinuation {
-                        message: Message::user(content),
-                        continuation: history.store.put(HistoryNode::default()),
-                        resolved_env_id: Some(branch.env_ids[0].clone()),
-                    });
-                    history.replace_node(&branch.history_path, node.clone());
-                    self.resolve_only = false;
-                    self.resolution_base = None;
-                }
-                if let Some(edge) = node.user_continuations.first() {
-                    branch.messages.push(edge.message.clone());
-                    branch.history_path.push(PathStep::User(0));
-                    return Some(branch);
-                }
+            let mut node = history.node(&branch.history_path).as_ref().clone();
+            if node.user_continuations.is_empty()
+                && let Some(content) = self.feedback.take()
+            {
+                node.user_continuations.push(UserContinuation {
+                    message: Message::user(content),
+                    continuation: history.store.put(HistoryNode::default()),
+                    resolved_env_id: Some(branch.env_ids[0].clone()),
+                });
+                history.replace_node(&branch.history_path, node.clone());
+                self.resolve_only = false;
+                self.resolution_base = None;
+            }
+            if let Some(edge) = node.user_continuations.first() {
+                branch.messages.push(edge.message.clone());
+                branch.history_path.push(PathStep::User(0));
+                return Some(branch);
             }
             self.finish_branch(branch, message.content);
             return None;
@@ -1484,25 +1423,21 @@ where
             .collect();
         let registry = register(raw_specs, nested.clone())?;
         let prompt = (subagent.build_prompt)(&call.args)?;
-        let recording =
-            subagent.recording || self.recorded.is_some() || self.history_resolver.is_some();
         let mut previous = None;
         let mut prior_runs = Vec::new();
-        if let Some(history) = &self.recorded {
-            let node = history.node(&branch.history_path);
-            if let Some(entry) = node.subagents.iter().find(|s| s.call_id == call.id) {
-                previous = Some(Agent {
-                    descriptor: entry.agent_descriptor().clone(),
-                    store: history.store.clone(),
-                });
-                prior_runs = entry.runs.clone();
-                if prior_runs.is_empty() {
-                    prior_runs.push(Arc::new(ChildAgentRun {
-                        env_ids: vec![],
-                        base: None,
-                        history: entry.history.clone(),
-                    }));
-                }
+        let node = self.recorded.node(&branch.history_path);
+        if let Some(entry) = node.subagents.iter().find(|s| s.call_id == call.id) {
+            previous = Some(Agent {
+                descriptor: entry.agent_descriptor().clone(),
+                store: self.recorded.store.clone(),
+            });
+            prior_runs = entry.runs.clone();
+            if prior_runs.is_empty() {
+                prior_runs.push(Arc::new(ChildAgentRun {
+                    env_ids: vec![],
+                    base: None,
+                    history: entry.history.clone(),
+                }));
             }
         }
         // Recorded parent invocations pin a revision. Lookup selects only new
@@ -1521,19 +1456,11 @@ where
             if let Some(descriptor) = (resolver.resolve)(&query)? {
                 previous = Some(Agent {
                     descriptor,
-                    store: self
-                        .record_store
-                        .clone()
-                        .expect("independent recording store"),
+                    store: self.recorded.store.clone(),
                 });
             }
         }
         let base = previous.as_ref().map(|h| h.descriptor.clone());
-        let history_options = (recording || previous.is_some()).then(|| AgentOptions {
-            previous,
-            store: self.record_store.clone(),
-            prompt_eq: self.prompt_eq,
-        });
         let config = LoopConfig {
             prompt,
             env_ids: branch.env_ids.clone(),
@@ -1541,9 +1468,10 @@ where
             subagent: None,
             subagents: Some(nested),
             history_resolver: self.history_resolver.clone(),
-            record_store: self.record_store.clone(),
+            record_store: Some(self.recorded.store.clone()),
             budget: self.budget.clone(),
-            history: history_options,
+            history: previous,
+            prompt_eq: self.prompt_eq,
             feedback: None,
         };
         // The locally reserved key uses only internal invocation counters, not
@@ -1586,58 +1514,50 @@ where
         for (key, env_ids) in groups {
             let mut messages = branch.messages.clone();
             let mut history_path = branch.history_path.clone();
-            if let Some(history) = &mut self.recorded {
-                let mut node = history.node(&history_path).as_ref().clone();
-                let evidence: Vec<_> = env_ids
-                    .iter()
-                    .map(|env| EnvObservation {
-                        env_id: env.clone(),
-                        outputs: branch
-                            .turn_calls
-                            .iter()
-                            .map(|c| OutputRecord {
-                                tool_output: branch.turn_results[&c.id][env].clone(),
-                            })
-                            .collect(),
-                    })
-                    .collect();
-                // Today's function compares both sides. First existing match wins
-                // if a coarser function now equates multiple historical edges.
-                let matched = node.observations.iter().position(|edge| {
-                    let old_key: Vec<K> = edge
-                        .representative
+            let history = &mut self.recorded;
+            let mut node = history.node(&history_path).as_ref().clone();
+            let evidence: Vec<_> = env_ids
+                .iter()
+                .map(|env| EnvObservation {
+                    env_id: env.clone(),
+                    outputs: branch
+                        .turn_calls
                         .iter()
-                        .map(|o| (self.comparison_key)(&o.tool_output))
-                        .collect();
-                    old_key == key
-                });
-                if self.resolve_only && matched.is_none() {
-                    self.fail(LoopError::FeedbackResolutionMiss);
-                    return;
-                }
-                let index = matched.unwrap_or(node.observations.len());
-                if matched.is_none() {
-                    node.observations.push(Observation {
-                        representative: evidence[0].outputs.clone(),
-                        evidence: Vec::new(),
-                        continuation: history.store.put(HistoryNode::default()),
-                    });
-                }
-                let edge = &mut node.observations[index];
-                edge.evidence.extend(evidence);
-                for (call, output) in branch.turn_calls.iter().zip(&edge.representative) {
-                    messages.push(Message::tool(output.tool_output.clone(), call.id.clone()));
-                }
-                history.replace_node(&history_path, node);
-                history_path.push(PathStep::Observation(index));
-            } else {
-                Self::append_tool_messages(
-                    &mut messages,
-                    &branch.turn_calls,
-                    &branch.turn_results,
-                    &env_ids[0],
-                );
+                        .map(|c| OutputRecord {
+                            tool_output: branch.turn_results[&c.id][env].clone(),
+                        })
+                        .collect(),
+                })
+                .collect();
+            // Today's function compares both sides. First existing match wins
+            // if a coarser function now equates multiple historical edges.
+            let matched = node.observations.iter().position(|edge| {
+                let old_key: Vec<K> = edge
+                    .representative
+                    .iter()
+                    .map(|o| (self.comparison_key)(&o.tool_output))
+                    .collect();
+                old_key == key
+            });
+            if self.resolve_only && matched.is_none() {
+                self.fail(LoopError::FeedbackResolutionMiss);
+                return;
             }
+            let index = matched.unwrap_or(node.observations.len());
+            if matched.is_none() {
+                node.observations.push(Observation {
+                    representative: evidence[0].outputs.clone(),
+                    evidence: Vec::new(),
+                    continuation: history.store.put(HistoryNode::default()),
+                });
+            }
+            let edge = &mut node.observations[index];
+            edge.evidence.extend(evidence);
+            for (call, output) in branch.turn_calls.iter().zip(&edge.representative) {
+                messages.push(Message::tool(output.tool_output.clone(), call.id.clone()));
+            }
+            history.replace_node(&history_path, node);
+            history_path.push(PathStep::Observation(index));
             if !split {
                 branch.messages = messages;
                 branch.history_path = history_path;
@@ -1668,22 +1588,6 @@ where
             if self.error.is_some() {
                 return;
             }
-        }
-    }
-
-    fn append_tool_messages(
-        messages: &mut Vec<Message<P>>,
-        calls: &[ToolCall],
-        results: &HashMap<String, BTreeMap<String, P>>,
-        representative_env: &str,
-    ) {
-        for call in calls {
-            let result = results
-                .get(&call.id)
-                .and_then(|by_env| by_env.get(representative_env))
-                .expect("representative result must exist")
-                .clone();
-            messages.push(Message::tool(result, call.id.clone()));
         }
     }
 

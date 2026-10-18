@@ -65,7 +65,6 @@ fn config(prompt: &str, envs: &[&str]) -> LoopConfig<String> {
         vec![status()],
     )
     .with_subagents(definitions())
-    .with_recording()
 }
 fn model(r: &LlmRequest<String>, parent_calls: &[ToolCall]) -> LlmCompletion<String> {
     let prompt = &r.messages[0].content;
@@ -289,7 +288,7 @@ fn multiple_tools_changed_parent_reuses_children_and_exposes_persistable_provena
         !loaded
             .lock()
             .unwrap()
-            .contains(&old.history.as_ref().unwrap().descriptor.root)
+            .contains(&old.history.descriptor.root)
     );
     assert!(
         second
@@ -307,7 +306,7 @@ fn multiple_tools_changed_parent_reuses_children_and_exposes_persistable_provena
     );
     assert_eq!(second.result.results["tomorrow"], old.results["old"]);
     assert_eq!(queries.lock().unwrap().len(), 2);
-    let parent = second.result.history.as_ref().unwrap();
+    let parent = &second.result.history;
     for u in &second.result.child_histories {
         let key = u.history.descriptor.prompt.clone();
         assert_eq!(u.base.as_ref(), selected.get(&key));
@@ -338,7 +337,7 @@ fn multiple_tools_changed_parent_reuses_children_and_exposes_persistable_provena
         0,
     );
     assert!(replay.llms.is_empty());
-    for entry in &replay.result.history.unwrap().root().subagents {
+    for entry in &replay.result.history.root().subagents {
         assert_eq!(entry.runs.len(), 2);
         assert_eq!(
             entry.runs[0].history,
@@ -614,7 +613,7 @@ fn incompatible_resolver_results_and_malformed_args_leave_fresh_requests_recover
     let mut wrong_prompt = descriptor.clone();
     wrong_prompt.prompt = "other".into();
     let mut wrong_nested = descriptor.clone();
-    wrong_nested.subagents = old.history.as_ref().unwrap().descriptor.subagents.clone();
+    wrong_nested.subagents = old.history.descriptor.subagents.clone();
     let mut wrong_tools = descriptor.clone();
     wrong_tools.tools.clear();
     for bad in [wrong_prompt, wrong_nested, wrong_tools] {
@@ -686,7 +685,6 @@ fn incompatible_resolver_results_and_malformed_args_leave_fresh_requests_recover
             .result()
             .unwrap()
             .history
-            .unwrap()
             .root()
             .assistant
             .as_ref()
@@ -784,14 +782,18 @@ fn registration_legacy_advertisements_and_all_serial_driver_entries() {
         )
         .is_ok()
     );
-    assert!(matches!(
+    assert!(
         BatchLoop::new(
             base()
-                .with_subagents(vec![imports.clone().with_recording()])
+                .with_subagents(vec![imports.clone()])
                 .with_budget(Budget::new(100, |_| "stop".into()))
-        ),
-        Err(LoopError::UnsupportedHistory)
-    ));
+        )
+        .unwrap()
+        .agent()
+        .root()
+        .assistant
+        .is_none()
+    );
     let mut legacy_config = base().with_subagent(imports.clone());
     legacy_config.tool_specs = vec![imports.spec.clone()];
     let mut legacy = BatchLoop::new(legacy_config).unwrap();
@@ -805,8 +807,8 @@ fn registration_legacy_advertisements_and_all_serial_driver_entries() {
         vec!["e".into()],
         move |_| {
             vec![
-                ToolEntry::Subagent(i.clone().with_recording()),
-                ToolEntry::Subagent(metrics.clone().with_recording()),
+                ToolEntry::Subagent(i.clone()),
+                ToolEntry::Subagent(metrics.clone()),
                 ToolEntry::Callable(Arc::new(FunctionTool::new(read(), |_| "value".to_owned()))),
             ]
         },
@@ -815,7 +817,7 @@ fn registration_legacy_advertisements_and_all_serial_driver_entries() {
     )
     .unwrap();
     assert_eq!(result.results["e"], "imports:done|metrics:done");
-    assert!(result.history.is_none());
+    assert_eq!(result.agent().root().subagents.len(), 2);
     assert_eq!(result.child_histories.len(), 2);
     assert!(result.child_histories.iter().all(|u| {
         serde_json::to_value(&u.history.descriptor)
@@ -1041,7 +1043,7 @@ fn selected_feedback_revision_is_reused_without_automatically_updating_old_paren
             }
         }
     }
-    let improved = feedback.result().unwrap().history.unwrap();
+    let improved = feedback.result().unwrap().history;
     let backend = Backend::default();
     let selected = publish(&improved, &backend);
     let lookup = selected.clone();
@@ -1063,7 +1065,7 @@ fn selected_feedback_revision_is_reused_without_automatically_updating_old_paren
     assert_eq!(new.results["new"], "improved imports");
     assert_eq!(new.child_histories[0].base.as_ref(), Some(&selected));
     let before = *queries.lock().unwrap();
-    let mut c = config("parent-A", &["new"]).with_replay(old.history.clone().unwrap());
+    let mut c = config("parent-A", &["new"]).with_replay(old.history.clone());
     c.history_resolver = Some(resolver);
     let replay = drive(
         BatchLoop::new(c).unwrap(),
@@ -1074,11 +1076,11 @@ fn selected_feedback_revision_is_reused_without_automatically_updating_old_paren
     assert!(replay.llms.is_empty());
     assert_eq!(replay.result.results["new"], "imports:done");
     assert_eq!(*queries.lock().unwrap(), before);
-    let history = replay.result.history.unwrap();
+    let history = replay.result.history;
     assert_eq!(history.root().subagents[0].runs.len(), 2);
     assert_eq!(
         history.root().subagents[0].runs[0].history,
-        old.history.unwrap().root().subagents[0].history
+        old.history.root().subagents[0].history
     );
 }
 
@@ -1090,7 +1092,6 @@ fn opaque_byte_prompts_are_verified_by_value_not_lookup_keys() {
         |_| vec![],
         1,
     )
-    .with_recording()
     .with_subagents(vec![]);
     let mut first = BatchLoop::new(
         LoopConfig::new(b"parent-A".to_vec(), vec!["e".into()], vec![])

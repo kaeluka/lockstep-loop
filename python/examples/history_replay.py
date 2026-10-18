@@ -19,7 +19,6 @@ def investigate(env: str, observation: str, agent: Agent[str] | None = None):
         prompt="Read the revision's status.",
         env_ids=[env],
         tool_specs=[ToolSpec("status", "Read status without changing it.", {})],
-        recording=True,
         agent=agent,
     )
     llm_calls = 0
@@ -44,7 +43,6 @@ def investigate(env: str, observation: str, agent: Agent[str] | None = None):
                 )
             )
     result = loop.result()
-    assert result.agent is not None
     return result.agent, llm_calls, result.results[env]
 
 

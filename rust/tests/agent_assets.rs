@@ -1,9 +1,9 @@
 use lockstep_loop::{
-    Agent, AgentDescriptor, AgentOptions, AgentQuery, AgentResolver, BatchLoop, ChildAgentRun,
-    ChildAgentUpdate, ChildHistoryRun, ChildHistoryUpdate, Completion, EnvObservation, History,
-    HistoryDescriptor, HistoryNode, HistoryOptions, HistoryQuery, HistoryResolver, LlmCompletion,
-    LoopConfig, Message, NodeRef, Observation, OutputRecord, RecordStore, Request, RequestKind,
-    Role, SubagentHistory, SubagentRecord, SubagentTool, ToolCall, ToolCompletion, ToolSpec,
+    Agent, AgentDescriptor, AgentQuery, AgentResolver, BatchLoop, ChildAgentRun, ChildAgentUpdate,
+    ChildHistoryRun, ChildHistoryUpdate, Completion, EnvObservation, History, HistoryDescriptor,
+    HistoryNode, HistoryQuery, HistoryResolver, LlmCompletion, LoopConfig, Message, NodeRef,
+    Observation, OutputRecord, RecordStore, Request, RequestKind, Role, SubagentHistory,
+    SubagentRecord, SubagentTool, ToolCall, ToolCompletion, ToolSpec,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -21,8 +21,8 @@ fn config(envs: &[&str]) -> LoopConfig<String> {
     )
 }
 fn record() -> (Agent<String>, Agent<String>, Agent<String>) {
-    let mut loop_ = BatchLoop::new(config(&["A", "B", "D"]).with_recording()).unwrap();
-    let empty = loop_.agent().unwrap();
+    let mut loop_ = BatchLoop::new(config(&["A", "B", "D"])).unwrap();
+    let empty = loop_.agent();
     let initial = empty.assets().next().unwrap();
     assert!(!initial.is_complete() && !initial.has_value());
     assert_eq!(initial.value(), None);
@@ -36,7 +36,7 @@ fn record() -> (Agent<String>, Agent<String>, Agent<String>) {
             tool_calls: vec![ToolCall::new("r", "read", json!({"path": "/entry"}))],
         }))
         .unwrap();
-    let pending = loop_.agent().unwrap();
+    let pending = loop_.agent();
     let asset = pending.assets().next().unwrap();
     assert!(!asset.is_complete() && !asset.has_value());
     assert_eq!(asset.env_ids(), ["A", "B", "D"]);
@@ -55,7 +55,7 @@ fn record() -> (Agent<String>, Agent<String>, Agent<String>) {
             ],
         }))
         .unwrap();
-    let opened = loop_.agent().unwrap();
+    let opened = loop_.agent();
     assert_eq!(
         opened.assets().map(|a| a.env_ids()).collect::<Vec<_>>(),
         [vec!["A", "B"], vec!["D"]]
@@ -71,10 +71,10 @@ fn record() -> (Agent<String>, Agent<String>, Agent<String>) {
             .unwrap();
     }
     let result = loop_.result().unwrap();
-    assert_eq!(result.agent(), result.history.as_ref());
+    assert_eq!(result.agent(), &result.history);
     assert_eq!(loop_.agent(), loop_.history());
     assert_eq!(result.child_agents(), result.child_histories);
-    (result.history.unwrap(), empty, opened)
+    (result.history, empty, opened)
 }
 
 #[test]
@@ -127,7 +127,7 @@ fn feedback_moves_the_leaf_without_mutating_old_assets_or_overwriting_values() {
             results: vec![("A".into(), "shared".into())],
         }))
         .unwrap();
-    let pending_agent = loop_.agent().unwrap();
+    let pending_agent = loop_.agent();
     let pending = pending_agent.assets().next().unwrap();
     assert_eq!(pending.env_ids(), ["A", "B"]);
     assert!(!pending.is_complete() && pending.has_value());
@@ -146,7 +146,7 @@ fn feedback_moves_the_leaf_without_mutating_old_assets_or_overwriting_values() {
             "no issues".into(),
         )))
         .unwrap();
-    let current = loop_.result().unwrap().history.unwrap();
+    let current = loop_.result().unwrap().history;
     let revised = current.assets().next().unwrap();
     assert!(revised.is_complete());
     assert_eq!(revised.value(), old_asset.value());
@@ -174,8 +174,7 @@ fn asset_views_retain_lossy_evidence_and_real_null_publications() {
         Some("inspect".to_owned()),
         vec!["A".into(), "B".into()],
         vec![spec()],
-    )
-    .with_recording();
+    );
     let mut loop_ = BatchLoop::with_comparison_key(config, |p: &Option<String>| {
         p.as_deref().unwrap_or_default().trim().to_owned()
     })
@@ -205,7 +204,7 @@ fn asset_views_retain_lossy_evidence_and_real_null_publications() {
             None,
         )))
         .unwrap();
-    let agent = loop_.agent().unwrap();
+    let agent = loop_.agent();
     let asset = agent.assets().next().unwrap();
     assert!(asset.is_complete() && asset.has_value());
     assert_eq!(asset.value(), Some(&None));
@@ -288,10 +287,6 @@ fn public_aliases_preserve_types_and_serde_records() {
     assert_eq!(
         type_name::<AgentResolver<String>>(),
         type_name::<HistoryResolver<String>>()
-    );
-    assert_eq!(
-        type_name::<AgentOptions<String>>(),
-        type_name::<HistoryOptions<String>>()
     );
     assert_eq!(
         type_name::<SubagentRecord<String>>(),

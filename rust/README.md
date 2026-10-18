@@ -92,12 +92,11 @@ the caller can produce a valid value of the opaque payload type.
 
 ## Recording and replay
 
-Opt into recording through `LoopConfig::with_recording()`. Restore a
-snapshot with `with_agent(agent)` (`with_replay` remains an alias);
-constructors still use
-`BatchLoop::new` (exact equality) or `BatchLoop::with_comparison_key` (explicit lossy
-policy). Existing loops without these options behave as before. Constructor-based
-callers remain supported. Public configuration/result fields keep compatibility
+Every loop and convenience driver records an immutable Agent, including children.
+Restore a snapshot with `with_agent(agent)` (`with_replay` remains an alias).
+Constructors use `BatchLoop::new` (exact equality) or
+`BatchLoop::with_comparison_key` (explicit lossy policy).
+Public configuration/result fields keep compatibility
 spellings (`history`, `history_resolver`, `child_histories`); prefer the canonical
 builders and `agent()` / `child_agents()` getters. No duplicate state is stored.
 Legacy `group_key` labels retain debug
@@ -106,14 +105,13 @@ the result's `Vec`; internal branch IDs remain collision-free.
 
 ```rust
 let config = LoopConfig::new(prompt.clone(), vec!["revision-1".into()], specs.clone())
-    .with_recording()
     .with_record_store(RecordStore::new("caller-reserved-writer-namespace"));
 let mut loop_ = BatchLoop::new(config)?;
 // Serve normal requests/completions.
-let snapshot = loop_.agent().unwrap(); // immutable agent, including active children
+let snapshot = loop_.agent(); // immutable agent, including active children
 // After completion, loop_.result()?.into_agent() moves out the updated agent.
 let replay_config = LoopConfig::new(prompt, vec!["revision-2".into()], specs)
-    .with_agent(snapshot); // implies replay + recording
+    .with_agent(snapshot); // replay prior reasoning
 let mut replay = BatchLoop::new(replay_config)?;
 ```
 
@@ -211,7 +209,7 @@ Discard the live loop after an arbitrary callback panic. See the
 ### Inspecting assets
 
 ```rust
-let agent = result.agent().unwrap();
+let agent = result.agent();
 for asset in agent.assets() {
     println!("{:?}: complete={}", asset.env_ids(), asset.is_complete());
     if let Some(value) = asset.value() { println!("{value:?}"); }
@@ -255,7 +253,6 @@ let study_design = SubagentTool::try_new(
 
 let config = LoopConfig::new(parent_prompt, env_ids, ordinary_parent_specs)
     .with_subagents(vec![study_design, other_specialist])
-    .with_recording()
     .with_record_store(RecordStore::with_loader(fresh_writer_namespace, load_node))
     .with_agent_resolver(move |query| {
         Ok(selected.get(&query.prompt).cloned()) // fixed configuration in this sketch
@@ -285,10 +282,8 @@ only child prompt, ordered tools and nested configuration, never
 parent identity, invocation/call IDs or env membership. It requires `P: PartialEq`,
 like `with_agent`, for full compatibility checks. Return None for a miss; return a
 chosen descriptor for a hit. Index hashes or abbreviated keys never replace core
-equality checks. No child key is required. A recorded parent or resolver enables
-child recording; otherwise `SubagentTool::with_recording()` optionally records
-standalone children. This switch is not structural identity. Fresh roots still
-require `LoopConfig::with_recording()`; an Agent implies replay plus recording.
+equality checks. No child key is required. Every parent and child records an
+immutable Agent; supplying a prior Agent enables replay.
 Child grouping is inherited; external provider/grouping policy isolation belongs
 to the caller, not a core version field.
 
@@ -336,8 +331,8 @@ Use `try_new` for fallible prompt/spec factories. On a fresh LLM completion,
 `HistoryResolution`) and incompatible selected descriptors leave the request
 correctable without partial spawning. Replay-time preparation errors are terminal;
 arbitrary callback panics remain unrecovered. No factories are rerun at commit.
-Budgets remain unsupported wherever child recording is enabled. No environment
-binding/remapping, new system-role API, logical asset registry or scheduler is added.
+No environment binding/remapping, new system-role API, logical asset registry
+or scheduler is added.
 
 **API/schema migration:** manual contract arguments, fields and builders are removed,
 not renamed. Record type aliases and provenance `history` fields remain. Old
@@ -408,12 +403,20 @@ constructor feedback is the strict resolution/resumption operation.
 Use transferable instructions (“check whether X”) rather than unqualified
 subject-specific assertions, or keep a separate snapshot. No rewriting, semantic
 classification, alternate scope modes or environment binding is implemented.
-Budgets remain unsupported for recorded execution, before and after injection.
+Budget exhaustion during strict resolution fails without appending feedback;
+the new continuation uses the remaining step allowance.
 “Once” is per live operation, not crash-safe exactly-once publication.
 
-**Limits:** recording still rejects budgets; root agent recording/replay requires
-direct `BatchLoop`. Serial drivers can expose recorded child-agent updates.
-No core storage I/O, async loader, eviction/GC, or independent-root merge.
+**Budgets:** fresh and replayed assistant turns count toward the per-branch limit.
+Exhaustion returns the caller's fallback in `results`, never a fabricated assistant
+message. The Agent retains the real checkpoint (open on a fresh path), so later
+replay with a larger or no budget can resume it. Smaller replay budgets stop before
+the next stored turn without truncating old history. Child fallbacks become actual
+parent tool observations, while the child Agent stays at its real checkpoint.
+
+**Limits:** use direct `BatchLoop` for replay and resolver-driven serving;
+convenience drivers expose root and child Agents. No core storage I/O, async
+loader, eviction/GC, or independent-root merge.
 Stores retain local writes/cached loads; deep path copying can have quadratic
 write volume. Pending requests/partial tuples are not persisted, so tools restart
 on replay: this is not in-flight crash recovery. Invalid completions remain

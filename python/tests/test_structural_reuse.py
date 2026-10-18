@@ -1,7 +1,6 @@
 """Reuse depends on observations/configuration, never implementation/version labels."""
 
 import pickle
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -47,7 +46,7 @@ def config(**options):
 
 
 def test_changed_tool_implementation_same_output_reuses_different_output_branches():
-    original, count = drive(config(recording=True), lambda _: "same")
+    original, count = drive(config(), lambda _: "same")
     assert count == 2
     old = original.agent
     # Different executor implementation, identical tool specs and observations.
@@ -64,7 +63,7 @@ def test_changed_tool_implementation_same_output_reuses_different_output_branche
 
 
 def test_provider_and_custom_grouping_policy_are_external_not_inferred():
-    old, _ = drive(config(recording=True, comparison_key=str.strip), lambda _: "same ")
+    old, _ = drive(config(comparison_key=str.strip), lambda _: "same ")
 
     def changed_provider(_):
         raise AssertionError("external provider change does not invalidate recorded turns")
@@ -129,7 +128,7 @@ def test_legacy_pickle_labels_are_discarded_even_in_child_cache_identity():
         assert r.messages[0].content == parent  # no child LLM request
         assert r.messages[-1].content == b"child answer"
         loop.complete(LlmCompletion(r.request_id, b"done"))
-        assert loop.agent is None  # resolver does not opt the root into recording
+        assert len(loop.agent.root.subagents) == 1
         assert loop.result().child_agents[0].base == selected
     assert queries[0] == queries[1]
     assert Agent(root, store).prompt == root.prompt
@@ -139,7 +138,7 @@ def test_legacy_pickle_labels_are_discarded_even_in_child_cache_identity():
 def test_default_and_custom_identity_reuse_each_other(initial_custom):
     identity = lambda value: value  # noqa: E731
     old, _ = drive(
-        config(recording=True, comparison_key=identity if initial_custom else None),
+        config(comparison_key=identity if initial_custom else None),
         lambda _: "same",
     )
     before = old.agent.root
@@ -155,7 +154,7 @@ def test_default_and_custom_identity_reuse_each_other(initial_custom):
 
 @pytest.mark.parametrize("strict", [None, lambda value: value])
 def test_stricter_keys_match_representatives_not_old_evidence(strict):
-    old, _ = drive(config(recording=True, comparison_key=str.strip), lambda _: "same ")
+    old, _ = drive(config(comparison_key=str.strip), lambda _: "same ")
     grouped, count = drive(config(agent=old.agent, comparison_key=str.strip), lambda _: "same")
     assert count == 0
     before = grouped.agent.root
@@ -174,7 +173,7 @@ def test_stricter_keys_match_representatives_not_old_evidence(strict):
 
 
 def test_coarser_keys_choose_first_existing_edge_without_merging_history():
-    first, _ = drive(config(recording=True), lambda _: "A", lambda _: "first")
+    first, _ = drive(config(), lambda _: "A", lambda _: "first")
     old, count = drive(config(agent=first.agent), lambda _: "a", lambda _: "second")
     assert count == 1
     before = old.agent.root
@@ -233,27 +232,21 @@ def test_child_query_and_execution_do_not_distinguish_default_from_custom_identi
     assert queries[0] == queries[1] == queries[2]
 
 
-def test_recording_switch_not_structural_identity_and_legacy_budget_stays_available():
+def test_child_structural_identity_and_fresh_budget():
     tool = SubagentTool("child", "", {}, lambda _: "child", lambda _: (), subagents=())
-    loop = BatchLoop(prompt="p", env_ids=["e"], tool_specs=[], subagents=[tool], recording=True)
+    loop = BatchLoop(prompt="p", env_ids=["e"], tool_specs=[], subagents=[tool])
     r = loop.next_request()
     loop.complete(LlmCompletion(r.request_id, "done"))
-    # Toggling child recording does not change the replay compatibility header.
     replay = BatchLoop(
         prompt="p",
         env_ids=["e"],
         tool_specs=[],
-        subagents=[replace(tool, recording=True)],
+        subagents=[tool],
         agent=loop.agent,
     )
     assert replay.done
-    legacy = BatchLoop(prompt="p", env_ids=["e"], tool_specs=[], subagents=[tool], budget=Budget(1))
-    assert legacy.agent is None
-    with pytest.raises(ValueError, match="budgets"):
-        BatchLoop(
-            prompt="p",
-            env_ids=["e"],
-            tool_specs=[],
-            subagents=[replace(tool, recording=True)],
-            budget=Budget(1),
-        )
+    fresh = BatchLoop(prompt="p", env_ids=["e"], tool_specs=[], subagents=[tool], budget=Budget(1))
+    assert fresh.agent.root.assistant is None
+    request = fresh.next_request()
+    fresh.complete(LlmCompletion(request.request_id, "done"))
+    assert fresh.result().agent.root.assistant.content == "done"

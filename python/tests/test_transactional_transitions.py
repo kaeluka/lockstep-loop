@@ -24,13 +24,12 @@ from lockstep_loop import (
 SPECS = (ToolSpec("probe", "", {}), ToolSpec("investigate", "", {}))
 
 
-def make_loop(sub, *, recording=True, history=None, env="old"):
+def make_loop(sub, *, history=None, env="old"):
     return BatchLoop(
         prompt="parent",
         env_ids=[env],
         tool_specs=SPECS,
         subagent=sub,
-        recording=recording,
         history=history,
     )
 
@@ -109,11 +108,10 @@ def persisted(history):
     )
 
 
-@pytest.mark.parametrize("recording", [False, True])
 @pytest.mark.parametrize("failure", ["prompt", "specs"])
 @pytest.mark.parametrize("corrected_tools", [False, True])
 def test_failed_mixed_turn_is_unfulfilled_and_retry_agrees_with_replay(
-    recording, failure, corrected_tools
+    failure, corrected_tools
 ):
     prompts, specs = [], []
 
@@ -128,17 +126,16 @@ def test_failed_mixed_turn_is_unfulfilled_and_retry_agrees_with_replay(
             raise RuntimeError("spec iterator failed after yielding")
 
     sub = SubagentTool("investigate", "", {}, build, tool_specs)
-    loop = make_loop(sub, recording=recording)
+    loop = make_loop(sub)
     request = loop.next_request()
     before = state(loop)
     bad_args = {} if failure == "prompt" else {"required": "bad"}
     with pytest.raises(KeyError if failure == "prompt" else RuntimeError):
         loop.complete(LlmCompletion(request.request_id, "bad", mixed(bad_args)))
     assert state(loop) == before
-    if recording:
-        # Preparation may allocate orphan OPEN child nodes, but must not even
-        # create a recorded assistant fact for the unvalidated "bad" turn.
-        assert all(node.assistant is None for node in loop.history.store.records().values())
+    # Preparation may allocate orphan OPEN child nodes, but must not even
+    # create a recorded assistant fact for the unvalidated "bad" turn.
+    assert all(node.assistant is None for node in loop.history.store.records().values())
     assert loop.next_request() is None
     assert not loop.done and loop.outstanding_llm == 1
     assert prompts == [{"required": "good"}, bad_args]
@@ -152,12 +149,11 @@ def test_failed_mixed_turn_is_unfulfilled_and_retry_agrees_with_replay(
     result = serve(loop)
     assert result.results == {"old": expected}
     assert loop._partition[0].steps == (2 if corrected_tools else 1)
-    if recording:
-        assert before[0].root.assistant is None
-        assert result.history.root.assistant.content == "corrected"
-        assert result.history.root.assistant.tool_calls == calls
-        replay = make_loop(sub, history=persisted(result.history), env="new")
-        assert serve(replay, replay=True).results == {"new": expected}
+    assert before[0].root.assistant is None
+    assert result.history.root.assistant.content == "corrected"
+    assert result.history.root.assistant.tool_calls == calls
+    replay = make_loop(sub, history=persisted(result.history), env="new")
+    assert serve(replay, replay=True).results == {"new": expected}
 
 
 def test_failed_child_preparation_after_feedback_does_not_reinject_or_poison_history():
@@ -170,7 +166,6 @@ def test_failed_child_preparation_after_feedback_does_not_reinject_or_poison_his
         env_ids=["old"],
         tool_specs=SPECS,
         subagent=sub,
-        recording=True,
         history=original.history,
         feedback=Feedback("check again"),
     )
@@ -223,14 +218,13 @@ def test_staged_commit_preserves_the_serving_lock_and_concurrent_routes():
     }
 
 
-@pytest.mark.parametrize("recording", [False, True])
 @pytest.mark.parametrize("error_type", [FeedbackResolutionError, InvalidHistoryError])
-def test_callback_exception_type_alone_does_not_commit_a_terminal_failure(recording, error_type):
+def test_callback_exception_type_alone_does_not_commit_a_terminal_failure(error_type):
     def build(_):
         raise error_type("caller callback, not a detected loop failure")
 
     sub = SubagentTool("investigate", "", {}, build, lambda _: SPECS)
-    loop = make_loop(sub, recording=recording)
+    loop = make_loop(sub)
     request = loop.next_request()
     before = state(loop)
     with pytest.raises(error_type):
@@ -241,10 +235,9 @@ def test_callback_exception_type_alone_does_not_commit_a_terminal_failure(record
     assert loop.done and loop.result().results == {"old": "corrected"}
 
 
-@pytest.mark.parametrize("recording", [False, True])
-def test_callback_failure_in_nested_completion_preserves_parent_routes(recording):
+def test_callback_failure_in_nested_completion_preserves_parent_routes():
     sub = SubagentTool("investigate", "", {}, lambda a: a["required"], lambda _: SPECS, 2)
-    loop = make_loop(sub, recording=recording)
+    loop = make_loop(sub)
     parent = loop.next_request()
     loop.complete(
         LlmCompletion(
@@ -262,11 +255,10 @@ def test_callback_failure_in_nested_completion_preserves_parent_routes(recording
     loop.complete(LlmCompletion(child.request_id, "corrected child"))
     result = serve(loop)
     assert result.results == {"old": "corrected child"}
-    if recording:
-        entry = result.history.root.subagents[0]
-        assert result.history.load(entry.history.root).assistant.content == "corrected child"
-        replay = make_loop(sub, history=result.history, env="new")
-        assert serve(replay, replay=True).results == {"new": "corrected child"}
+    entry = result.history.root.subagents[0]
+    assert result.history.load(entry.history.root).assistant.content == "corrected child"
+    replay = make_loop(sub, history=result.history, env="new")
+    assert serve(replay, replay=True).results == {"new": "corrected child"}
 
 
 def test_parent_callback_failure_after_child_completion_restores_child_pending_route():

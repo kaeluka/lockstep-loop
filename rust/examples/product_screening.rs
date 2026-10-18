@@ -60,7 +60,7 @@ fn screen(
     config = if let Some(previous) = agent {
         config.with_agent(previous)
     } else {
-        config.with_recording()
+        config
     };
     // Default record namespaces suffice for this single-process, in-memory demo.
     // Durable callers reserve namespaces and persist records as in history_replay.rs.
@@ -105,7 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
     )?;
     assert_eq!((llms, reads, initial.classes.len()), (3, 3, 2));
-    let old = initial.agent().unwrap().clone();
+    let old = initial.agent().clone();
     println!(
         "Initial: {llms} LLM calls, {reads} tool executions, {} classes",
         initial.classes.len()
@@ -121,14 +121,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (changed, llms, reads) = screen(
         BTreeMap::from([("product-a/v2".into(), ratings("IP65", 0, 50))]),
-        matching.into_agent(),
+        Some(matching.into_agent()),
     )?;
     assert_eq!((llms, reads), (1, 1));
     assert_eq!(
         changed.results["product-a/v2"],
         "does not meet toy requirements"
     );
-    let extended = changed.agent().unwrap();
+    let extended = changed.agent();
     assert_eq!(old.assets().count(), 2);
     assert_eq!(extended.assets().count(), 3);
     println!("Revised specifications: {llms} LLM call, {reads} tool execution");

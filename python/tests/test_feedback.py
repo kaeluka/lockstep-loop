@@ -32,7 +32,6 @@ def loop_for(envs, history=None, feedback=None, **options):
         prompt=PROMPT,
         env_ids=envs,
         tool_specs=SPECS,
-        recording=True,
         history=history,
         feedback=feedback,
         **options,
@@ -323,7 +322,7 @@ def test_partial_paths_and_unfinished_feedback_are_not_targets():
 
 def test_opaque_null_feedback_presence_and_constructor_limits():
     initial_loop = BatchLoop(
-        prompt=b"prompt", env_ids=["A"], tool_specs=[], recording=True
+        prompt=b"prompt", env_ids=["A"], tool_specs=[]
     )
     request = initial_loop.next_request()
     initial_loop.complete(LlmCompletion(request.request_id, b"same"))
@@ -348,11 +347,15 @@ def test_opaque_null_feedback_presence_and_constructor_limits():
     )
     assert replay.done and replay.result().results == {"C": b"same"}
     assert not old.root.user_continuations
+    bounded = BatchLoop(
+        prompt=b"prompt", env_ids=["A"], tool_specs=[], history=old,
+        feedback=Feedback(None), budget=Budget(100),
+    )
+    assert isinstance(bounded.next_request(), LlmRequest)
     for options in (
         {"history": None},
         {"env_ids": ["A", "B"]},
         {"prompt": b"changed"},
-        {"budget": Budget(100)},
     ):
         config = dict(
             prompt=b"prompt",
@@ -420,7 +423,6 @@ def nested_loop(history=None, feedback=None):
         env_ids=["A"],
         tool_specs=specs,
         subagent=SubagentTool("investigate", "", {}, lambda a: a["prompt"], lambda _: specs, 1),
-        recording=True,
         history=history,
         feedback=feedback,
     )
