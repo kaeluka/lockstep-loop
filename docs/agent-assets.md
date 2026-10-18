@@ -112,7 +112,7 @@ Legacy constructors, fields and methods remain usable where listed.
 | Rust `with_recording(label)` | `with_recording()` | Fresh-root opt-in, no version. |
 | Rust `with_agent(agent, label)` / `with_replay(agent, label)` | `with_agent(agent)` / `with_replay(agent)` | Supplying an Agent implies replay and recording. |
 | Descriptor/query/options `contract`, `Agent.contract` / `contract()` | Removed | Query identity is structural; no replacement namespace. |
-| Descriptor/query `custom_grouping` | Removed | No mode or function identity gate. Current `group_by` compares fresh outputs and historical representatives. |
+| Descriptor/query `custom_grouping` | Removed | No mode or function identity gate. Current `comparison_key` compares fresh outputs and historical representatives. |
 
 `Agent.prompt` / `prompt()` exposes the descriptor prompt. `SubagentContract` retains
 its class name for compatibility but contains only spec, depth and nested allowlist.

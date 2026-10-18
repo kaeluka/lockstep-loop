@@ -176,7 +176,7 @@ fn asset_views_retain_lossy_evidence_and_real_null_publications() {
         vec![spec()],
     )
     .with_recording();
-    let mut loop_ = BatchLoop::with_group_by(config, |p: &Option<String>| {
+    let mut loop_ = BatchLoop::with_comparison_key(config, |p: &Option<String>| {
         p.as_deref().unwrap_or_default().trim().to_owned()
     })
     .unwrap();
@@ -411,7 +411,8 @@ fn pre_rename_fixture_loads_inspects_replays_and_omits_legacy_labels() {
     )
     .with_agent(agent.clone())
     .with_subagents(vec![sub.clone()]);
-    let mut replay = BatchLoop::with_group_by(config, |s: &String| s.trim().to_owned()).unwrap();
+    let mut replay =
+        BatchLoop::with_comparison_key(config, |s: &String| s.trim().to_owned()).unwrap();
     let request = replay.next_request(RequestKind::Any).unwrap();
     assert!(matches!(request, Request::Tool(_)));
     replay
@@ -445,7 +446,7 @@ fn pre_rename_fixture_loads_inspects_replays_and_omits_legacy_labels() {
         .with_record_store(agent.store.clone())
         .with_agent_resolver(move |_| Ok(Some(selected.clone())));
     let mut new_parent =
-        BatchLoop::with_group_by(config, |s: &String| s.trim().to_owned()).unwrap();
+        BatchLoop::with_comparison_key(config, |s: &String| s.trim().to_owned()).unwrap();
     let request = new_parent.next_request(RequestKind::Any).unwrap();
     new_parent
         .complete(Completion::Llm(LlmCompletion {

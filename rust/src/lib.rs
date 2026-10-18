@@ -33,7 +33,7 @@ use thiserror::Error;
 type BudgetFallback<P> = dyn Fn(usize) -> P + Send + Sync;
 type PromptBuilder<P> = dyn Fn(&Value) -> Result<P, LoopError> + Send + Sync;
 type SubToolSpecFactory = dyn Fn(&str) -> Result<Vec<ToolSpec>, LoopError> + Send + Sync;
-type GroupFunction<P, K> = dyn Fn(&P) -> K + Send + Sync;
+type ComparisonKeyFunction<P, K> = dyn Fn(&P) -> K + Send + Sync;
 type ToolFunction<P> = dyn Fn(&Value) -> P + Send + Sync;
 
 /// Provider-neutral tool description.
@@ -674,7 +674,7 @@ pub struct BatchLoop<P, K = P> {
     history_resolver: Option<AgentResolver<P>>,
     record_store: Option<RecordStore<P>>,
     unavailable_subagents: HashSet<String>,
-    group_by: Arc<GroupFunction<P, K>>,
+    comparison_key: Arc<ComparisonKeyFunction<P, K>>,
     budget: Option<Budget<P>>,
     id_prefix: String,
 
@@ -719,14 +719,21 @@ where
     P: Clone + 'static,
     K: Eq + Hash + Debug + 'static,
 {
-    /// Construct a loop with a caller-provided lossy grouping key.
-    pub fn with_group_by(
+    /// Construct a loop with a caller-provided comparison key for each raw tool output.
+    ///
+    /// The function is applied both to new outputs for partition grouping and to
+    /// stored representative outputs for replay matching. Equal keys may deliberately
+    /// group unequal payloads. Keys never replace model-visible payloads: replay uses
+    /// the historical representative and recording retains all raw evidence.
+    /// Closure identity is never compared; [`BatchLoop::new`] defaults to identity
+    /// (exact value equality).
+    pub fn with_comparison_key(
         config: LoopConfig<P>,
-        group_by: impl Fn(&P) -> K + Send + Sync + 'static,
+        comparison_key: impl Fn(&P) -> K + Send + Sync + 'static,
     ) -> Result<Self, LoopError> {
         Self::build(
             config,
-            Arc::new(group_by),
+            Arc::new(comparison_key),
             String::new(),
             false,
             HashSet::new(),
@@ -735,7 +742,7 @@ where
 
     fn build(
         config: LoopConfig<P>,
-        group_by: Arc<GroupFunction<P, K>>,
+        comparison_key: Arc<ComparisonKeyFunction<P, K>>,
         id_prefix: String,
         resolve_only: bool,
         mut unavailable_subagents: HashSet<String>,
@@ -856,7 +863,7 @@ where
             history_resolver: config.history_resolver,
             record_store,
             unavailable_subagents,
-            group_by,
+            comparison_key,
             budget: config.budget,
             id_prefix,
             seq: 0,
@@ -1543,7 +1550,7 @@ where
         // opaque provider IDs, and is published only after all children prepare.
         let child = Self::build(
             config,
-            Arc::clone(&self.group_by),
+            Arc::clone(&self.comparison_key),
             format!("{}{child_key}", self.id_prefix),
             self.resolve_only,
             unavailable,
@@ -1569,7 +1576,7 @@ where
                         .get(&call.id)
                         .and_then(|results| results.get(env))
                         .expect("every call must have one result per env");
-                    (self.group_by)(result)
+                    (self.comparison_key)(result)
                 })
                 .collect::<Vec<_>>();
             groups.entry(key).or_default().push(env.clone());
@@ -1600,7 +1607,7 @@ where
                     let old_key: Vec<K> = edge
                         .representative
                         .iter()
-                        .map(|o| (self.group_by)(&o.tool_output))
+                        .map(|o| (self.comparison_key)(&o.tool_output))
                         .collect();
                     old_key == key
                 });
@@ -1792,13 +1799,14 @@ where
     run_to_completion_inner(prompt, env_ids, tools, complete_llm, Clone::clone, budget)
 }
 
-/// Synchronous convenience driver with a caller-provided grouping key.
-pub fn run_to_completion_by<P, K, TF, LF, G>(
+/// Synchronous convenience driver with a caller-provided comparison key.
+/// See [`BatchLoop::with_comparison_key`] for key and payload semantics.
+pub fn run_to_completion_by<P, K, TF, LF, CK>(
     prompt: P,
     env_ids: Vec<String>,
     tools: TF,
     complete_llm: LF,
-    group_by: G,
+    comparison_key: CK,
     budget: Option<Budget<P>>,
 ) -> Result<BatchResult<P>, LoopError>
 where
@@ -1806,17 +1814,17 @@ where
     K: Eq + Hash + Debug + 'static,
     TF: Fn(&str) -> Vec<ToolEntry<P>>,
     LF: FnMut(&LlmRequest<P>) -> LlmCompletion<P>,
-    G: Fn(&P) -> K + Send + Sync + 'static,
+    CK: Fn(&P) -> K + Send + Sync + 'static,
 {
-    run_to_completion_inner(prompt, env_ids, tools, complete_llm, group_by, budget)
+    run_to_completion_inner(prompt, env_ids, tools, complete_llm, comparison_key, budget)
 }
 
-fn run_to_completion_inner<P, K, TF, LF, G>(
+fn run_to_completion_inner<P, K, TF, LF, CK>(
     prompt: P,
     env_ids: Vec<String>,
     tools: TF,
     mut complete_llm: LF,
-    group_by: G,
+    comparison_key: CK,
     budget: Option<Budget<P>>,
 ) -> Result<BatchResult<P>, LoopError>
 where
@@ -1824,7 +1832,7 @@ where
     K: Eq + Hash + Debug + 'static,
     TF: Fn(&str) -> Vec<ToolEntry<P>>,
     LF: FnMut(&LlmRequest<P>) -> LlmCompletion<P>,
-    G: Fn(&P) -> K + Send + Sync + 'static,
+    CK: Fn(&P) -> K + Send + Sync + 'static,
 {
     if env_ids.is_empty() {
         return Err(LoopError::EmptyEnvIds);
@@ -1852,7 +1860,7 @@ where
     config.budget = budget;
     let mut loop_ = BatchLoop::<P, K>::build(
         config,
-        Arc::new(group_by),
+        Arc::new(comparison_key),
         String::new(),
         false,
         HashSet::new(),

@@ -17,8 +17,8 @@ its full conversation, not just an answer or an environment class. See the
   conversation.
 - When the model makes a tool call, the call is evaluated on **every**
   environment still in the class (SIMD-style fan-out).
-- Results are compared by value equality (optionally canonicalized with a
-  caller-provided `group_by`) and the class is refined — one
+- Results are compared by value equality (or by keys computed with a
+  caller-provided `comparison_key`) and the class is refined — one
   sub-conversation per distinct result. Branches then advance
   independently as their completions arrive.
 - The process repeats per branch until done, yielding a prefix-sharing trie
@@ -95,6 +95,23 @@ while not loop.done:
 # elsewhere, as completions arrive: loop.complete(completion)
 result = loop.result()
 ```
+
+## Comparison keys
+
+`comparison_key` computes a hashable key from each raw tool output. It defaults
+to identity: exact value equality. The same function is applied to **both fresh
+outputs and stored representative outputs**, for partition grouping and replay
+matching. For example, `comparison_key=lambda output: output.strip()` deliberately
+ignores surrounding whitespace when comparing, not when presenting evidence.
+Keys never rewrite model-visible payloads: recorded conversations reuse the original
+representative, and full raw per-environment outputs remain in the evidence.
+Callables/lambdas are never compared by identity. The current function determines
+matches, including when its semantics differ from the recording's function.
+
+**Source-level API break:** the `group_by=` keyword is now `comparison_key=` on
+`BatchLoop`, `run_batch`, and `run_to_completion`; the old keyword is not an alias.
+This rename adds no persisted fields. See the migration notes below for the
+separate removal of manual contract labels and `custom_grouping` metadata.
 
 ## Recording and replay
 
@@ -179,7 +196,7 @@ when those policies change. Payloads, arguments and schemas are **borrowed immut
 mutate nested contents through any alias after handing them to the loop. Convert
 mutable provider objects to stable values or make your own copies first.
 
-Default `group_by` is identity. Neither default/custom mode nor callback identity
+Default `comparison_key` is identity. Neither default/custom mode nor callback identity
 is persisted or compared. The current function compares **both** fresh raw outputs
 and stored representative outputs. Stricter keys can miss despite a match in old
 per-environment evidence; coarser keys can reuse the first matching existing edge

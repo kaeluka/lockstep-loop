@@ -127,9 +127,12 @@ def test_parallel_branches_never_merge_and_do_not_clobber_history():
         assert not llms
 
 
-def test_lossy_grouping_keeps_exact_bytes_and_historical_representative():
-    loop = make_loop(("a", "b"), group_by=bytes.strip)
-    result, _ = drive(loop, {"a": ((b"one ", b"two "),), "b": ((b"one", b"two"),)}, turns=1)
+def test_comparison_key_applies_to_new_outputs_and_stored_representatives():
+    # Tuple keys cannot equal raw bytes: both sides must pass through the callback.
+    loop = make_loop(("a", "b"), comparison_key=lambda value: (value.strip(),))
+    result, llms = drive(loop, {"a": ((b"one ", b"two "),), "b": ((b"one", b"two"),)}, turns=1)
+    assert len(result.classes) == 1
+    assert [m.content for m in llms[-1].messages[-2:]] == [b"one ", b"two "]
     edge = result.history.root.observations[0]
     assert edge.representative[1].tool_output == b"two "
     assert edge.evidence[1].outputs[1].tool_output == b"two"
@@ -139,10 +142,15 @@ def test_lossy_grouping_keeps_exact_bytes_and_historical_representative():
         RecordStore(load=lambda ref: pickle.loads(encoded[ref])),
     )
     replay, requests = drive(
-        make_loop(("c",), restored, group_by=bytes.strip), {"c": ((b"one\n", b"two\n"),)}, turns=1
+        # A fresh lambda with the same semantics must replay; never compare lambda identity.
+        make_loop(("c",), restored, comparison_key=lambda value: (value.strip(),)),
+        {"c": ((b"one\n", b"two\n"),)},
+        turns=1,
     )
     assert not requests
     assert replay.results == {"c": b"two "}
+    assert len(replay.history.root.observations) == 1
+    assert len(edge.evidence) == 2  # replay leaves the old snapshot unchanged
     assert replay.history.root.observations[0].evidence[-1].outputs[1].tool_output == b"two\n"
     assert restored == result.history
 
@@ -252,12 +260,12 @@ def test_reverse_branch_completions_keep_siblings_and_never_merge():
 
 
 def test_grouping_callback_failure_is_recoverable_after_partial_tool_completion():
-    def grouping(value):
+    def comparison_key(value):
         if value == "invalid":
             raise ValueError("cannot group")
         return value
 
-    loop = make_loop(group_by=grouping)
+    loop = make_loop(comparison_key=comparison_key)
     request = loop.next_request()
     loop.complete(
         LlmCompletion(

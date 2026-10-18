@@ -70,9 +70,22 @@ imports, tool setup, and persistence backends.
 ## Payloads and grouping
 
 Conversation content and tool results are generic in `P`. `BatchLoop::new`
-groups results by value equality; `BatchLoop::with_group_by` accepts a custom
-key function for deliberate lossy grouping. Tool arguments and JSON schemas
-use `serde_json::Value`.
+groups results by value equality (identity key); `BatchLoop::with_comparison_key`
+accepts a function computing a comparison key from each raw tool output. The same
+function is applied to **both fresh outputs and stored representative outputs**,
+for partition grouping and replay matching. For example,
+`BatchLoop::with_comparison_key(config, |output: &String| output.trim().to_owned())`
+deliberately ignores surrounding whitespace in comparisons. Keys never rewrite
+model-visible payloads: replay uses the original representative and full raw
+per-environment outputs remain in the evidence. Closure identity is never compared;
+the current function determines matches, including when its semantics differ from
+the recording's function. Tool arguments and JSON schemas use `serde_json::Value`.
+
+**Source-level API break:** `BatchLoop::with_group_by` is now
+`BatchLoop::with_comparison_key`, without a legacy alias. `run_to_completion_by`
+keeps its name and positional API; its closure parameter is named `comparison_key`.
+This rename adds no persisted fields. See the migration notes below for the
+separate removal of manual contract labels and `custom_grouping` metadata.
 
 Rust budgets include an exhaustion callback (`Budget::new(max_steps, f)`) so
 the caller can produce a valid value of the opaque payload type.
@@ -82,7 +95,7 @@ the caller can produce a valid value of the opaque payload type.
 Opt into recording through `LoopConfig::with_recording()`. Restore a
 snapshot with `with_agent(agent)` (`with_replay` remains an alias);
 constructors still use
-`BatchLoop::new` (exact equality) or `BatchLoop::with_group_by` (explicit lossy
+`BatchLoop::new` (exact equality) or `BatchLoop::with_comparison_key` (explicit lossy
 policy). Existing loops without these options behave as before. Constructor-based
 callers remain supported. Public configuration/result fields keep compatibility
 spellings (`history`, `history_resolver`, `child_histories`); prefer the canonical

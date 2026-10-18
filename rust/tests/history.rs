@@ -204,27 +204,35 @@ fn concurrent_branches_and_round_trip_keep_all_paths() {
 }
 
 #[test]
-fn lossy_grouping_preserves_actual_evidence_and_original_conversation() {
-    let mut loop_ =
-        BatchLoop::with_group_by(config(&["a", "b"], None), |s: &String| s.trim().to_owned())
-            .unwrap();
-    drive(
+fn comparison_key_applies_to_new_outputs_and_stored_representatives() {
+    // Tuple keys differ from raw strings: both sides must pass through the callback.
+    let mut loop_ = BatchLoop::with_comparison_key(config(&["a", "b"], None), |s: &String| {
+        (s.trim().to_owned(),)
+    })
+    .unwrap();
+    let llms = drive(
         &mut loop_,
         &[("a", &[("one ", "two ")]), ("b", &[("one", "two")])],
         1,
     );
+    assert_eq!(loop_.result().unwrap().classes.len(), 1);
+    let messages = &llms.last().unwrap().messages;
+    assert_eq!(messages[messages.len() - 2].content, "one ");
+    assert_eq!(messages[messages.len() - 1].content, "two ");
     let history = loop_.history().unwrap();
     let root = history.root();
     let edge = &root.observations[0];
     assert_eq!(edge.representative[1].tool_output, "two ");
     assert_eq!(edge.evidence[1].outputs[1].tool_output, "two");
+    // A separately created closure with the same semantics must replay, not match identity.
     let mut replay =
-        BatchLoop::with_group_by(config(&["c"], Some(history.clone())), |s: &String| {
-            s.trim().to_owned()
+        BatchLoop::with_comparison_key(config(&["c"], Some(history.clone())), |s: &String| {
+            (s.trim().to_owned(),)
         })
         .unwrap();
     assert!(drive(&mut replay, &[("c", &[("one\n", "two\n")])], 1).is_empty());
     assert_eq!(replay.result().unwrap().results["c"], "two ");
+    assert_eq!(replay.history().unwrap().root().observations.len(), 1);
     assert_eq!(
         replay.history().unwrap().root().observations[0].evidence[2].outputs[1].tool_output,
         "two\n"
@@ -247,7 +255,7 @@ impl Hash for Collision {
 
 #[test]
 fn hash_and_debug_collisions_cannot_conflate_records() {
-    let mut loop_ = BatchLoop::with_group_by(config(&["a", "b"], None), |s: &String| {
+    let mut loop_ = BatchLoop::with_comparison_key(config(&["a", "b"], None), |s: &String| {
         if s == "a" {
             Collision("a")
         } else {
@@ -269,15 +277,17 @@ fn hash_and_debug_collisions_cannot_conflate_records() {
     let history = result.history.unwrap();
     assert_eq!(history.root().observations.len(), 2);
     for value in ["a", "b"] {
-        let mut replay =
-            BatchLoop::with_group_by(config(&["next"], Some(history.clone())), |s: &String| {
+        let mut replay = BatchLoop::with_comparison_key(
+            config(&["next"], Some(history.clone())),
+            |s: &String| {
                 if s == "a" {
                     Collision("a")
                 } else {
                     Collision("b")
                 }
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert!(drive(&mut replay, &[("next", &[(value, value)])], 1).is_empty());
         assert_eq!(replay.result().unwrap().results["next"], value);
     }
@@ -381,7 +391,7 @@ fn structural_checks_final_only_replay_and_unsupported_budget() {
         Err(LoopError::IncompatibleHistory)
     ));
     assert!(
-        BatchLoop::with_group_by(config(&["new"], Some(history)), Clone::clone)
+        BatchLoop::with_comparison_key(config(&["new"], Some(history)), Clone::clone)
             .unwrap()
             .is_done()
     );

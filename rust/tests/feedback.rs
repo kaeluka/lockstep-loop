@@ -639,10 +639,11 @@ fn opaque_null_feedback_presence_and_constructor_limits() {
 
 #[test]
 fn lossy_grouping_keeps_actual_evidence_and_shared_feedback_context() {
-    let mut loop_ = BatchLoop::with_group_by(config(&["A", "B"], None, None), |s: &String| {
-        s.trim().to_owned()
-    })
-    .unwrap();
+    let mut loop_ =
+        BatchLoop::with_comparison_key(config(&["A", "B"], None, None), |s: &String| {
+            s.trim().to_owned()
+        })
+        .unwrap();
     let request = next_llm(&mut loop_);
     loop_.complete(Completion::Llm(model(&request))).unwrap();
     let request = next_tool(&mut loop_);
@@ -662,11 +663,11 @@ fn lossy_grouping_keeps_actual_evidence_and_shared_feedback_context() {
             OLD.into(),
         )))
         .unwrap();
-    let mut feedback =
-        BatchLoop::with_group_by(config(&["B"], loop_.history(), Some(NOTE)), |s: &String| {
-            s.trim().to_owned()
-        })
-        .unwrap();
+    let mut feedback = BatchLoop::with_comparison_key(
+        config(&["B"], loop_.history(), Some(NOTE)),
+        |s: &String| s.trim().to_owned(),
+    )
+    .unwrap();
     let tool = next_tool(&mut feedback);
     feedback
         .complete(Completion::Tool(ToolCompletion {
@@ -692,11 +693,11 @@ fn lossy_grouping_keeps_actual_evidence_and_shared_feedback_context() {
             .tool_output,
         "shared\n"
     );
-    let mut replay =
-        BatchLoop::with_group_by(config(&["C"], Some(history.clone()), None), |s: &String| {
-            s.trim().to_owned()
-        })
-        .unwrap();
+    let mut replay = BatchLoop::with_comparison_key(
+        config(&["C"], Some(history.clone()), None),
+        |s: &String| s.trim().to_owned(),
+    )
+    .unwrap();
     let tool = next_tool(&mut replay);
     replay
         .complete(Completion::Tool(ToolCompletion {

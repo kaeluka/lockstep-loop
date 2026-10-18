@@ -613,7 +613,8 @@ fn non_recording_colliding_labels_do_not_identify_or_drop_groups() {
         vec![specs()[0].clone()],
     );
     let mut loop_ =
-        BatchLoop::with_group_by(config, |value: &String| CollidingKey(value == "A")).unwrap();
+        BatchLoop::with_comparison_key(config, |value: &String| CollidingKey(value == "A"))
+            .unwrap();
     sequential(&mut loop_, &[("a", "A"), ("b", "B")], 1);
     let result = loop_.result().unwrap();
     assert_eq!(result.tree.children.len(), 2);

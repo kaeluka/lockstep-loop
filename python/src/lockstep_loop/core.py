@@ -25,7 +25,7 @@ slow provider (or tool) delays only its own branch.
 Payloads are opaque: the loop is generic in the content type ``P``, so
 multimodal conversations (content blocks, image bytes) work unchanged.
 Tool results are grouped by value equality and therefore must be hashable,
-unless a ``group_by`` canonicalizer is given.
+unless a ``comparison_key`` function is given.
 """
 
 from __future__ import annotations
@@ -202,7 +202,7 @@ class ToolCompletion(Generic[P]):
 
     Exactly one ``(env_id, result)`` pair per env in the request.  Results
     are compared by value equality and must therefore be hashable, unless
-    the loop was constructed with a ``group_by`` canonicalizer — the escape
+    the loop was constructed with a ``comparison_key`` function — the escape
     hatch for grouping values that are deliberately *not* equal.
     """
 
@@ -526,11 +526,13 @@ class BatchLoop(Generic[P]):
     best-effort — the frontier moves while you decide.  Sequential drivers
     get exact, replayable issue order.
 
-    Grouping: tool results are compared by value equality, so payloads must
-    be hashable.  ``group_by`` is the escape hatch for lossy grouping —
-    environments whose canonical keys match share a conversation even when
-    their raw payloads differ (the conversation then records a
-    representative's payload).
+    Grouping: ``comparison_key`` maps each raw tool output to a hashable key.
+    The default is identity (exact value equality, requiring hashable payloads).
+    Keys are used both to partition new outputs and to match them against stored
+    representative outputs, applying the same function to both sides. Custom keys
+    can deliberately group unequal payloads. Keys never replace model-visible
+    payloads: replay uses the historical representative and recording retains all
+    raw per-environment evidence. Callable identity is never compared.
 
     Recording: fresh roots opt in with ``recording=True``; supplying an ``Agent``
     implies replay and recording. A recorded parent or resolver records children;
@@ -552,7 +554,7 @@ class BatchLoop(Generic[P]):
         subagent: SubagentTool[P] | None = None,
         subagents: Sequence[SubagentTool[P]] | None = None,
         history_resolver: AgentResolver[P] | None = None,
-        group_by: Callable[[P], Hashable] | None = None,
+        comparison_key: Callable[[P], Hashable] | None = None,
         budget: Budget | None = None,
         recording: bool = False,
         history: Agent[P] | None = None,
@@ -636,8 +638,8 @@ class BatchLoop(Generic[P]):
         self._next_branch = 0
         self._next_child = 0
         self._id_prefix = _id_prefix
-        self._group_by: Callable[[P], Hashable] = (
-            group_by if group_by is not None else lambda v: cast(Hashable, v)
+        self._comparison_key: Callable[[P], Hashable] = (
+            comparison_key if comparison_key is not None else lambda v: cast(Hashable, v)
         )
         self._budget = budget
         self._children: dict[str, _ChildLink[P]] = {}
@@ -742,7 +744,7 @@ class BatchLoop(Generic[P]):
                 # A child final answer becomes a parent tool output. Validate its
                 # grouping contract before fulfilling the child's final request.
                 if isinstance(completion, LlmCompletion) and not completion.tool_calls:
-                    hash(self._group_by(completion.content))
+                    hash(self._comparison_key(completion.content))
                 try:
                     self._in_child(link, lambda child: child.complete(completion))
                 except (FeedbackResolutionError, InvalidHistoryError):
@@ -1185,7 +1187,7 @@ class BatchLoop(Generic[P]):
             tool_specs=child_specs,
             subagents=nested,
             history_resolver=self._history_resolver,
-            group_by=self._group_by,
+            comparison_key=self._comparison_key,
             budget=self._budget,
             recording=recording,
             history=previous,
@@ -1371,7 +1373,7 @@ class BatchLoop(Generic[P]):
             )
         # All fallible grouping/lookup happens before committing even this partial result.
         for _, output in completion.results:
-            hash(self._group_by(output))
+            hash(self._comparison_key(output))
         candidate = {**branch.turn_results, request.tool_call.id: dict(completion.results)}
         plan = None
         if len(candidate) == len(branch.turn_calls):
@@ -1386,7 +1388,7 @@ class BatchLoop(Generic[P]):
     ) -> list[tuple[list[str], int | None, str]]:
         groups: dict[tuple[Hashable, ...], list[str]] = {}
         for env in branch.env_ids:
-            key = tuple(self._group_by(results[c.id][env]) for c in branch.turn_calls)
+            key = tuple(self._comparison_key(results[c.id][env]) for c in branch.turn_calls)
             groups.setdefault(key, []).append(env)
         node = self._recorded._node(branch.history_path) if self._recorded else None
         plan: list[tuple[list[str], int | None, str]] = []
@@ -1398,7 +1400,9 @@ class BatchLoop(Generic[P]):
                 # Apply today's function to both sides; first existing match wins
                 # if a coarser function now equates multiple historical edges.
                 for index, edge in enumerate(node.observations):
-                    if key == tuple(self._group_by(o.tool_output) for o in edge.representative):
+                    if key == tuple(
+                        self._comparison_key(o.tool_output) for o in edge.representative
+                    ):
                         match = index
                         break
             label = str(key) if len(groups) > 1 else ""
@@ -1495,7 +1499,7 @@ class BatchLoop(Generic[P]):
         representative_env: str,
     ) -> None:
         # With default value-equality grouping every env in the class holds an
-        # equal value, so any representative is exact.  A lossy group_by lets
+        # equal value, so any representative is exact.  A lossy comparison_key lets
         # unequal values share a class; the conversation then records the
         # representative's payload.
         for call in calls:
@@ -1532,7 +1536,7 @@ def run_batch(
     prompt: P,
     env_ids: Sequence[str],
     tool_specs: Sequence[ToolSpec],
-    group_by: Callable[[P], Hashable] | None = None,
+    comparison_key: Callable[[P], Hashable] | None = None,
     budget: Budget | None = None,
 ) -> Generator[Request[P] | None, Completion[P] | None, BatchResult[P]]:
     """``BatchLoop`` as a generator, for pump-style drivers.
@@ -1548,7 +1552,7 @@ def run_batch(
         prompt=prompt,
         env_ids=env_ids,
         tool_specs=tool_specs,
-        group_by=group_by,
+        comparison_key=comparison_key,
         budget=budget,
     )
 
@@ -1576,7 +1580,7 @@ def run_to_completion(
     tools: Callable[[str], Sequence[Tool[P] | SubagentTool[P]]],
     complete_llm: Callable[[LlmRequest[P]], LlmCompletion[P]],
     complete_tool: Callable[[ToolRequest], ToolCompletion[P]] | None = None,
-    group_by: Callable[[P], Hashable] | None = None,
+    comparison_key: Callable[[P], Hashable] | None = None,
     budget: Budget | None = None,
 ) -> BatchResult[P]:
     """Drive a ``BatchLoop`` synchronously, one request at a time.
@@ -1610,7 +1614,7 @@ def run_to_completion(
         env_ids=envs,
         tool_specs=specs,
         subagents=subagents,
-        group_by=group_by,
+        comparison_key=comparison_key,
         budget=budget,
     )
     while not loop.done:

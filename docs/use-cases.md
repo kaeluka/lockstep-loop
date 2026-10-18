@@ -143,7 +143,7 @@ outside the core.
    while returning the same finding to its parent. This costs child work: measure
    total tokens and tool executions, not just the parent's branch count.
 4. **Keep the evidence.** Full tool outputs remain recorded. Canonical formatting
-   is not permission to discard meaningful differences. Custom `group_by` is an
+   is not permission to discard meaningful differences. Custom `comparison_key` is an
    explicit, potentially lossy policy—not semantic equivalence established by the core.
 5. **Evaluate the investigation.** Matching observations justify replay of that
    recorded path; they do not prove that the agent asked every necessary question.

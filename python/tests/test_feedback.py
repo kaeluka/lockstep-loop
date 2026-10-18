@@ -368,20 +368,20 @@ def test_opaque_null_feedback_presence_and_constructor_limits():
 
 def test_lossy_grouping_keeps_actual_evidence_and_shared_feedback_context():
     result, _, _ = drive(
-        loop_for(("A", "B"), group_by=str.strip),
+        loop_for(("A", "B"), comparison_key=str.strip),
         {
             "A": {"read": "shared "},
             "B": {"read": "shared"},
         },
     )
-    loop = loop_for(("B",), result.history, Feedback(NOTE), group_by=str.strip)
+    loop = loop_for(("B",), result.history, Feedback(NOTE), comparison_key=str.strip)
     loop.complete(output_for(loop.next_request(), {"B": {"read": "shared\n"}}))
     request = loop.next_request()
     assert request.messages[2].content == "shared "  # historical representative
     loop.complete(LlmCompletion(request.request_id, OLD))
     history = loop.history
     assert history.root.observations[0].evidence[-1].outputs[0].tool_output == "shared\n"
-    replay = loop_for(("C",), history, group_by=str.strip)
+    replay = loop_for(("C",), history, comparison_key=str.strip)
     replay.complete(output_for(replay.next_request(), {"C": {"read": "shared\t"}}))
     assert replay.done and replay.result().results == {"C": OLD}
     assert history.root.observations[0].evidence[-1].outputs[0].tool_output == "shared\n"

@@ -56,10 +56,15 @@ The history model is the replay engine's model, not a lossy export:
   a stored asset identity. A former leaf becomes an ancestor after feedback in a
   new snapshot, while remaining a leaf in the old snapshot.
 
-Matching verifies equality of complete output tuples (or caller-defined group
-keys); hashes/debug strings are never record identities or substitutes for
-outputs. Branch IDs are run-local scheduling identifiers. Repeated environment
-IDs append visits/evidence rather than overwriting them; use revision-qualified
+Matching verifies equality of complete output tuples (or caller-defined comparison
+keys). Python `comparison_key` / Rust `BatchLoop::with_comparison_key` computes a key
+from each raw tool output, defaulting to identity (exact value equality). The same
+function is applied to both freshly observed outputs and stored representative
+outputs, for partition grouping and replay matching. Callable/closure identity is
+never compared. Keys do not replace model-visible payloads or discard raw evidence;
+hashes/debug strings are never record identities or substitutes for outputs.
+Branch IDs are run-local scheduling identifiers. Repeated environment IDs append
+visits/evidence rather than overwriting them; use revision-qualified
 IDs if you need to distinguish runs in an inspector.
 
 ### Specialized tools and independently reusable child histories

@@ -97,13 +97,13 @@ fn changed_implementation_reuses_equal_outputs_and_branches_on_different_outputs
 #[test]
 fn provider_and_custom_grouping_policy_are_caller_owned_not_inferred() {
     let (old, _) = drive(
-        BatchLoop::with_group_by(config().with_recording(), |s: &String| s.trim().to_owned())
+        BatchLoop::with_comparison_key(config().with_recording(), |s: &String| s.trim().to_owned())
             .unwrap(),
         |_| "same ".into(),
         answer,
     );
     let (replay, count) = drive(
-        BatchLoop::with_group_by(
+        BatchLoop::with_comparison_key(
             config().with_agent(old.agent().unwrap().clone()),
             |s: &String| s.trim().to_lowercase(),
         )
@@ -197,7 +197,7 @@ fn imported_legacy_labels_do_not_poison_structural_child_cache_matching() {
                 Ok((*q == candidate.query()).then(|| candidate.clone()))
             });
         let mut loop_ = if custom {
-            BatchLoop::with_group_by(config, |s: &String| s.trim().to_owned())
+            BatchLoop::with_comparison_key(config, |s: &String| s.trim().to_owned())
         } else {
             BatchLoop::new(config)
         }
@@ -236,7 +236,7 @@ fn default_and_custom_identity_reuse_each_other() {
     for initial_custom in [false, true] {
         let c = config().with_recording();
         let initial = if initial_custom {
-            BatchLoop::with_group_by(c, Clone::clone)
+            BatchLoop::with_comparison_key(c, Clone::clone)
         } else {
             BatchLoop::new(c)
         }
@@ -248,7 +248,7 @@ fn default_and_custom_identity_reuse_each_other() {
         let replay = if initial_custom {
             BatchLoop::new(c)
         } else {
-            BatchLoop::with_group_by(c, Clone::clone)
+            BatchLoop::with_comparison_key(c, Clone::clone)
         }
         .unwrap();
         let (replay, count) = drive(replay, |_| "same".into(), answer);
@@ -274,13 +274,13 @@ fn default_and_custom_identity_reuse_each_other() {
 #[test]
 fn stricter_keys_match_representatives_not_old_evidence() {
     let (old, _) = drive(
-        BatchLoop::with_group_by(config().with_recording(), |v: &String| v.trim().to_owned())
+        BatchLoop::with_comparison_key(config().with_recording(), |v: &String| v.trim().to_owned())
             .unwrap(),
         |_| "same ".into(),
         answer,
     );
     let (grouped, count) = drive(
-        BatchLoop::with_group_by(
+        BatchLoop::with_comparison_key(
             config().with_agent(old.agent().unwrap().clone()),
             |v: &String| v.trim().to_owned(),
         )
@@ -294,7 +294,7 @@ fn stricter_keys_match_representatives_not_old_evidence() {
     for custom in [false, true] {
         let c = config().with_agent(agent.clone());
         let strict = if custom {
-            BatchLoop::with_group_by(c, Clone::clone)
+            BatchLoop::with_comparison_key(c, Clone::clone)
         } else {
             BatchLoop::new(c)
         }
@@ -341,7 +341,7 @@ fn coarser_keys_choose_first_existing_edge_without_merging_history() {
     let agent = old.agent().unwrap();
     let before = agent.root();
     let (replay, count) = drive(
-        BatchLoop::with_group_by(config().with_agent(agent.clone()), |v: &String| {
+        BatchLoop::with_comparison_key(config().with_agent(agent.clone()), |v: &String| {
             v.trim().to_lowercase()
         })
         .unwrap(),
@@ -400,7 +400,7 @@ fn child_query_and_execution_ignore_default_custom_mode() {
                 Ok(candidate.as_ref().filter(|d| d.query() == *q).cloned())
             });
         let mut loop_ = if custom {
-            BatchLoop::with_group_by(c, Clone::clone)
+            BatchLoop::with_comparison_key(c, Clone::clone)
         } else {
             BatchLoop::new(c)
         }

@@ -141,7 +141,7 @@ def test_bytes_payloads_group_by_value():
     assert sorted(c.env_ids for c in result.classes) == [("a", "b"), ("c",)]
 
 
-def test_custom_group_by_merges_unequal_values():
+def test_custom_comparison_key_groups_unequal_values():
     data = {"a": "result v1\n", "b": "result v1"}  # differ by whitespace only
 
     def make_tools(env: str) -> list[FakeTool]:
@@ -161,7 +161,7 @@ def test_custom_group_by_merges_unequal_values():
         env_ids=["a", "b"],
         tools=make_tools,
         complete_llm=llm,
-        group_by=lambda s: s.strip(),
+        comparison_key=lambda s: s.strip(),
     )
 
     assert [c.env_ids for c in result.classes] == [("a", "b")]
@@ -341,6 +341,25 @@ def test_generator_adapter_protocol():
         gen.send(LlmCompletion(request_id=request.request_id, content="done"))
     result = exc_info.value.value
     assert result.results == {"a": "done"}
+
+
+def test_generator_adapter_forwards_comparison_key_without_rewriting_payloads():
+    gen = run_batch(
+        prompt="inspect",
+        env_ids=["a", "b"],
+        tool_specs=[ToolSpec("read", "", {})],
+        comparison_key=lambda output: (output.strip(),),
+    )
+    request = next(gen)
+    tool = gen.send(
+        LlmCompletion(request.request_id, "look", (ToolCall("r", "read", {}),))
+    )
+    request = gen.send(ToolCompletion(tool.request_id, (("b", "same\n"), ("a", "same "))))
+    assert request.env_ids == ("a", "b")
+    assert request.messages[-1].content == "same "
+    with pytest.raises(StopIteration) as exc_info:
+        gen.send(LlmCompletion(request.request_id, "done"))
+    assert len(exc_info.value.value.classes) == 1
 
 
 def test_completion_for_unknown_request_rejected():

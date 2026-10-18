@@ -64,13 +64,13 @@ def test_changed_tool_implementation_same_output_reuses_different_output_branche
 
 
 def test_provider_and_custom_grouping_policy_are_external_not_inferred():
-    old, _ = drive(config(recording=True, group_by=str.strip), lambda _: "same ")
+    old, _ = drive(config(recording=True, comparison_key=str.strip), lambda _: "same ")
 
     def changed_provider(_):
         raise AssertionError("external provider change does not invalidate recorded turns")
 
     replay, count = drive(
-        config(agent=old.agent, group_by=lambda value: value.strip().lower()),
+        config(agent=old.agent, comparison_key=lambda value: value.strip().lower()),
         lambda _: "SAME",
         changed_provider,
     )
@@ -121,7 +121,7 @@ def test_legacy_pickle_labels_are_discarded_even_in_child_cache_identity():
             subagents=[tool],
             agent_resolver=resolve,
             record_store=store,
-            group_by=grouping,
+            comparison_key=grouping,
         )
         r = loop.next_request()
         loop.complete(LlmCompletion(r.request_id, b"delegate", (ToolCall("c", "delegate", {}),)))
@@ -139,11 +139,13 @@ def test_legacy_pickle_labels_are_discarded_even_in_child_cache_identity():
 def test_default_and_custom_identity_reuse_each_other(initial_custom):
     identity = lambda value: value  # noqa: E731
     old, _ = drive(
-        config(recording=True, group_by=identity if initial_custom else None), lambda _: "same"
+        config(recording=True, comparison_key=identity if initial_custom else None),
+        lambda _: "same",
     )
     before = old.agent.root
     replay, count = drive(
-        config(agent=old.agent, group_by=None if initial_custom else identity), lambda _: "same"
+        config(agent=old.agent, comparison_key=None if initial_custom else identity),
+        lambda _: "same",
     )
     assert count == 0 and replay.results == old.results
     assert old.agent.root == before and len(before.observations[0].evidence) == 1
@@ -153,13 +155,13 @@ def test_default_and_custom_identity_reuse_each_other(initial_custom):
 
 @pytest.mark.parametrize("strict", [None, lambda value: value])
 def test_stricter_keys_match_representatives_not_old_evidence(strict):
-    old, _ = drive(config(recording=True, group_by=str.strip), lambda _: "same ")
-    grouped, count = drive(config(agent=old.agent, group_by=str.strip), lambda _: "same")
+    old, _ = drive(config(recording=True, comparison_key=str.strip), lambda _: "same ")
+    grouped, count = drive(config(agent=old.agent, comparison_key=str.strip), lambda _: "same")
     assert count == 0
     before = grouped.agent.root
     # "same" is in historical evidence but differs from the representative "same ".
     changed, count = drive(
-        config(agent=grouped.agent, group_by=strict),
+        config(agent=grouped.agent, comparison_key=strict),
         lambda _: "same",
         lambda r: "strict:" + r.messages[-1].content,
     )
@@ -177,7 +179,7 @@ def test_coarser_keys_choose_first_existing_edge_without_merging_history():
     assert count == 1
     before = old.agent.root
     replay, count = drive(
-        config(agent=old.agent, group_by=lambda v: v.strip().lower()), lambda _: "a "
+        config(agent=old.agent, comparison_key=lambda v: v.strip().lower()), lambda _: "a "
     )
     assert count == 0 and replay.results == {"e": "first"}
     edges = replay.agent.root.observations
@@ -208,7 +210,7 @@ def test_child_query_and_execution_do_not_distinguish_default_from_custom_identi
             subagents=[tool],
             agent_resolver=resolve,
             record_store=store,
-            group_by=grouping,
+            comparison_key=grouping,
         )
         r = loop.next_request()
         loop.complete(LlmCompletion(r.request_id, "delegate", (ToolCall("c", "child", {}),)))

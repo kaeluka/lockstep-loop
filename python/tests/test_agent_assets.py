@@ -147,7 +147,7 @@ def test_asset_views_keep_lossy_evidence_and_real_null_values():
         env_ids=["A", "B"],
         tool_specs=[READ],
         recording=True,
-        group_by=bytes.strip,
+        comparison_key=bytes.strip,
     )
     r = loop.next_request()
     loop.complete(LlmCompletion(r.request_id, b"read", (ToolCall("r", "read", {}),)))
@@ -270,7 +270,7 @@ def test_pre_rename_pickle_fixture_loads_replays_and_preserves_wire_names():
         tool_specs=agent.descriptor.tools,
         agent=agent,
         subagents=[sub],
-        group_by=bytes.strip,
+        comparison_key=bytes.strip,
     )
     tool = loop.next_request()
     assert not isinstance(tool, LlmRequest)
