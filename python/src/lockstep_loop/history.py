@@ -9,6 +9,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
+from pprint import pformat
 from typing import TYPE_CHECKING, Generic, Literal, NoReturn, TypeAlias, TypeVar
 from uuid import uuid4
 
@@ -217,6 +218,26 @@ class AgentSnapshot(Generic[P]):
         Callable[..., AgentSnapshot[P]],
         tuple[AgentDescriptor[P], dict[NodeRef, HistoryNode[P]]],
     ]:
+        return _restore_snapshot, (self.descriptor, self._reachable_records())
+
+    def format(self, *, width: int = 100) -> str:
+        """Format the descriptor and all reachable history records for inspection.
+
+        Explicitly loads the full graph, including child base/result revisions;
+        unrelated store records and transient run state are excluded. Payloads use
+        their normal Python representations, with no imposed depth/length limit.
+        The result may be large and contain sensitive model/tool content. This
+        returns text, performs no printing, and leaves history unchanged (loader
+        caches may warm). Unlike this method, repr(snapshot) never loads records.
+        Payloads need not be pickleable. Width is the preferred pprint line width.
+        """
+        return pformat(
+            {"descriptor": self.descriptor, "records": self._reachable_records()},
+            width=width,
+            sort_dicts=False,
+        )
+
+    def _reachable_records(self) -> dict[NodeRef, HistoryNode[P]]:
         # Follow addresses, not the store's write set: it can contain unrelated
         # runs or aborted writes. Shallow records keep pickle's recursion depth
         # independent of conversation depth; pickle itself preserves payload sharing.
@@ -238,7 +259,7 @@ class AgentSnapshot(Generic[P]):
                     pending.append(run.snapshot.root)
                     if run.base is not None:
                         pending.append(run.base.root)
-        return _restore_snapshot, (self.descriptor, records)
+        return records
 
     @property
     def root(self) -> HistoryNode[P]:

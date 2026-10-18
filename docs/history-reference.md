@@ -148,6 +148,18 @@ value semantics; shared interior mutability must not change recorded facts.
 The caller owns copying/codecs for provider objects. Key functions must accept
 historical outputs, be deterministic, and use stable equality/hashing.
 
+### Python snapshot dump
+
+`print(snapshot.format())` explicitly dumps the descriptor and all reachable history
+records, including feedback, full observation evidence and child base/result revisions.
+`format(width=100)` returns a string using Python's `pprint`; it does not print or
+require pickleable payloads. Opaque payloads use their normal Python representations,
+without an imposed depth/length limit. The dump may be large or contain sensitive
+provider/tool content. It loads lazy records, but does not change history or include
+unrelated store records, pending requests or other transient execution state.
+`repr(snapshot)` stays lightweight and never loads records. Use Asset views for
+conversation-oriented inspection rather than a record-level dump.
+
 ### Direct Python snapshot pickle
 
 Python supports `pickle.dump(agent.snapshot(), file)` and

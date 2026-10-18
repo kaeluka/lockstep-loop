@@ -40,6 +40,7 @@ The documentation preserves these boundaries:
 | Specialized registries, independent children, pinned revisions, concurrent updates | [Python specialists](../python/tests/test_specialized_subagents.py), [Rust specialists](../rust/tests/specialized_subagents.rs) |
 | Completion recovery and serving costs | [Python transactions](../python/tests/test_transactional_transitions.py), [cost guards](../python/tests/test_transition_cost.py), [Rust transactions](../rust/tests/transactional_transitions.rs) |
 | Mutable handles, independent snapshots, both overlapping completion orders, automatic publication, failure/budget semantics and lazy storage | [Python entry point](../python/tests/test_agent_entrypoint.py), [Rust entry point](../rust/tests/agent_entrypoint.rs) |
+| Explicit Python snapshot formatting: all reachable records, opaque representations, lazy loads, deep sharing and lightweight repr | [Python formatting suite](../python/tests/test_snapshot_format.py) |
 | Direct Python snapshot pickle: full reachable graph, lazy-loader materialization, child bases/results, deep sharing, fresh writers and failure handling | [Python pickle suite](../python/tests/test_snapshot_pickle.py), [direct example](../python/examples/snapshot_pickle.py) |
 | No keys needed; implementation changes reuse or branch; external policy is caller-owned | [Python structural reuse](../python/tests/test_structural_reuse.py), [Rust structural reuse](../rust/tests/structural_reuse.rs), specialist suites |
 
@@ -50,7 +51,9 @@ evidence, unchanged old roots and mode-independent child lookup.
 
 ## Checks for the Agent entry point and direct snapshot pickle
 
-- Python: **139 tests**, strict mypy on all four source modules, Ruff lint.
+- Python: **145 tests**, strict mypy on all four source modules, Ruff lint.
+  The six formatting cases cover complete reachable-record dumps without pickle,
+  lazy-load behavior, deep shared history, custom representations and error handling.
   The 31 direct-pickle cases exercise default, protocol 4 and highest protocols,
   an 1800-turn shared graph, opaque payloads, nested provenance and independent loads.
 - Rust: **79 integration tests**, Clippy and rustdoc with warnings denied, formatting checks.

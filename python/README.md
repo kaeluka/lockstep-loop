@@ -170,6 +170,21 @@ replace the owner's head**. `run.snapshot()` may expose validated partial histor
 not pending requests or a crash-recovery protocol. Caller side effects, warmed
 caches and unreachable append-only writes are not rolled back.
 
+### Printing recorded state
+
+```python
+print(agent.snapshot().format())  # descriptor and every reachable history record
+```
+
+`format(width=100)` returns a pretty-printed string without printing itself. It
+explicitly loads the full reachable graph, including feedback, exact tool evidence,
+children and their historical base/result revisions. It omits unrelated store
+records and transient execution state. There is no imposed payload truncation;
+opaque values use their normal Python representations and need not be pickleable.
+The dump can be large and contain sensitive provider/tool content. History is not
+modified, although loader caches may warm. Plain `repr(snapshot)` remains lightweight
+and does not load records. For conversation-oriented inspection, use Asset views below.
+
 ### Specialized children and Asset views
 
 Configure `subagents=[SubagentTool(...), ...]` and optional `agent_resolver` on the
