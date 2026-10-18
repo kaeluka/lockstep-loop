@@ -9,7 +9,7 @@ import pickle
 from history_replay import persist
 
 from lockstep_loop import (
-    BatchLoop,
+    Agent,
     LlmCompletion,
     LlmRequest,
     RecordStore,
@@ -54,14 +54,14 @@ def investigate(parent_prompt, env, cache, backend):
         # may include all query fields; core verifies FULL compatibility either way.
         return cache.get(query.prompt)
 
-    loop = BatchLoop(
+    agent = Agent(
         prompt=parent_prompt,
-        env_ids=[env],
         tool_specs=[],
         subagents=[IMPORTS],
         record_store=store,
         agent_resolver=resolve,
     )
+    loop = agent.start([env])
     parent_llms = child_llms = child_tools = 0
     while not loop.done:
         request = loop.next_request()
@@ -102,7 +102,7 @@ if __name__ == "__main__":
     cache, backend = {}, {}
     first, counts = investigate("Parent A: analyze dependencies", "repo@commit-1", cache, backend)
     assert counts == (2, 2, 1)
-    original = first.child_agents[0].agent
+    original = first.child_updates[0].snapshot
     # Persist shallow records BEFORE publishing the selected child descriptor.
     # Trusted pickle only; choose your own codecs and backend in production.
     selected = pickle.loads(persist(original, backend))
@@ -113,14 +113,14 @@ if __name__ == "__main__":
     )
     assert counts == (2, 0, 1)  # parent regenerated, child reasoning reused, child tool rerun
     assert second.results == {"repo@commit-2": "os, sys"}
-    update = second.child_agents[0]
+    update = second.child_updates[0]
     assert update.base == selected
-    assert update.agent.descriptor.root != selected.root
+    assert update.snapshot.descriptor.root != selected.root
     assert original.root.env_ids == ("repo@commit-1",)
-    provenance = second.agent.root.subagents[0].runs[-1]
-    assert provenance.base == selected and provenance.agent_descriptor == update.agent.descriptor
+    provenance = second.snapshot.root.subagents[0].runs[-1]
+    assert provenance.base == selected and provenance.agent_descriptor == update.snapshot.descriptor
     # There is one update for this query here. Concurrent invocations would yield
     # separate entries; selecting/merging/publishing them is a caller decision.
-    updated = pickle.loads(persist(update.agent, backend))
+    updated = pickle.loads(persist(update.snapshot, backend))
     cache[updated.prompt] = updated
     print("Changed parent: 2 fresh parent LLM calls, 0 child LLM calls, 1 child tool rerun")

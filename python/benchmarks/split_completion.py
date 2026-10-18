@@ -2,19 +2,20 @@
 
 From python/: PYTHONPATH=src python benchmarks/split_completion.py --repeats 3
 Timing includes construction, fan-out, and the plain done/pull/complete loop;
-result validation is outside the timed region. Includes Agent history; no subagents.
+result validation is outside the timed region. Includes AgentSnapshot snapshot; no subagents.
 """
 
 import argparse
 from statistics import median
 from time import perf_counter
 
-from lockstep_loop import BatchLoop, LlmCompletion, ToolCall, ToolCompletion
+from lockstep_loop import Agent, LlmCompletion, ToolCall, ToolCompletion
 
 
 def run(n):
     start = perf_counter()
-    loop = BatchLoop(prompt="p", env_ids=[str(i) for i in range(n)], tool_specs=[])
+    agent = Agent(prompt="p", tool_specs=[])
+    loop = agent.start([str(i) for i in range(n)])
     request = loop.next_request()
     loop.complete(LlmCompletion(request.request_id, "", (ToolCall("x", "read", {}),)))
     request = loop.next_request()

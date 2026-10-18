@@ -28,10 +28,19 @@ The existing final partition trie alone is insufficient for replay.
 
 ### Representation and immutability
 
-- Prefer one immutable history model used both internally and by callers for
-  persistence/inspection, rather than separate internal and export tries.
-- A mutable root reference may point at immutable, structurally shared records.
-  Extending history must not mutate previously captured roots or their records.
+- Agent is the primary mutable handle owning a current AgentSnapshot and runtime
+  callbacks. AgentRun wraps immutable history plus transient execution builders.
+  Use one immutable history model internally and for persistence/inspection.
+- start captures the CURRENT root. Successful completion automatically publishes
+  exactly once, including immediate cached/budget completion. Overlapping runs are
+  allowed: LAST COMPLETION WINS WITHOUT MERGING. No queues or lifetime locks.
+  Document this warning prominently. Inspection of old runs never republishes.
+- Failures and abandoned runs never replace the owner head. Invalid completions
+  remain correctable. Budgets publish real history, not fabricated assistant facts.
+- snapshot/from_snapshot must support lazy caller stores/loaders symmetrically.
+  Restore prompt/specs from the snapshot, reattach executable callbacks explicitly.
+  Independent handles fork via snapshots; child updates and Assets anchor snapshots,
+  never mutable handles. Extending history never mutates captured roots/records.
 - Pending requests and partially collected turns are builders/late initialization:
   validate before fulfillment, fulfill once, then retain immutable historical facts.
   Invalid completions must not consume a request. Retries/corrections must not
@@ -72,13 +81,13 @@ The existing final partition trie alone is insufficient for replay.
   Independent child queries use child structural configuration, never parent identity.
 - Provider/adapter and custom grouping semantics are external policy, not inferred.
   The caller owns cache isolation and compatible snapshot selection for policy changes.
-- Every loop and convenience driver records an immutable Agent, including children.
-  Supplying a prior Agent enables replay. Budgets limit accepted assistant turns,
+- Every run and convenience driver records an immutable AgentSnapshot, including
+  children. Agent.start replays its current snapshot; from_snapshot restores a handle. Budgets limit accepted assistant turns,
   including reused turns; exhaustion returns a run fallback, never a fabricated
   assistant record. Preserve the real checkpoint so later replay can resume.
-- Retain legacy record class aliases. Ignore deprecated persisted contract labels
-  and `custom_grouping` metadata, never matching keys; document source/wire migration
-  and codec limitations.
+- No legacy migration is required. Use canonical record names and clean public
+  exports; do not retain deprecated aliases or migration scaffolding. Document
+  payload codec and cross-language/version persistence limitations.
 - Distinguish completed-history reuse from crash recovery of in-flight execution;
   do not claim the latter unless its protocol is implemented and tested.
 
@@ -100,8 +109,12 @@ building speculative frameworks.
 Preserve existing request/completion behavior and tests. Add tests demonstrating:
 - unchanged observations reuse recorded reasoning with zero new LLM requests,
   including changed tool implementations and changed parent prompts for child lookup;
-- imported legacy labels do not affect matching; external provider/grouping policy
-  remains caller-owned, while structural incompatibilities are rejected;
+- external provider/grouping policy remains caller-owned, while structural
+  incompatibilities are rejected;
+- automatic exactly-once publication, sequential reuse, both overlapping completion
+  orders without merging, immediate cached completion, and no publication on failure;
+- lazy snapshot roundtrips without repeated prompt/specs; independent run snapshots
+  and Asset views survive later Agent publications;
 - changed observations branch at the first divergence, including previously
   non-splitting turns;
 - old snapshots remain unchanged and both old and new paths remain reusable;

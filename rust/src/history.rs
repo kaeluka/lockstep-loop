@@ -1,4 +1,4 @@
-//! Immutable Agent snapshots, contextual Asset views, and shallow history records.
+//! Immutable AgentSnapshot snapshots, contextual Asset views, and shallow snapshot records.
 //! Payload clones must have immutable value semantics. No core storage I/O.
 
 use crate::{LoopError, Message, Role, ToolCall, ToolSpec};
@@ -44,7 +44,7 @@ pub struct UserContinuation<P> {
     pub resolved_env_id: Option<String>,
 }
 
-/// Structural subagent configuration; legacy type name, no caller version key.
+/// Structural subagent configuration, without caller version keys.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SubagentContract {
     pub spec: ToolSpec,
@@ -54,26 +54,25 @@ pub struct SubagentContract {
 }
 
 /// AgentQuery: child structural configuration, without parent/invocation/environment IDs.
-/// External provider/grouping policy isolation is caller-owned. The legacy struct
-/// name is retained; self-describing Serde ignores old contract/grouping metadata.
+/// External provider/grouping policy isolation is caller-owned.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct HistoryQuery<P> {
+pub struct AgentQuery<P> {
     pub prompt: P,
     pub tools: Vec<ToolSpec>,
     pub subagents: Vec<SubagentContract>,
 }
 
 type Resolver<P> =
-    dyn Fn(&HistoryQuery<P>) -> Result<Option<HistoryDescriptor<P>>, LoopError> + Send + Sync;
+    dyn Fn(&AgentQuery<P>) -> Result<Option<AgentDescriptor<P>>, LoopError> + Send + Sync;
 
-/// AgentResolver: caller-owned agent revision selection, using the RecordStore loader.
-pub struct HistoryResolver<P> {
+/// AgentResolver: caller-owned snapshot revision selection, using the RecordStore loader.
+pub struct AgentResolver<P> {
     pub(crate) resolve: Arc<Resolver<P>>,
     pub(crate) prompt_eq: fn(&P, &P) -> bool,
 }
-impl<P: PartialEq> HistoryResolver<P> {
+impl<P: PartialEq> AgentResolver<P> {
     pub fn new(
-        resolve: impl Fn(&HistoryQuery<P>) -> Result<Option<HistoryDescriptor<P>>, LoopError>
+        resolve: impl Fn(&AgentQuery<P>) -> Result<Option<AgentDescriptor<P>>, LoopError>
         + Send
         + Sync
         + 'static,
@@ -84,7 +83,7 @@ impl<P: PartialEq> HistoryResolver<P> {
         }
     }
 }
-impl<P> Clone for HistoryResolver<P> {
+impl<P> Clone for AgentResolver<P> {
     fn clone(&self) -> Self {
         Self {
             resolve: self.resolve.clone(),
@@ -92,59 +91,59 @@ impl<P> Clone for HistoryResolver<P> {
         }
     }
 }
-impl<P> fmt::Debug for HistoryResolver<P> {
+impl<P> fmt::Debug for AgentResolver<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("HistoryResolver { .. }")
+        f.write_str("AgentResolver { .. }")
     }
 }
 
 /// AgentDescriptor: small persistence envelope; publish AFTER its referenced records.
-/// Legacy struct name retained; self-describing Serde ignores old contract/grouping metadata.
+/// Attach a RecordStore to reconstruct a snapshot without eager loading.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct HistoryDescriptor<P> {
+pub struct AgentDescriptor<P> {
     pub prompt: P,
     pub tools: Vec<ToolSpec>,
     pub root: NodeRef,
     pub subagents: Vec<SubagentContract>,
 }
 
-/// SubagentRecord: parent-call provenance, not the complete child agent itself.
-/// Use Agent::child to inspect the child agent and its assets.
+/// SubagentRecord: parent-call provenance, not the complete child snapshot itself.
+/// Use AgentSnapshot::child to inspect the child snapshot and its assets.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct SubagentHistory<P> {
+pub struct SubagentRecord<P> {
     pub call_id: String,
-    pub history: HistoryDescriptor<P>,
+    pub snapshot: AgentDescriptor<P>,
     #[serde(default = "Vec::new")]
-    pub runs: Vec<Arc<ChildHistoryRun<P>>>,
+    pub runs: Vec<Arc<ChildAgentRun<P>>>,
 }
 
 /// ChildAgentRun: one invocation's environments, selected base and resulting revision.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ChildHistoryRun<P> {
+pub struct ChildAgentRun<P> {
     pub env_ids: Vec<String>,
-    pub base: Option<HistoryDescriptor<P>>,
-    pub history: HistoryDescriptor<P>,
+    pub base: Option<AgentDescriptor<P>>,
+    pub snapshot: AgentDescriptor<P>,
 }
 
 /// ChildAgentUpdate: one completed invocation, not a merged cache or conversation ID.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ChildHistoryUpdate<P> {
+pub struct ChildAgentUpdate<P> {
     pub request_prefix: String,
     pub branch_id: String,
     pub depth: usize,
     pub tool_call: ToolCall,
     pub env_ids: Vec<String>,
-    pub base: Option<HistoryDescriptor<P>>,
-    pub history: Agent<P>,
+    pub base: Option<AgentDescriptor<P>>,
+    pub snapshot: AgentSnapshot<P>,
 }
 
-/// Shared prefix or historical endpoint; an Asset also needs its agent/path context.
+/// Shared prefix or historical endpoint; an Asset also needs its snapshot/path context.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HistoryNode<P> {
     pub assistant: Option<Message<P>>,
     pub env_ids: Vec<String>,
     pub observations: Vec<Observation<P>>,
-    pub subagents: Vec<SubagentHistory<P>>,
+    pub subagents: Vec<SubagentRecord<P>>,
     pub user_continuations: Vec<UserContinuation<P>>,
 }
 
@@ -270,15 +269,15 @@ impl<P> RecordStore<P> {
     }
 }
 
-/// Complete immutable agent: prompt, structural configuration and accumulated trie.
-/// This is not a tool definition or a running BatchLoop. Persist its descriptor
-/// and records, not a live resolver or asset view. History is a compatibility alias.
+/// Immutable prompt, structural configuration and accumulated conversation trie.
+/// Persist the descriptor and records, not mutable Agent/AgentRun handles or views.
+/// Owned clones are independent values; shared records and payloads stay immutable.
 #[derive(Clone, Debug)]
-pub struct Agent<P> {
+pub struct AgentSnapshot<P> {
     pub descriptor: AgentDescriptor<P>,
     pub store: RecordStore<P>,
 }
-impl<P: PartialEq> PartialEq for Agent<P> {
+impl<P: PartialEq> PartialEq for AgentSnapshot<P> {
     fn eq(&self, other: &Self) -> bool {
         self.descriptor == other.descriptor
     }
@@ -289,7 +288,7 @@ pub(crate) enum PathStep {
     User(usize),
 }
 
-impl<P> Agent<P> {
+impl<P> AgentSnapshot<P> {
     pub fn prompt(&self) -> &P {
         &self.descriptor.prompt
     }
@@ -303,7 +302,7 @@ impl<P> Agent<P> {
     /// to inspect them. This never executes tools or creates records.
     pub fn assets(&self) -> Assets<'_, P> {
         Assets {
-            agent: self,
+            snapshot: self,
             stack: vec![(self.descriptor.root.clone(), 0, None)],
             path: vec![],
         }
@@ -320,7 +319,7 @@ impl<P> Agent<P> {
         node
     }
 }
-impl<P: Clone> HistoryDescriptor<P> {
+impl<P: Clone> AgentDescriptor<P> {
     pub fn query(&self) -> AgentQuery<P> {
         AgentQuery {
             prompt: self.prompt.clone(),
@@ -330,9 +329,9 @@ impl<P: Clone> HistoryDescriptor<P> {
     }
 }
 
-impl<P: Clone> Agent<P> {
-    pub fn child(&self, entry: &SubagentRecord<P>) -> Agent<P> {
-        Agent {
+impl<P: Clone> AgentSnapshot<P> {
+    pub fn child(&self, entry: &SubagentRecord<P>) -> AgentSnapshot<P> {
+        AgentSnapshot {
             descriptor: entry.agent_descriptor().clone(),
             store: self.store.clone(),
         }
@@ -362,22 +361,22 @@ impl<P: Clone> Agent<P> {
     }
 }
 
-impl<P> SubagentHistory<P> {
+impl<P> SubagentRecord<P> {
     pub fn agent_descriptor(&self) -> &AgentDescriptor<P> {
-        &self.history
+        &self.snapshot
     }
 }
-impl<P> ChildHistoryRun<P> {
+impl<P> ChildAgentRun<P> {
     pub fn agent_descriptor(&self) -> &AgentDescriptor<P> {
-        &self.history
+        &self.snapshot
     }
 }
-impl<P> ChildHistoryUpdate<P> {
-    pub fn agent(&self) -> &Agent<P> {
-        &self.history
+impl<P> ChildAgentUpdate<P> {
+    pub fn snapshot(&self) -> &AgentSnapshot<P> {
+        &self.snapshot
     }
-    pub fn into_agent(self) -> Agent<P> {
-        self.history
+    pub fn into_snapshot(self) -> AgentSnapshot<P> {
+        self.snapshot
     }
 }
 
@@ -394,18 +393,18 @@ impl<P> Clone for AssetStep<P> {
     }
 }
 
-/// Read-only leaf investigation, in its agent/path context. No IDs, serialization
-/// or resume operation: feedback still resolves agent snapshot + environment.
+/// Read-only leaf investigation, in its snapshot/path context. No IDs, serialization
+/// or resume operation: feedback still resolves snapshot snapshot + environment.
 /// Asset equality is not defined by the published value.
 pub struct Asset<'a, P> {
-    agent: &'a Agent<P>,
+    snapshot: &'a AgentSnapshot<P>,
     path: Vec<AssetStep<P>>,
 }
 
-/// Lazy depth-first inspection of one agent's leaves. Paths copy only record
+/// Lazy depth-first inspection of one snapshot's leaves. Paths copy only record
 /// references once per yielded view; no payload cloning or eager subtree loading.
 pub struct Assets<'a, P> {
-    agent: &'a Agent<P>,
+    snapshot: &'a AgentSnapshot<P>,
     stack: Vec<(NodeRef, usize, Option<PathStep>)>,
     path: Vec<AssetStep<P>>,
 }
@@ -414,14 +413,14 @@ impl<'a, P> Iterator for Assets<'a, P> {
     fn next(&mut self) -> Option<Self::Item> {
         while let Some((reference, depth, via)) = self.stack.pop() {
             self.path.truncate(depth);
-            let node = self.agent.load(&reference);
+            let node = self.snapshot.load(&reference);
             self.path.push(AssetStep {
                 node: node.clone(),
                 via,
             });
             if node.observations.is_empty() && node.user_continuations.is_empty() {
                 return Some(Asset {
-                    agent: self.agent,
+                    snapshot: self.snapshot,
                     path: self.path.clone(),
                 });
             }
@@ -444,13 +443,13 @@ impl<'a, P> Iterator for Assets<'a, P> {
     }
 }
 impl<P> Asset<'_, P> {
-    pub fn agent(&self) -> &Agent<P> {
-        self.agent
+    pub fn snapshot(&self) -> &AgentSnapshot<P> {
+        self.snapshot
     }
     pub fn node(&self) -> &HistoryNode<P> {
         &self.path.last().expect("asset has a path").node
     }
-    /// Shared prefix through leaf, including child-agent provenance records.
+    /// Shared prefix through leaf, including child-snapshot provenance records.
     pub fn nodes(&self) -> Vec<&HistoryNode<P>> {
         self.path.iter().map(|step| step.node.as_ref()).collect()
     }
@@ -524,7 +523,7 @@ impl<P> Asset<'_, P> {
 impl<P: Clone> Asset<'_, P> {
     /// The model-visible conversation, using historical representatives.
     pub fn messages(&self) -> Vec<Message<P>> {
-        let mut messages = vec![Message::user(self.agent.descriptor.prompt.clone())];
+        let mut messages = vec![Message::user(self.snapshot.descriptor.prompt.clone())];
         for (i, step) in self.path.iter().enumerate() {
             match step.via {
                 Some(PathStep::Observation(edge)) => {
@@ -554,13 +553,3 @@ impl<P: Clone> Asset<'_, P> {
         messages
     }
 }
-
-// One model. Legacy type names retained; manual contract fields removed.
-// These aliases are the preferred domain vocabulary, not duplicate wrappers.
-pub use Agent as History;
-pub use ChildHistoryRun as ChildAgentRun;
-pub use ChildHistoryUpdate as ChildAgentUpdate;
-pub use HistoryDescriptor as AgentDescriptor;
-pub use HistoryQuery as AgentQuery;
-pub use HistoryResolver as AgentResolver;
-pub use SubagentHistory as SubagentRecord;

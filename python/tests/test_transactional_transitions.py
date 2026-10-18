@@ -1,3 +1,4 @@
+
 """Fallible child preparation must never fulfill a pending assistant turn."""
 
 import pickle
@@ -7,10 +8,9 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from lockstep_loop import (
-    BatchLoop,
+    AgentSnapshot,
     Feedback,
     FeedbackResolutionError,
-    History,
     InvalidHistoryError,
     LlmCompletion,
     LlmRequest,
@@ -20,24 +20,25 @@ from lockstep_loop import (
     ToolCompletion,
     ToolSpec,
 )
+from lockstep_loop.core import BatchLoop
 
 SPECS = (ToolSpec("probe", "", {}), ToolSpec("investigate", "", {}))
 
 
-def make_loop(sub, *, history=None, env="old"):
+def make_loop(sub, *, snapshot=None, env="old"):
     return BatchLoop(
         prompt="parent",
         env_ids=[env],
         tool_specs=SPECS,
         subagent=sub,
-        history=history,
+        snapshot=snapshot,
     )
 
 
 def state(loop):
     # Freeze builders rather than retaining references to their mutable lists.
     return (
-        loop.history,
+        loop.snapshot,
         loop._seq,
         loop._next_branch,
         loop._next_child,
@@ -100,17 +101,17 @@ def serve(loop, *, replay=False):
     return loop.result()
 
 
-def persisted(history):
-    records = {ref: pickle.dumps(node) for ref, node in history.store.records().items()}
-    return History(
-        pickle.loads(pickle.dumps(history.descriptor)),
+def persisted(snapshot):
+    records = {ref: pickle.dumps(node) for ref, node in snapshot.store.records().items()}
+    return AgentSnapshot(
+        pickle.loads(pickle.dumps(snapshot.descriptor)),
         RecordStore(load=lambda ref: pickle.loads(records[ref])),
     )
 
 
 @pytest.mark.parametrize("failure", ["prompt", "specs"])
 @pytest.mark.parametrize("corrected_tools", [False, True])
-def test_failed_mixed_turn_is_unfulfilled_and_retry_agrees_with_replay(
+def test_failed_mixed_turn_is_unfulfilled_and_retry_agrees_with_snapshot(
     failure, corrected_tools
 ):
     prompts, specs = [], []
@@ -135,7 +136,7 @@ def test_failed_mixed_turn_is_unfulfilled_and_retry_agrees_with_replay(
     assert state(loop) == before
     # Preparation may allocate orphan OPEN child nodes, but must not even
     # create a recorded assistant fact for the unvalidated "bad" turn.
-    assert all(node.assistant is None for node in loop.history.store.records().values())
+    assert all(node.assistant is None for node in loop.snapshot.store.records().values())
     assert loop.next_request() is None
     assert not loop.done and loop.outstanding_llm == 1
     assert prompts == [{"required": "good"}, bad_args]
@@ -150,9 +151,9 @@ def test_failed_mixed_turn_is_unfulfilled_and_retry_agrees_with_replay(
     assert result.results == {"old": expected}
     assert loop._partition[0].steps == (2 if corrected_tools else 1)
     assert before[0].root.assistant is None
-    assert result.history.root.assistant.content == "corrected"
-    assert result.history.root.assistant.tool_calls == calls
-    replay = make_loop(sub, history=persisted(result.history), env="new")
+    assert result.snapshot.root.assistant.content == "corrected"
+    assert result.snapshot.root.assistant.tool_calls == calls
+    replay = make_loop(sub, snapshot=persisted(result.snapshot), env="new")
     assert serve(replay, replay=True).results == {"new": expected}
 
 
@@ -166,7 +167,7 @@ def test_failed_child_preparation_after_feedback_does_not_reinject_or_poison_his
         env_ids=["old"],
         tool_specs=SPECS,
         subagent=sub,
-        history=original.history,
+        snapshot=original.snapshot,
         feedback=Feedback("check again"),
     )
     request = loop.next_request()
@@ -177,15 +178,15 @@ def test_failed_child_preparation_after_feedback_does_not_reinject_or_poison_his
     assert state(loop) == before
     loop.complete(LlmCompletion(request.request_id, "corrected"))
     assert loop.done and loop.result().results == {"old": "corrected"}
-    history = loop.history
-    assert len(history.root.user_continuations) == 1
+    snapshot = loop.snapshot
+    assert len(snapshot.root.user_continuations) == 1
     assert (
-        history.load(history.root.user_continuations[0].continuation).assistant.content
+        snapshot.load(snapshot.root.user_continuations[0].continuation).assistant.content
         == "corrected"
     )
-    replay = make_loop(sub, history=persisted(history), env="new")
+    replay = make_loop(sub, snapshot=persisted(snapshot), env="new")
     assert replay.done and replay.result().results == {"new": "corrected"}
-    assert not original.history.root.user_continuations
+    assert not original.snapshot.root.user_continuations
 
 
 def test_staged_commit_preserves_the_serving_lock_and_concurrent_routes():
@@ -213,7 +214,7 @@ def test_staged_commit_preserves_the_serving_lock_and_concurrent_routes():
     assert loop.outstanding_count == 0
     result = serve(loop)
     assert result.results == {"old": "ordinary|child-good|child-fixed"}
-    assert serve(make_loop(sub, history=result.history, env="new"), replay=True).results == {
+    assert serve(make_loop(sub, snapshot=result.snapshot, env="new"), replay=True).results == {
         "new": "ordinary|child-good|child-fixed"
     }
 
@@ -255,9 +256,9 @@ def test_callback_failure_in_nested_completion_preserves_parent_routes():
     loop.complete(LlmCompletion(child.request_id, "corrected child"))
     result = serve(loop)
     assert result.results == {"old": "corrected child"}
-    entry = result.history.root.subagents[0]
-    assert result.history.load(entry.history.root).assistant.content == "corrected child"
-    replay = make_loop(sub, history=result.history, env="new")
+    entry = result.snapshot.root.subagents[0]
+    assert result.snapshot.load(entry.snapshot.root).assistant.content == "corrected child"
+    replay = make_loop(sub, snapshot=result.snapshot, env="new")
     assert serve(replay, replay=True).results == {"new": "corrected child"}
 
 
@@ -295,7 +296,7 @@ def test_parent_callback_failure_after_child_completion_restores_child_pending_r
     original.complete(LlmCompletion(child.request_id, "second answer"))
     request = original.next_request()
     original.complete(LlmCompletion(request.request_id, "done"))
-    replay = make_loop(sub, history=original.history, env="new")
+    replay = make_loop(sub, snapshot=original.snapshot, env="new")
     tool = replay.next_request()
     before = state(replay)
     broken = True
@@ -306,8 +307,8 @@ def test_parent_callback_failure_after_child_completion_restores_child_pending_r
     broken = False
     replay.complete(ToolCompletion(tool.request_id, (("new", "value"),)))
     assert replay.done and replay.result().results == {"new": "done"}
-    history = replay.history
-    first = history.load(history.root.subagents[0].history.root)
+    snapshot = replay.snapshot
+    first = snapshot.load(snapshot.root.subagents[0].snapshot.root)
     assert [e.env_id for e in first.observations[0].evidence] == ["old", "new"]
 
 
@@ -335,7 +336,7 @@ def test_callback_failure_while_polling_cached_child_rollup_is_atomic(poll):
         original.complete(LlmCompletion(child.request_id, name + " answer"))
     request = original.next_request()
     original.complete(LlmCompletion(request.request_id, "done"))
-    replay = make_loop(sub, history=original.history, env="new")
+    replay = make_loop(sub, snapshot=original.snapshot, env="new")
     before = state(replay)
     broken = True
     with pytest.raises(KeyError):
@@ -386,9 +387,9 @@ def test_last_tool_completion_prepares_replayed_children_before_consumption(fail
     original.complete(LlmCompletion(child.request_id, "answer"))
     final = original.next_request()
     original.complete(LlmCompletion(final.request_id, "done"))
-    old = original.history
+    old = original.snapshot
 
-    replay = make_loop(sub, history=old, env="new")
+    replay = make_loop(sub, snapshot=old, env="new")
     tool = replay.next_request()
     before = state(replay)
     broken = True
@@ -404,6 +405,6 @@ def test_last_tool_completion_prepares_replayed_children_before_consumption(fail
     assert replay.done and replay.result().results == {"new": "done"}
     assert len(callbacks) == calls_before_retry + 2  # prompt and specs once each
     assert old.root.env_ids == ("old",)
-    again = make_loop(sub, history=persisted(replay.history), env="again")
+    again = make_loop(sub, snapshot=persisted(replay.snapshot), env="again")
     again.complete(ToolCompletion(again.next_request().request_id, (("again", "ordinary"),)))
     assert again.done and again.result().results == {"again": "done"}

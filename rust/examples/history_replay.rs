@@ -1,7 +1,7 @@
 //! Run from the repository root: cargo run -p lockstep-loop --example history_replay
 use lockstep_loop::{
-    Agent, BatchLoop, Completion, LlmCompletion, LoopConfig, NodeRef, RecordStore, Request,
-    RequestKind, ToolCall, ToolCompletion, ToolSpec,
+    Agent, AgentConfig, AgentRuntime, AgentSnapshot, Completion, LlmCompletion, NodeRef,
+    RecordStore, Request, RequestKind, RunOptions, ToolCall, ToolCompletion, ToolSpec,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -10,22 +10,21 @@ use std::sync::Arc;
 fn investigate(
     env: &str,
     observation: &str,
-    previous: Option<Agent<String>>,
-) -> Result<(Agent<String>, usize, String), Box<dyn std::error::Error>> {
-    let config = LoopConfig::new(
+    previous: Option<AgentSnapshot<String>>,
+) -> Result<(AgentSnapshot<String>, usize, String), Box<dyn std::error::Error>> {
+    let config = AgentConfig::new(
         "Read the revision's status.".to_owned(),
-        vec![env.to_owned()],
         vec![ToolSpec::new(
             "status",
             "Read status without changing it.",
             json!({}),
         )],
     );
-    let config = match previous {
-        Some(agent) => config.with_agent(agent),
-        None => config.with_record_store(RecordStore::new("writer-1")),
+    let agent = match previous {
+        Some(snapshot) => Agent::from_snapshot(snapshot, AgentRuntime::default())?,
+        None => Agent::new(config.with_record_store(RecordStore::new("writer-1")))?,
     };
-    let mut loop_ = BatchLoop::new(config)?;
+    let mut loop_ = agent.start(vec![env.to_owned()], RunOptions::default())?;
     let mut llm_calls = 0;
     while !loop_.is_done() {
         // This example completes requests synchronously.
@@ -63,12 +62,12 @@ fn investigate(
     }
     let result = loop_.result()?;
     let answer = result.results[env].clone();
-    Ok((result.into_agent(), llm_calls, answer))
+    Ok((agent.snapshot(), llm_calls, answer))
 }
 
 type Backend = BTreeMap<NodeRef, Vec<u8>>;
 
-fn persist(agent: &Agent<String>, backend: &mut Backend) -> Vec<u8> {
+fn persist(agent: &AgentSnapshot<String>, backend: &mut Backend) -> Vec<u8> {
     // Persist shallow immutable records BEFORE atomically publishing descriptor.
     for (reference, node) in agent.store.records() {
         let bytes = serde_json::to_vec(&node).unwrap();
@@ -81,10 +80,14 @@ fn persist(agent: &Agent<String>, backend: &mut Backend) -> Vec<u8> {
     serde_json::to_vec(&agent.descriptor).unwrap()
 }
 
-fn restore(descriptor: &[u8], backend: Backend, fresh_writer_namespace: &str) -> Agent<String> {
+fn restore(
+    descriptor: &[u8],
+    backend: Backend,
+    fresh_writer_namespace: &str,
+) -> AgentSnapshot<String> {
     // Reserve a globally unique writer namespace in real storage (e.g. a database
     // sequence or UUID). Never reuse writer-N across independent writable stores.
-    Agent {
+    AgentSnapshot {
         descriptor: serde_json::from_slice(descriptor).unwrap(),
         store: RecordStore::with_loader(fresh_writer_namespace, move |reference| {
             // Caller-owned codec/I/O. No traversal or observation matching here.

@@ -1,23 +1,25 @@
 //! Provider-agnostic lockstep agent orchestration.
 //!
-//! A [`BatchLoop`] starts one conversation for an equivalence class of
+//! An [`Agent`] starts an [`AgentRun`] for an equivalence class of
 //! environments. Tool calls fan out over every environment in the class; the
 //! class splits only when tool results differ. The caller owns all LLM and
 //! tool execution and may complete requests in any order.
 //!
-//! An immutable [`Agent`] contains the initial prompt, structural configuration
+//! An immutable [`AgentSnapshot`] contains the initial prompt, structural configuration
 //! and accumulated trie. Its [`Asset`] views are leaf investigations backed by
 //! complete conversations, not just published values or environment classes.
-//! [`History`] remains an alias; legacy persisted contract labels are ignored.
-//! Feedback still resolves an agent snapshot + environment by replay.
+//! Successful runs automatically publish their snapshots to the mutable Agent.
+//! Overlapping runs do not merge: last completion wins. Feedback resolves an
+//! existing path through environment replay.
 
+mod agent;
+pub use agent::{Agent, AgentConfig, AgentRun, AgentRuntime, RunOptions};
 mod history;
 use history::PathStep;
 pub use history::{
-    Agent, AgentDescriptor, AgentQuery, AgentResolver, Asset, Assets, ChildAgentRun,
-    ChildAgentUpdate, ChildHistoryRun, ChildHistoryUpdate, EnvObservation, History,
-    HistoryDescriptor, HistoryNode, HistoryQuery, HistoryResolver, NodeRef, Observation,
-    OutputRecord, RecordStore, SubagentContract, SubagentHistory, SubagentRecord, UserContinuation,
+    AgentDescriptor, AgentQuery, AgentResolver, AgentSnapshot, Asset, Assets, ChildAgentRun,
+    ChildAgentUpdate, EnvObservation, HistoryNode, NodeRef, Observation, OutputRecord, RecordStore,
+    SubagentContract, SubagentRecord, UserContinuation,
 };
 
 use indexmap::IndexMap;
@@ -217,7 +219,7 @@ impl<P> Completion<P> {
 /// Rust cannot fabricate the Python implementation's string sentinel for an
 /// arbitrary `P`, so the caller supplies the payload to use on exhaustion.
 /// Both fresh and replayed assistant turns count toward the per-branch limit.
-/// The fallback is a run result, not an assistant message: the Agent retains its
+/// The fallback is a run result, not an assistant message: the AgentSnapshot retains its
 /// real checkpoint for replay with a larger or no budget.
 pub struct Budget<P> {
     pub max_steps_per_branch: usize,
@@ -253,7 +255,7 @@ impl<P> Debug for Budget<P> {
     }
 }
 
-/// Reserved specialized tool implemented by a nested [`BatchLoop`].
+/// Reserved specialized tool implemented by a nested investigation.
 /// The caller deterministically constructs initial USER content from structured
 /// arguments; schemas are advertisements, not runtime argument validation.
 pub struct SubagentTool<P> {
@@ -340,7 +342,8 @@ impl<P> Debug for SubagentTool<P> {
 }
 
 /// Configuration shared by default and custom-grouping constructors.
-/// Every loop records an immutable [`Agent`]; [`Self::with_agent`] supplies prior history.
+/// Internal engine configuration. Prefer [`AgentConfig`] and [`Agent::start`].
+#[doc(hidden)]
 #[derive(Clone, Debug)]
 pub struct LoopConfig<P> {
     pub prompt: P,
@@ -348,12 +351,12 @@ pub struct LoopConfig<P> {
     pub tool_specs: Vec<ToolSpec>,
     pub subagent: Option<SubagentTool<P>>,
     pub subagents: Option<Vec<SubagentTool<P>>>,
-    /// Compatibility field; configure agent lookup with with_agent_resolver.
-    pub history_resolver: Option<AgentResolver<P>>,
+    /// Caller-owned child revision lookup.
+    pub agent_resolver: Option<AgentResolver<P>>,
     pub record_store: Option<RecordStore<P>>,
     pub budget: Option<Budget<P>>,
-    /// Optional prior snapshot for replay; configure with with_agent.
-    pub history: Option<Agent<P>>,
+    /// Optional prior snapshot for replay.
+    pub snapshot: Option<AgentSnapshot<P>>,
     prompt_eq: Option<fn(&P, &P) -> bool>,
     /// Some(payload) is one intervention; even Some(None) for an optional payload.
     pub feedback: Option<P>,
@@ -367,35 +370,27 @@ impl<P> LoopConfig<P> {
             tool_specs,
             subagent: None,
             subagents: None,
-            history_resolver: None,
+            agent_resolver: None,
             record_store: None,
             budget: None,
-            history: None,
+            snapshot: None,
             prompt_eq: None,
             feedback: None,
         }
     }
 
     /// Replay and record a snapshot under compatible structural configuration.
-    pub fn with_agent(mut self, previous: Agent<P>) -> Self
+    pub fn with_snapshot(mut self, previous: AgentSnapshot<P>) -> Self
     where
         P: PartialEq,
     {
-        self.history = Some(previous);
+        self.snapshot = Some(previous);
         self.prompt_eq = Some(PartialEq::eq);
         self
     }
 
-    /// Compatibility spelling of with_agent; still resolves environments through replay.
-    pub fn with_replay(self, previous: Agent<P>) -> Self
-    where
-        P: PartialEq,
-    {
-        self.with_agent(previous)
-    }
-
     /// Select the shared record resolver/writer for root and child recording.
-    /// A conflicting store on an existing history is rejected during construction.
+    /// A conflicting store on an existing snapshot is rejected during construction.
     pub fn with_record_store(mut self, store: RecordStore<P>) -> Self {
         self.record_store = Some(store);
         self
@@ -423,22 +418,8 @@ impl<P> LoopConfig<P> {
     where
         P: PartialEq,
     {
-        self.history_resolver = Some(AgentResolver::new(resolver));
+        self.agent_resolver = Some(AgentResolver::new(resolver));
         self
-    }
-
-    /// Compatibility spelling of with_agent_resolver.
-    pub fn with_history_resolver(
-        self,
-        resolver: impl Fn(&AgentQuery<P>) -> Result<Option<AgentDescriptor<P>>, LoopError>
-        + Send
-        + Sync
-        + 'static,
-    ) -> Self
-    where
-        P: PartialEq,
-    {
-        self.with_agent_resolver(resolver)
     }
 
     pub fn with_subagent(mut self, subagent: SubagentTool<P>) -> Self {
@@ -478,21 +459,21 @@ pub struct BatchResult<P> {
     pub classes: Vec<EnvClass>,
     /// Final answers or budget fallbacks, separate from recorded model evidence.
     pub results: BTreeMap<String, P>,
-    /// Compatibility field; prefer agent() for the recorded agent snapshot.
-    pub history: Agent<P>,
-    /// Compatibility field; prefer child_agents().
-    pub child_histories: Vec<ChildAgentUpdate<P>>,
+    /// Immutable final history, independent of later owner publications.
+    pub snapshot: AgentSnapshot<P>,
+    /// Independent completed child forks; caller selects future cache revisions.
+    pub child_updates: Vec<ChildAgentUpdate<P>>,
 }
 
 impl<P> BatchResult<P> {
-    pub fn agent(&self) -> &Agent<P> {
-        &self.history
+    pub fn snapshot(&self) -> &AgentSnapshot<P> {
+        &self.snapshot
     }
-    pub fn into_agent(self) -> Agent<P> {
-        self.history
+    pub fn into_snapshot(self) -> AgentSnapshot<P> {
+        self.snapshot
     }
-    pub fn child_agents(&self) -> &[ChildAgentUpdate<P>] {
-        &self.child_histories
+    pub fn child_updates(&self) -> &[ChildAgentUpdate<P>] {
+        &self.child_updates
     }
 }
 
@@ -510,11 +491,11 @@ pub enum LoopError {
     InvalidSubagentArguments(String),
     #[error("subagent preparation failed: {0}")]
     SubagentPreparation(String),
-    #[error("history resolution failed: {0}")]
+    #[error("snapshot resolution failed: {0}")]
     HistoryResolution(String),
-    #[error("incompatible history prompt, tools, subagents or record store")]
+    #[error("incompatible snapshot prompt, tools, subagents or record store")]
     IncompatibleHistory,
-    #[error("feedback requires a supplied history and exactly one environment")]
+    #[error("feedback requires a supplied snapshot and exactly one environment")]
     InvalidFeedback,
     #[error("no recorded completed conversation on the feedback resolution path")]
     FeedbackResolutionMiss,
@@ -650,10 +631,11 @@ struct ChildRoute {
 /// Methods take `&mut self`; callers that need cross-thread serving can put
 /// the loop behind their preferred `Mutex` without paying for synchronization
 /// they do not need.
+#[doc(hidden)]
 pub struct BatchLoop<P, K = P> {
     specs: Vec<ToolSpec>,
     subagents: IndexMap<String, SubagentTool<P>>,
-    history_resolver: Option<AgentResolver<P>>,
+    agent_resolver: Option<AgentResolver<P>>,
     unavailable_subagents: HashSet<String>,
     comparison_key: Arc<ComparisonKeyFunction<P, K>>,
     budget: Option<Budget<P>>,
@@ -664,14 +646,14 @@ pub struct BatchLoop<P, K = P> {
     next_child: u64,
     branches: HashMap<String, Branch<P>>,
     partition: Vec<BranchRecord>, // legacy per-run partition summary
-    recorded: Agent<P>,
+    recorded: AgentSnapshot<P>,
     feedback: Option<P>,
     resolve_only: bool,
-    resolution_base: Option<Agent<P>>,
+    resolution_base: Option<AgentSnapshot<P>>,
     error: Option<LoopError>,
     prompt_eq: Option<fn(&P, &P) -> bool>,
     finals: Vec<FinalBranch<P>>,
-    child_histories: Vec<ChildAgentUpdate<P>>,
+    child_updates: Vec<ChildAgentUpdate<P>>,
     ready_llm: VecDeque<LlmRequest<P>>,
     ready_tool: VecDeque<ToolRequest>,
     outstanding: HashMap<String, Request<P>>,
@@ -745,14 +727,14 @@ where
             .unwrap_or_else(|| config.subagent.into_iter().collect());
         let registry = register(config.tool_specs, definitions)?;
         unavailable_subagents.retain(|name| !registry.subagents.contains_key(name));
-        if config.feedback.is_some() && (config.env_ids.len() != 1 || config.history.is_none()) {
+        if config.feedback.is_some() && (config.env_ids.len() != 1 || config.snapshot.is_none()) {
             return Err(LoopError::InvalidFeedback);
         }
         let resolve_only = resolve_only || config.feedback.is_some();
         let prompt_eq = config
             .prompt_eq
-            .or_else(|| config.history_resolver.as_ref().map(|r| r.prompt_eq));
-        let recorded = if let Some(previous) = config.history {
+            .or_else(|| config.agent_resolver.as_ref().map(|r| r.prompt_eq));
+        let recorded = if let Some(previous) = config.snapshot {
             if config
                 .record_store
                 .as_ref()
@@ -766,7 +748,7 @@ where
             previous
         } else {
             let store = config.record_store.unwrap_or_default();
-            Agent {
+            AgentSnapshot {
                 descriptor: AgentDescriptor {
                     prompt: config.prompt,
                     tools: registry.specs.clone(),
@@ -796,7 +778,7 @@ where
         let mut loop_ = Self {
             specs: registry.specs,
             subagents: registry.subagents,
-            history_resolver: config.history_resolver,
+            agent_resolver: config.agent_resolver,
             unavailable_subagents,
             comparison_key,
             budget: config.budget,
@@ -813,7 +795,7 @@ where
             error: None,
             prompt_eq,
             finals: Vec::new(),
-            child_histories: Vec::new(),
+            child_updates: Vec::new(),
             ready_llm: VecDeque::new(),
             ready_tool: VecDeque::new(),
             outstanding: HashMap::new(),
@@ -936,7 +918,7 @@ where
     }
 
     /// Build the immutable trie, final classes, and per-environment results.
-    /// A terminal resolution/history failure returns its stored error, not a partial result.
+    /// A terminal resolution/snapshot failure returns its stored error, not a partial result.
     pub fn result(&mut self) -> Result<BatchResult<P>, LoopError> {
         let done = self.is_done();
         if let Some(error) = &self.error {
@@ -948,7 +930,7 @@ where
         Ok(self.finalize())
     }
 
-    /// Terminal resolution/history error, not a correctable completion validation error.
+    /// Terminal resolution/snapshot error, not a correctable completion validation error.
     pub fn error(&self) -> Option<&LoopError> {
         self.error.as_ref()
     }
@@ -968,15 +950,15 @@ where
     }
 
     /// A structurally shared snapshot; builders and pending requests are not persisted.
-    pub fn agent(&self) -> Agent<P> {
+    pub fn snapshot(&self) -> AgentSnapshot<P> {
         let mut snapshot = self.recorded.clone();
         for link in self.children.values() {
-            let child = link.child.agent();
+            let child = link.child.snapshot();
             let branch = &self.branches[&link.branch_id];
             let current = snapshot.node(&branch.history_path);
             if current.subagents.iter().any(|old| {
                 old.call_id == link.call.id
-                    && old.history.root == child.descriptor.root
+                    && old.snapshot.root == child.descriptor.root
                     && old.runs.len() == link.prior_runs.len() + 1
             }) {
                 continue;
@@ -986,11 +968,11 @@ where
             runs.push(Arc::new(ChildAgentRun {
                 env_ids: branch.env_ids.clone(),
                 base: link.base.clone(),
-                history: child.descriptor.clone(),
+                snapshot: child.descriptor.clone(),
             }));
             let entry = SubagentRecord {
                 call_id: link.call.id.clone(),
-                history: child.descriptor,
+                snapshot: child.descriptor,
                 runs,
             };
             if let Some(old) = node
@@ -1007,15 +989,10 @@ where
         snapshot
     }
 
-    /// Compatibility spelling of agent().
-    pub fn history(&self) -> Agent<P> {
-        self.agent()
-    }
-
     /// Fork an open shared-path continuation of an already completed run. This
     /// legacy helper does not resume this loop. Prefer with_feedback for strict
     /// replay-only resolution before resumption. No endpoint ID is accepted.
-    pub fn append_user_message(&mut self, content: P) -> Result<Agent<P>, LoopError> {
+    pub fn append_user_message(&mut self, content: P) -> Result<AgentSnapshot<P>, LoopError> {
         if let Some(error) = &self.error {
             return Err(error.clone());
         }
@@ -1026,7 +1003,7 @@ where
         {
             return Err(LoopError::UnresolvedConversation);
         }
-        let mut snapshot = self.history();
+        let mut snapshot = self.snapshot();
         let path = &self.finals[0].history_path;
         let mut node = snapshot.node(path).as_ref().clone();
         node.user_continuations.push(UserContinuation {
@@ -1129,7 +1106,7 @@ where
                 self.fail(error);
                 return;
             }
-            self.recorded = self.history();
+            self.recorded = self.snapshot();
             if done_keys.is_empty() {
                 return;
             }
@@ -1146,15 +1123,15 @@ where
                 branch
                     .turn_results
                     .insert(link.call.id.clone(), child_result.results);
-                self.child_histories.extend(child_result.child_histories);
-                self.child_histories.push(ChildAgentUpdate {
+                self.child_updates.extend(child_result.child_updates);
+                self.child_updates.push(ChildAgentUpdate {
                     request_prefix: link.child.id_prefix.clone(),
                     branch_id: branch.branch_id.clone(),
                     depth: branch.steps,
                     tool_call: link.call,
                     env_ids: branch.env_ids.clone(),
                     base: link.base,
-                    history: child_result.history,
+                    snapshot: child_result.snapshot,
                 });
                 if branch.turn_results.len() == branch.turn_calls.len() {
                     self.advance_turn(branch);
@@ -1329,24 +1306,24 @@ where
         mut prepared: PreparedChildren<P, K>,
     ) -> Option<Branch<P>> {
         self.branches.remove(&branch.branch_id);
-        let history = &mut self.recorded;
-        let mut node = history.node(&branch.history_path).as_ref().clone();
+        let snapshot = &mut self.recorded;
+        let mut node = snapshot.node(&branch.history_path).as_ref().clone();
         node.assistant.get_or_insert_with(|| message.clone());
         node.env_ids.extend(branch.env_ids.clone());
-        history.replace_node(&branch.history_path, node);
+        snapshot.replace_node(&branch.history_path, node);
         branch.steps += 1;
         branch.messages.push(message.clone());
         if message.tool_calls.is_empty() {
-            let mut node = history.node(&branch.history_path).as_ref().clone();
+            let mut node = snapshot.node(&branch.history_path).as_ref().clone();
             if node.user_continuations.is_empty()
                 && let Some(content) = self.feedback.take()
             {
                 node.user_continuations.push(UserContinuation {
                     message: Message::user(content),
-                    continuation: history.store.put(HistoryNode::default()),
+                    continuation: snapshot.store.put(HistoryNode::default()),
                     resolved_env_id: Some(branch.env_ids[0].clone()),
                 });
-                history.replace_node(&branch.history_path, node.clone());
+                snapshot.replace_node(&branch.history_path, node.clone());
                 self.resolve_only = false;
                 self.resolution_base = None;
             }
@@ -1372,7 +1349,7 @@ where
         self.branches.insert(branch.branch_id.clone(), branch);
         // Attach newly spawned (possibly still open) children once, so repeated
         // snapshots and rejected completions retain the same root reference.
-        self.recorded = self.history();
+        self.recorded = self.snapshot();
         None
     }
 
@@ -1427,7 +1404,7 @@ where
         let mut prior_runs = Vec::new();
         let node = self.recorded.node(&branch.history_path);
         if let Some(entry) = node.subagents.iter().find(|s| s.call_id == call.id) {
-            previous = Some(Agent {
+            previous = Some(AgentSnapshot {
                 descriptor: entry.agent_descriptor().clone(),
                 store: self.recorded.store.clone(),
             });
@@ -1436,7 +1413,7 @@ where
                 prior_runs.push(Arc::new(ChildAgentRun {
                     env_ids: vec![],
                     base: None,
-                    history: entry.history.clone(),
+                    snapshot: entry.snapshot.clone(),
                 }));
             }
         }
@@ -1446,7 +1423,7 @@ where
             return Err(LoopError::FeedbackResolutionMiss);
         }
         if previous.is_none()
-            && let Some(resolver) = &self.history_resolver
+            && let Some(resolver) = &self.agent_resolver
         {
             let query = AgentQuery {
                 prompt: prompt.clone(),
@@ -1454,7 +1431,7 @@ where
                 subagents: registry.contracts,
             };
             if let Some(descriptor) = (resolver.resolve)(&query)? {
-                previous = Some(Agent {
+                previous = Some(AgentSnapshot {
                     descriptor,
                     store: self.recorded.store.clone(),
                 });
@@ -1467,10 +1444,10 @@ where
             tool_specs: registry.specs,
             subagent: None,
             subagents: Some(nested),
-            history_resolver: self.history_resolver.clone(),
+            agent_resolver: self.agent_resolver.clone(),
             record_store: Some(self.recorded.store.clone()),
             budget: self.budget.clone(),
-            history: previous,
+            snapshot: previous,
             prompt_eq: self.prompt_eq,
             feedback: None,
         };
@@ -1514,8 +1491,8 @@ where
         for (key, env_ids) in groups {
             let mut messages = branch.messages.clone();
             let mut history_path = branch.history_path.clone();
-            let history = &mut self.recorded;
-            let mut node = history.node(&history_path).as_ref().clone();
+            let snapshot = &mut self.recorded;
+            let mut node = snapshot.node(&history_path).as_ref().clone();
             let evidence: Vec<_> = env_ids
                 .iter()
                 .map(|env| EnvObservation {
@@ -1548,7 +1525,7 @@ where
                 node.observations.push(Observation {
                     representative: evidence[0].outputs.clone(),
                     evidence: Vec::new(),
-                    continuation: history.store.put(HistoryNode::default()),
+                    continuation: snapshot.store.put(HistoryNode::default()),
                 });
             }
             let edge = &mut node.observations[index];
@@ -1556,7 +1533,7 @@ where
             for (call, output) in branch.turn_calls.iter().zip(&edge.representative) {
                 messages.push(Message::tool(output.tool_output.clone(), call.id.clone()));
             }
-            history.replace_node(&history_path, node);
+            snapshot.replace_node(&history_path, node);
             history_path.push(PathStep::Observation(index));
             if !split {
                 branch.messages = messages;
@@ -1635,8 +1612,8 @@ where
             tree: root.expect("partition always contains a root"),
             classes,
             results,
-            history: self.recorded.clone(),
-            child_histories: self.child_histories.clone(),
+            snapshot: self.recorded.clone(),
+            child_updates: self.child_updates.clone(),
         }
     }
 }
@@ -1704,7 +1681,7 @@ where
 }
 
 /// Synchronous convenience driver with a caller-provided comparison key.
-/// See [`BatchLoop::with_comparison_key`] for key and payload semantics.
+/// See [`Agent::with_comparison_key`] for key and payload semantics.
 pub fn run_to_completion_by<P, K, TF, LF, CK>(
     prompt: P,
     env_ids: Vec<String>,
@@ -1760,6 +1737,8 @@ where
         specs.push(spec);
     }
 
+    // This one-shot driver also accepts opaque P without PartialEq. It cannot
+    // restore/replay a prior root; use Agent for repeated investigations.
     let mut config = LoopConfig::new(prompt, env_ids, specs).with_subagents(subagents);
     config.budget = budget;
     let mut loop_ = BatchLoop::<P, K>::build(

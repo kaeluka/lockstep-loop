@@ -1,6 +1,6 @@
 # Documentation verification
 
-[Documentation](README.md) · [Visual guide](concepts.md) · [API mapping](agent-assets.md)
+[Documentation](README.md) · [Visual guide](concepts.md) · [API glossary](agent-assets.md)
 
 ## What the documentation claims
 
@@ -11,8 +11,12 @@ are caller-defined environments—not built-in integrations. The
 
 The documentation preserves these boundaries:
 
-- An `Agent` contains its prompt, structural configuration, and recorded trie.
-  An `Asset` is a read-only leaf view backed by its path, not merely its value.
+- `Agent` is the mutable entry point; `AgentSnapshot` is its immutable recorded
+  prompt/configuration/trie. `AgentRun` independently extends a captured root.
+  An Asset is an immutable path-backed view anchored in a snapshot, not just a value.
+- Successful completion publishes exactly once, including cached/budget starts.
+  Overlapping runs do not merge: last completion wins. Failures/abandonment do not
+  publish, and inspecting an older run cannot replace a newer head.
 - Sharing follows equal observed outputs, not topical similarity or equivalent
   outcomes. Tools still run per environment; split classes do not remerge.
 - Replay does not guarantee coverage. A missing investigative step must be caught
@@ -35,18 +39,18 @@ The documentation preserves these boundaries:
 | Feedback resolution and shared-path inheritance | [Python feedback](../python/tests/test_feedback.py), [Rust feedback](../rust/tests/feedback.rs) |
 | Specialized registries, independent children, pinned revisions, concurrent updates | [Python specialists](../python/tests/test_specialized_subagents.py), [Rust specialists](../rust/tests/specialized_subagents.rs) |
 | Completion recovery and serving costs | [Python transactions](../python/tests/test_transactional_transitions.py), [cost guards](../python/tests/test_transition_cost.py), [Rust transactions](../rust/tests/transactional_transitions.rs) |
-| Naming aliases and legacy contract imports preserve full evidence | [Pickle fixture](../python/tests/fixtures/README.md), [Serde fixture](../rust/tests/fixtures/README.md), both asset suites |
+| Mutable handles, independent snapshots, both overlapping completion orders, automatic publication, failure/budget semantics and lazy storage | [Python entry point](../python/tests/test_agent_entrypoint.py), [Rust entry point](../rust/tests/agent_entrypoint.rs) |
 | No keys needed; implementation changes reuse or branch; external policy is caller-owned | [Python structural reuse](../python/tests/test_structural_reuse.py), [Rust structural reuse](../rust/tests/structural_reuse.rs), specialist suites |
 
 Both structural-reuse suites additionally verify default/custom identity reuse in
 both directions, stricter-key misses against representatives rather than old evidence,
 coarser-key first-existing-edge selection, preserved representative context and fresh
-evidence, unchanged old roots, mode-independent child lookup, and legacy mode imports.
+evidence, unchanged old roots and mode-independent child lookup.
 
-## Checks for contract and grouping-mode removal
+## Checks for the Agent entry-point refactor
 
-- Python: **106 tests**, strict mypy on the core, Ruff lint.
-- Rust: **69 integration tests**, Clippy with warnings denied, formatting checks.
+- Python: **108 tests**, strict mypy on all four source modules, Ruff lint.
+- Rust: **79 integration tests**, Clippy and rustdoc with warnings denied, formatting checks.
 - All **ten provider-free examples**: `product_screening`, `agent_assets`,
   `history_replay`, `feedback`, and `specialized_subagents` in both languages.
 - The new product examples assert **3 LLM calls for 3 initial products in 2
@@ -54,16 +58,16 @@ evidence, unchanged old roots, mode-independent child lookup, and legacy mode im
   changed ratings**. They count tool executions separately and verify old assets
   survive extension. Their assessment rules and model replies are toy fixtures.
 - Relative Markdown links and heading anchors; `git diff --check`.
-- The agent diagram now says tool configuration, not reuse contract; source and
-  previews are kept in sync. No public upload or shared-canvas mutation is needed.
+- The split-completion benchmark runs with Agent/AgentRun (100/400/1000 environments).
+- No paid API calls or credentials. Existing diagrams/reports were not modified.
 
 The file-inspection demos remain protocol examples, not the library's only
-application. Contract and grouping-mode removal changes the source API and omits
-old labels/modes from new wire output. Unchanged legacy fixtures still load and replay; see
-[API/schema compatibility and limitations](agent-assets.md#persistence-and-contract-removal).
-Transactional preparation, full opaque records, immutable snapshots, feedback,
-asset views, request routing, arbitrary completion order and structural cost guards
-remain covered by their existing suites.
+application. No legacy migration is required: obsolete alias/import fixtures were
+removed. Current-format caller-owned storage roundtrips, lazy traversal, child
+provenance, feedback, opaque evidence and collision coverage remain in the existing
+suites and new entry-point tests. Transactional preparation, request routing,
+arbitrary completion order and structural cost guards remain covered.
+See [persistence values and API scope](agent-assets.md#persistence-values-and-api-scope).
 
 ## What fixture tests do not establish
 

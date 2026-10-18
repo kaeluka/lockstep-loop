@@ -1,7 +1,7 @@
 //! Routing must never interpret an opaque provider tool-call ID as an address.
 use lockstep_loop::{
-    BatchLoop, Completion, History, LlmCompletion, LlmRequest, LoopConfig, LoopError, Request,
-    RequestKind, Role, SubagentTool, ToolCall, ToolCompletion, ToolSpec,
+    AgentSnapshot, BatchLoop, Completion, LlmCompletion, LlmRequest, LoopConfig, LoopError,
+    Request, RequestKind, Role, SubagentTool, ToolCall, ToolCompletion, ToolSpec,
 };
 use serde_json::json;
 use std::collections::HashSet;
@@ -16,7 +16,7 @@ fn specs() -> Vec<ToolSpec> {
         .map(|name| ToolSpec::new(*name, "", json!({})))
         .collect()
 }
-fn make_loop(env: &str, previous: Option<History<String>>) -> BatchLoop<String> {
+fn make_loop(env: &str, previous: Option<AgentSnapshot<String>>) -> BatchLoop<String> {
     let config = LoopConfig::new("parent".into(), vec![env.into()], specs()).with_subagent(
         SubagentTool::new(
             specs()[0].clone(),
@@ -25,8 +25,8 @@ fn make_loop(env: &str, previous: Option<History<String>>) -> BatchLoop<String> 
             2,
         ),
     );
-    let config = if let Some(history) = previous {
-        config.with_replay(history)
+    let config = if let Some(snapshot) = previous {
+        config.with_snapshot(snapshot)
     } else {
         config
     };
@@ -209,12 +209,12 @@ fn exercise() {
                 Err(LoopError::UnknownRequest(_))
             ));
             assert_eq!(loop_.outstanding_count(), 0);
-            let history = loop_.history();
+            let snapshot = loop_.snapshot();
             assert_eq!(
-                history.root().assistant.as_ref().unwrap().tool_calls[1].id,
+                snapshot.root().assistant.as_ref().unwrap().tool_calls[1].id,
                 opaque_id
             );
-            let ids: HashSet<_> = history
+            let ids: HashSet<_> = snapshot
                 .root()
                 .subagents
                 .iter()
@@ -222,7 +222,7 @@ fn exercise() {
                 .collect();
             assert_eq!(ids, HashSet::from(["a".to_owned(), opaque_id.to_owned()]));
             for replay_reverse in [false, true] {
-                let mut replay = make_loop("new", Some(history.clone()));
+                let mut replay = make_loop("new", Some(snapshot.clone()));
                 assert_eq!(
                     finish(
                         &mut replay,
@@ -235,7 +235,7 @@ fn exercise() {
                 );
                 assert_eq!(replay.result().unwrap().results["new"], EXPECTED);
             }
-            assert_eq!(history.root().env_ids, ["old"]);
+            assert_eq!(snapshot.root().env_ids, ["old"]);
         }
     }
 }

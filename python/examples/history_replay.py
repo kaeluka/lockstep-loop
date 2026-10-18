@@ -3,8 +3,8 @@
 import pickle
 
 from lockstep_loop import (
+    AgentSnapshot,
     Agent,
-    BatchLoop,
     LlmCompletion,
     LlmRequest,
     RecordStore,
@@ -14,13 +14,16 @@ from lockstep_loop import (
 )
 
 
-def investigate(env: str, observation: str, agent: Agent[str] | None = None):
-    loop = BatchLoop(
-        prompt="Read the revision's status.",
-        env_ids=[env],
-        tool_specs=[ToolSpec("status", "Read status without changing it.", {})],
-        agent=agent,
+def investigate(env: str, observation: str, snapshot: AgentSnapshot[str] | None = None):
+    agent = (
+        Agent.from_snapshot(snapshot)
+        if snapshot is not None
+        else Agent(
+            prompt="Read the revision's status.",
+            tool_specs=[ToolSpec("status", "Read status without changing it.", {})],
+        )
     )
+    loop = agent.start([env])
     llm_calls = 0
     while not loop.done:
         request = loop.next_request()
@@ -43,7 +46,7 @@ def investigate(env: str, observation: str, agent: Agent[str] | None = None):
                 )
             )
     result = loop.result()
-    return result.agent, llm_calls, result.results[env]
+    return agent.snapshot(), llm_calls, result.results[env]
 
 
 def persist(agent, backend):
@@ -62,7 +65,7 @@ def restore(descriptor, backend):
     # No traversal here: core loads just the selected path, including children.
     # Each RecordStore gets a fresh writer namespace (UUID by default in Python).
     store = RecordStore(load=lambda reference: pickle.loads(backend[reference]))
-    return Agent(pickle.loads(descriptor), store)
+    return AgentSnapshot(pickle.loads(descriptor), store)
 
 
 if __name__ == "__main__":

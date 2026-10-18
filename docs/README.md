@@ -8,7 +8,7 @@ contain divergence. These are applications of the same domain-neutral loop.
 
 - **Choose a workload:** [use cases and environment/tool designs](use-cases.md).
   Includes documents, studies, products, datasets, suppliers, and source code.
-- **Name and inspect the model:** [Agent/Asset glossary and API migration](agent-assets.md).
+- **Name and inspect the model:** [Agent, run, snapshot and Asset glossary](agent-assets.md).
 - **Serve requests:** [Python](../python/README.md) · [Rust](../rust/README.md).
 - **Record, replay, and persist:** [technical reference](history-reference.md).
 
@@ -39,7 +39,7 @@ how to bind tools to other evidence sources.
 
 ## Reference and maintenance
 
-- [Agent/Asset inspection and compatibility names](agent-assets.md)
+- [Agent lifecycle and snapshot-backed Asset inspection](agent-assets.md)
 - [Persistence, feedback, child caching, and limitations](history-reference.md)
 - [Diagram sources and previews](diagrams/README.md)
 - [Documentation verification](verification.md)

@@ -4,8 +4,7 @@ from dataclasses import replace
 import pytest
 
 from lockstep_loop import (
-    BatchLoop,
-    History,
+    AgentSnapshot,
     HistoryNode,
     LlmCompletion,
     LlmRequest,
@@ -19,16 +18,17 @@ from lockstep_loop import (
     ToolSpec,
     UserContinuation,
 )
+from lockstep_loop.core import BatchLoop
 
 SPECS = (ToolSpec("probe", "", {}), ToolSpec("status", "", {}), ToolSpec("investigate", "", {}))
 
 
-def nested_loop(envs, history=None, depth=2):
+def nested_loop(envs, snapshot=None, depth=2):
     return BatchLoop(
         prompt="main",
         env_ids=envs,
         tool_specs=SPECS,
-        history=history,
+        snapshot=snapshot,
         subagent=SubagentTool(
             "investigate", "", {}, lambda args: args["question"], lambda _: SPECS, depth
         ),
@@ -82,37 +82,37 @@ def nested_drive(loop, values):
                         ),
                     )
                 )
-            snapshots.append(loop.history)
+            snapshots.append(loop.snapshot)
     return loop.result(), llms, snapshots, tools
 
 
-def child_history(history, name):
-    entry = next(e for e in history.root.subagents if e.call_id == name)
-    return History(entry.history, history.store)
+def child_history(snapshot, name):
+    entry = next(e for e in snapshot.root.subagents if e.call_id == name)
+    return AgentSnapshot(entry.snapshot, snapshot.store)
 
 
-def restore(history, loaded=None):
+def restore(snapshot, loaded=None):
     # Caller codec/backend only. Each serialized record is shallow.
-    records = {ref: pickle.dumps(node) for ref, node in history.store.records().items()}
+    records = {ref: pickle.dumps(node) for ref, node in snapshot.store.records().items()}
 
     def load(ref):
         if loaded is not None:
             loaded.append(ref)
         return pickle.loads(records[ref])
 
-    return History(pickle.loads(pickle.dumps(history.descriptor)), RecordStore(load=load))
+    return AgentSnapshot(pickle.loads(pickle.dumps(snapshot.descriptor)), RecordStore(load=load))
 
 
 def test_nested_histories_mixed_calls_depth_and_equal_parent_answers():
     loop = nested_loop(("a", "b"))
     result, llms, snapshots, _ = nested_drive(loop, {"a": "A", "b": "B"})
-    old = result.history
+    old = result.snapshot
     assert len(result.classes) == 1  # child traces split, parent answers do not
     assert result.classes[0].env_ids == ("a", "b")
     assert [s for s, _ in llms].count("main") == 2
     child = child_history(old, "child")
     grand = child_history(child, "nested")
-    assert grand.descriptor.subagent is None  # configured depth was exhausted
+    assert grand.descriptor.subagents == ()  # configured depth was exhausted
     assert "investigate" not in [spec.name for spec in grand.descriptor.tools]
     assert len(grand.root.observations) == 2
     assert {e.evidence[0].outputs[0].tool_output for e in grand.root.observations} == {
@@ -128,7 +128,7 @@ def test_nested_histories_mixed_calls_depth_and_equal_parent_answers():
     # A snapshot while children are open remains open after the run completes.
     early = snapshots[0]
     assert early.root.subagents
-    assert all(early.load(s.history.root).assistant is None for s in early.root.subagents)
+    assert all(early.load(s.snapshot.root).assistant is None for s in early.root.subagents)
 
     replay, llms, _, tools = nested_drive(nested_loop(("next",), restore(old)), {"next": "A"})
     assert not llms
@@ -138,12 +138,12 @@ def test_nested_histories_mixed_calls_depth_and_equal_parent_answers():
     changed, llms, _, _ = nested_drive(nested_loop(("same", "new"), old), {"same": "A", "new": "C"})
     assert llms and all(scope != "main" for scope, _ in llms)
     assert len(changed.classes) == 1
-    extended_grand = child_history(child_history(changed.history, "child"), "nested")
+    extended_grand = child_history(child_history(changed.snapshot, "child"), "nested")
     assert len(extended_grand.root.observations) == 3
     assert len(grand.root.observations) == 2  # old roots/evidence retained
     assert len(old.root.observations[0].evidence) == 2
     for value in ("A", "B", "C"):
-        _, llms, _, _ = nested_drive(nested_loop(("again",), changed.history), {"again": value})
+        _, llms, _, _ = nested_drive(nested_loop(("again",), changed.snapshot), {"again": value})
         assert not llms
     with pytest.raises(ValueError, match="incompatible"):
         nested_loop(("bad",), old, depth=1)
@@ -171,7 +171,7 @@ def test_repeated_subagent_call_ids_cannot_accept_stale_completions():
         old_child_id = child.request_id
     request = loop.next_request()
     loop.complete(LlmCompletion(request.request_id, "done"))
-    old = loop.history
+    old = loop.snapshot
     assert loop.done
     # Child-only recorded turns settle to completion without any new work.
     replay = nested_loop(("next",), old)
@@ -192,40 +192,40 @@ def test_invalid_nested_completion_preserves_routes_and_snapshot():
         )
     )
     child = loop.next_request()
-    before = loop.history
+    before = loop.snapshot
     duplicate = ToolCall("p", "probe", {})
     with pytest.raises(ValueError, match="duplicate"):
         loop.complete(LlmCompletion(child.request_id, "bad", (duplicate, duplicate)))
-    assert loop.history.descriptor == before.descriptor
+    assert loop.snapshot.descriptor == before.descriptor
     assert loop.outstanding_llm == 1
     loop.complete(LlmCompletion(child.request_id, "probe", (duplicate,)))
     tool = loop.next_request()
-    before = loop.history
+    before = loop.snapshot
     with pytest.raises(ValueError, match="exactly one"):
         loop.complete(ToolCompletion(tool.request_id, (("a", "A"),)))
     assert loop.outstanding_tool == 1
-    assert loop.history.descriptor == before.descriptor
+    assert loop.snapshot.descriptor == before.descriptor
     loop.complete(ToolCompletion(tool.request_id, (("a", "A"), ("b", "A"))))
     final = loop.next_request()
-    before_final = loop.history
+    before_final = loop.snapshot
     with pytest.raises(TypeError):
         loop.complete(LlmCompletion(final.request_id, []))
     assert loop.outstanding_llm == 1
-    assert loop.history.descriptor == before_final.descriptor
+    assert loop.snapshot.descriptor == before_final.descriptor
     loop.complete(LlmCompletion(final.request_id, "same"))
     parent = loop.next_request()
     loop.complete(LlmCompletion(parent.request_id, "done"))
     assert loop.done
     assert not child_history(before, "child").root.observations
-    assert child_history(loop.history, "child").root.observations[0].evidence[1].env_id == "b"
+    assert child_history(loop.snapshot, "child").root.observations[0].evidence[1].env_id == "b"
 
 
-def simple_loop(envs, history=None, store=None):
+def simple_loop(envs, snapshot=None, store=None):
     return BatchLoop(
         prompt="inspect",
         env_ids=envs,
         tool_specs=SPECS[:1],
-        history=history,
+        snapshot=snapshot,
         record_store=store,
     )
 
@@ -255,24 +255,24 @@ def sequential(loop, values, turns):
 def test_deep_shallow_persistence_and_lazy_replay_do_not_load_sibling_paths():
     loop = simple_loop(("left", "right"), store=RecordStore("initial-writer"))
     result, _ = sequential(loop, {"left": "L", "right": "R"}, turns=256)
-    old = result.history
+    old = result.snapshot
     # The records' child fields are addresses, never recursively encoded nodes.
     loaded = []
     backend = {}
 
-    def publish(history):
-        for ref, node in history.store.records().items():
+    def publish(snapshot):
+        for ref, node in snapshot.store.records().items():
             encoded = pickle.dumps(node)
             assert ref not in backend or backend[ref] == encoded
             backend[ref] = encoded
-        return pickle.dumps(history.descriptor)
+        return pickle.dumps(snapshot.descriptor)
 
     def reopen(descriptor):
         def load(ref):
             loaded.append(ref)
             return pickle.loads(backend[ref])
 
-        return History(pickle.loads(descriptor), RecordStore(load=load))
+        return AgentSnapshot(pickle.loads(descriptor), RecordStore(load=load))
 
     original_descriptor = publish(old)
     restored = reopen(original_descriptor)
@@ -285,10 +285,10 @@ def test_deep_shallow_persistence_and_lazy_replay_do_not_load_sibling_paths():
     assert len(loaded) == 257  # selected root/path only, not old ancestor versions
     assert old.root.observations[0].evidence[0].env_id == "left"
     assert len(old.root.observations[0].evidence) == 1
-    replay_descriptor = publish(replay.history)
+    replay_descriptor = publish(replay.snapshot)
     changed, calls = sequential(simple_loop(("new",), reopen(replay_descriptor)), {"new": "NEW"}, 1)
     assert calls == 1
-    extended_descriptor = publish(changed.history)
+    extended_descriptor = publish(changed.snapshot)
     for value in ("L", "R", "NEW"):
         _, calls = sequential(
             simple_loop(("again",), reopen(extended_descriptor)), {"again": value}, 256
@@ -301,7 +301,7 @@ def test_user_continuations_are_scoped_by_resolved_path_not_answer_value():
     old, _ = sequential(simple_loop(("a", "b")), {"a": "A", "b": "B"}, 1)
     # Resolve the investigation anew using snapshot + stable environment. No
     # public session/endpoint ID, nor lookup by the shared "same final" answer.
-    resolving = simple_loop(("a",), old.history)
+    resolving = simple_loop(("a",), old.snapshot)
     _, calls = sequential(resolving, {"a": "A"}, 1)
     assert calls == 0
     extended = resolving.append_user_message("Please check again.")
@@ -313,9 +313,9 @@ def test_user_continuations_are_scoped_by_resolved_path_not_answer_value():
     assert edge.resolved_env_id == "a"
     assert edge.message == Message(role="user", content="Please check again.")
     assert extended.load(edge.continuation).assistant is None
-    assert not old.history.load(old.history.root.observations[0].continuation).user_continuations
-    assert not resolving.history.load(
-        resolving.history.root.observations[0].continuation
+    assert not old.snapshot.load(old.snapshot.root.observations[0].continuation).user_continuations
+    assert not resolving.snapshot.load(
+        resolving.snapshot.root.observations[0].continuation
     ).user_continuations
     resumed, calls = sequential(simple_loop(("a",), extended), {"a": "A"}, 1)
     assert calls == 1
@@ -362,7 +362,7 @@ def test_user_continuations_are_scoped_by_resolved_path_not_answer_value():
     assert final.assistant.content == answered.assistant.content
     assert final.user_continuations[0].message.content == "One more check"
     assert extended.load(edge.continuation).assistant is None
-    assert sequential(simple_loop(("a",), old.history), {"a": "A"}, 1)[1] == 0
+    assert sequential(simple_loop(("a",), old.snapshot), {"a": "A"}, 1)[1] == 0
 
 
 def test_storage_addresses_are_not_content_hashes_and_writer_reuse_is_rejected():
@@ -397,7 +397,7 @@ def test_partition_labels_and_collisions_are_preserved():
         result, _ = sequential(loop, outputs, 1)
         assert set(result.tree.children) == expected
         assert len({c.id for c in result.classes}) == 2
-        assert len(result.agent.root.observations) == 2
-        assert [e.representative[0].tool_output for e in result.agent.root.observations] == list(
+        assert len(result.snapshot.root.observations) == 2
+        assert [e.representative[0].tool_output for e in result.snapshot.root.observations] == list(
             outputs.values()
         )

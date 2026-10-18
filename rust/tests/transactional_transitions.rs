@@ -1,7 +1,8 @@
 //! Library-detected nested incompatibility must be a structured failure, not a panic.
 use lockstep_loop::{
-    BatchLoop, Completion, History, LlmCompletion, LlmRequest, LoopConfig, LoopError, NodeRef,
-    RecordStore, Request, RequestKind, Role, SubagentTool, ToolCall, ToolCompletion, ToolSpec,
+    AgentSnapshot, BatchLoop, Completion, LlmCompletion, LlmRequest, LoopConfig, LoopError,
+    NodeRef, RecordStore, Request, RequestKind, Role, SubagentTool, ToolCall, ToolCompletion,
+    ToolSpec,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -58,12 +59,12 @@ fn subagent(
 }
 fn config(
     sub: SubagentTool<String>,
-    history: Option<History<String>>,
+    snapshot: Option<AgentSnapshot<String>>,
     env: &str,
 ) -> LoopConfig<String> {
     let config = LoopConfig::new("parent".into(), vec![env.into()], specs()).with_subagent(sub);
-    if let Some(history) = history {
-        config.with_replay(history)
+    if let Some(snapshot) = snapshot {
+        config.with_snapshot(snapshot)
     } else {
         config
     }
@@ -125,15 +126,15 @@ fn finish(loop_: &mut BatchLoop<String>, replay: bool) -> BTreeMap<String, Strin
     assert_eq!(loop_.outstanding_count(), 0);
     loop_.result().unwrap().results
 }
-fn persisted(history: &History<String>) -> History<String> {
-    let records: BTreeMap<NodeRef, Vec<u8>> = history
+fn persisted(snapshot: &AgentSnapshot<String>) -> AgentSnapshot<String> {
+    let records: BTreeMap<NodeRef, Vec<u8>> = snapshot
         .store
         .records()
         .into_iter()
         .map(|(r, n)| (r, serde_json::to_vec(&n).unwrap()))
         .collect();
-    History {
-        descriptor: serde_json::from_slice(&serde_json::to_vec(&history.descriptor).unwrap())
+    AgentSnapshot {
+        descriptor: serde_json::from_slice(&serde_json::to_vec(&snapshot.descriptor).unwrap())
             .unwrap(),
         store: RecordStore::with_loader("restored", move |r| {
             Arc::new(serde_json::from_slice(&records[r]).unwrap())
@@ -148,7 +149,7 @@ fn children_are_prepared_once_and_corrected_completions_replay_consistently() {
     let sub = subagent(&fault, &calls, Mismatch::Prompt, 1);
     let mut loop_ = BatchLoop::new(config(sub.clone(), None, "old")).unwrap();
     let request = llm(&mut loop_);
-    let before = loop_.history();
+    let before = loop_.snapshot();
     let duplicate = ToolCall::new("same", "investigate", json!({"required": "bad"}));
     assert!(matches!(
         loop_.complete(Completion::Llm(LlmCompletion {
@@ -159,7 +160,7 @@ fn children_are_prepared_once_and_corrected_completions_replay_consistently() {
         Err(LoopError::DuplicateToolCallId(_))
     ));
     assert!(calls.lock().unwrap().is_empty());
-    assert_eq!(loop_.history(), before);
+    assert_eq!(loop_.snapshot(), before);
     assert_eq!(loop_.outstanding_llm(), 1);
     loop_.complete(mixed(&request.request_id)).unwrap();
     let expected_calls = vec!["specs", "prompt:good", "specs", "prompt:bad"];
@@ -167,12 +168,12 @@ fn children_are_prepared_once_and_corrected_completions_replay_consistently() {
     let expected = "local|answer:good|answer:bad";
     assert_eq!(finish(&mut loop_, false)["old"], expected);
     assert_eq!(*calls.lock().unwrap(), expected_calls); // no factory rerun after commit
-    let history = loop_.history();
+    let snapshot = loop_.snapshot();
     assert_eq!(
-        history.root().assistant.as_ref().unwrap().content,
+        snapshot.root().assistant.as_ref().unwrap().content,
         "delegate"
     );
-    let mut replay = BatchLoop::new(config(sub, Some(persisted(&history)), "new")).unwrap();
+    let mut replay = BatchLoop::new(config(sub, Some(persisted(&snapshot)), "new")).unwrap();
     assert_eq!(finish(&mut replay, true)["new"], expected);
 }
 
@@ -206,16 +207,16 @@ fn incompatible_nested_history_is_rejected_without_panic_at_construction_or_afte
             let request = llm(&mut original);
             original.complete(mixed(&request.request_id)).unwrap();
             let expected = finish(&mut original, false)["old"].clone();
-            let history = original.history();
+            let snapshot = original.snapshot();
             let old_turn = if delayed {
-                history.load(&history.root().observations[0].continuation)
+                snapshot.load(&snapshot.root().observations[0].continuation)
             } else {
-                history.root()
+                snapshot.root()
             };
             fault.store(true, Ordering::Relaxed);
             if delayed {
                 let mut replay =
-                    BatchLoop::new(config(sub.clone(), Some(history.clone()), "new")).unwrap();
+                    BatchLoop::new(config(sub.clone(), Some(snapshot.clone()), "new")).unwrap();
                 let Request::Tool(tool) = replay.next_request(RequestKind::Tool).unwrap() else {
                     panic!()
                 };
@@ -236,7 +237,7 @@ fn incompatible_nested_history_is_rejected_without_panic_at_construction_or_afte
                     replay.complete(completion),
                     Err(LoopError::IncompatibleHistory)
                 );
-                let rejected = replay.history();
+                let rejected = replay.snapshot();
                 let turn = rejected.load(&rejected.root().observations[0].continuation);
                 // A prior ordinary observation was accepted, but the incompatible
                 // assistant turn has NOT been fulfilled/visited for the new env.
@@ -244,15 +245,15 @@ fn incompatible_nested_history_is_rejected_without_panic_at_construction_or_afte
                 assert_eq!(turn.as_ref(), old_turn.as_ref());
             } else {
                 assert!(matches!(
-                    BatchLoop::new(config(sub.clone(), Some(history.clone()), "new")),
+                    BatchLoop::new(config(sub.clone(), Some(snapshot.clone()), "new")),
                     Err(LoopError::IncompatibleHistory)
                 ));
             }
             assert_eq!(old_turn.env_ids, ["old"]);
-            assert_eq!(history.root().env_ids, ["old"]);
+            assert_eq!(snapshot.root().env_ids, ["old"]);
             fault.store(false, Ordering::Relaxed);
             let mut retry =
-                BatchLoop::new(config(sub, Some(persisted(&history)), "again")).unwrap();
+                BatchLoop::new(config(sub, Some(persisted(&snapshot)), "again")).unwrap();
             assert_eq!(finish(&mut retry, true)["again"], expected);
         }
     }
@@ -305,9 +306,9 @@ fn late_incompatibility_in_a_grandchild_cancels_root_routes_coherently() {
         }))
         .unwrap();
     finish(&mut original, false);
-    let history = original.history();
+    let snapshot = original.snapshot();
     fault.store(true, Ordering::Relaxed);
-    let mut replay = BatchLoop::new(config(sub, Some(history.clone()), "new")).unwrap();
+    let mut replay = BatchLoop::new(config(sub, Some(snapshot.clone()), "new")).unwrap();
     let Request::Tool(child_tool) = replay.next_request(RequestKind::Tool).unwrap() else {
         panic!()
     };
@@ -330,5 +331,5 @@ fn late_incompatibility_in_a_grandchild_cancels_root_routes_coherently() {
         })),
         Err(LoopError::IncompatibleHistory)
     );
-    assert_eq!(history.root().env_ids, ["old"]);
+    assert_eq!(snapshot.root().env_ids, ["old"]);
 }

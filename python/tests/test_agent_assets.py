@@ -1,20 +1,14 @@
 import pickle
-import pickletools
 from dataclasses import FrozenInstanceError
-from pathlib import Path
 
 import pytest
 
-import lockstep_loop as api
 from lockstep_loop import (
-    Agent,
     AgentDescriptor,
-    AgentQuery,
+    AgentSnapshot,
     Asset,
-    BatchLoop,
     EnvObservation,
     Feedback,
-    History,
     HistoryNode,
     LlmCompletion,
     LlmRequest,
@@ -27,6 +21,7 @@ from lockstep_loop import (
     ToolCompletion,
     ToolSpec,
 )
+from lockstep_loop.core import BatchLoop
 
 READ = ToolSpec("read", "read-only", {})
 
@@ -35,7 +30,7 @@ def record():
     loop = BatchLoop(
         prompt="inspect", env_ids=["A", "B", "D"], tool_specs=[READ]
     )
-    empty = loop.agent
+    empty = loop.snapshot
     initial = next(empty.assets())
     assert not initial.is_complete and not initial.has_value and initial.env_ids == ()
     assert initial.messages[0].content == "inspect"
@@ -45,7 +40,7 @@ def record():
     loop.complete(
         LlmCompletion(request.request_id, "read", (ToolCall("r", "read", {"path": "/entry"}),))
     )
-    pending = next(loop.agent.assets())
+    pending = next(loop.snapshot.assets())
     assert not pending.is_complete and not pending.has_value
     assert pending.env_ids == ("A", "B", "D")
     assert pending.messages[-1].tool_calls[0].args == {"path": "/entry"}
@@ -53,38 +48,38 @@ def record():
     loop.complete(
         ToolCompletion(request.request_id, (("D", "different"), ("B", "shared"), ("A", "shared")))
     )
-    open_agent = loop.agent
+    open_agent = loop.snapshot
     assert [a.env_ids for a in open_agent.assets()] == [("A", "B"), ("D",)]
     assert all(not a.is_complete and not a.has_value for a in open_agent.assets())
     while not loop.done:
         r = loop.next_request()
         loop.complete(LlmCompletion(r.request_id, "no issues"))
     result = loop.result()
-    assert result.agent is loop.agent is loop.history
-    assert result.child_agents is result.child_histories
-    return loop.agent, empty, open_agent
+    assert result.snapshot is loop.snapshot
+    assert result.child_updates == ()
+    return loop.snapshot, empty, open_agent
 
 
 def test_assets_are_path_backed_leaves_not_values_or_environment_classes():
     agent, empty, opened = record()
-    assert isinstance(agent, Agent) and Agent is History
+    assert isinstance(agent, AgentSnapshot)
     assert agent.prompt == "inspect"
     assets = list(agent.assets())
     assert len(assets) == 2
     assert [a.env_ids for a in assets] == [("A", "B"), ("D",)]
     assert all(a.is_complete and a.value == "no issues" for a in assets)
     assert assets[0].messages != assets[1].messages  # same answer, different investigations
-    assert assets[0].agent is agent
+    assert assets[0].snapshot is agent
     assert [m.role for m in assets[0].messages] == ["user", "assistant", "tool", "assistant"]
     assert assets[0].observations[0].evidence[1].env_id == "B"
     assert assets[0].nodes[-1] is assets[0].node
     assert not hasattr(assets[0], "id") and not hasattr(assets[0], "resume")
-    with pytest.raises(TypeError, match="Agent.assets"):
+    with pytest.raises(TypeError, match="AgentSnapshot.assets"):
         Asset()
-    with pytest.raises(TypeError, match="persist the agent"):
+    with pytest.raises(TypeError, match="persist the snapshot"):
         pickle.dumps(assets[0])
     with pytest.raises(FrozenInstanceError):
-        assets[0].agent = empty
+        assets[0].snapshot = empty
     assert not next(empty.assets()).has_value
     assert all(not a.is_complete for a in opened.assets())
     with pytest.raises(TypeError, match="not an asset"):
@@ -92,7 +87,7 @@ def test_assets_are_path_backed_leaves_not_values_or_environment_classes():
             prompt="inspect",
             env_ids=["A"],
             tool_specs=[READ],
-            agent=assets[0],
+            snapshot=assets[0],
             feedback=Feedback("check"),
         )
 
@@ -104,13 +99,13 @@ def test_feedback_moves_the_leaf_but_preserves_old_assets_and_publication():
         prompt=old.prompt,
         env_ids=["A"],
         tool_specs=[READ],
-        agent=old,
+        snapshot=old,
         feedback=Feedback("check /foo"),
     )
     tool = loop.next_request()
     assert not isinstance(tool, LlmRequest)  # assets do not provide a replay shortcut
     loop.complete(ToolCompletion(tool.request_id, (("A", "shared"),)))
-    pending_agent = loop.agent
+    pending_agent = loop.snapshot
     pending, unrelated = list(pending_agent.assets())
     assert pending.env_ids == ("A", "B")  # shared-path inheritance, not resolved_env_id filtering
     assert not pending.is_complete and pending.has_value
@@ -122,7 +117,7 @@ def test_feedback_moves_the_leaf_but_preserves_old_assets_and_publication():
     request = loop.next_request()
     assert request.messages == pending.messages
     loop.complete(LlmCompletion(request.request_id, "no issues"))
-    current = loop.result().agent
+    current = loop.result().snapshot
     revised = next(current.assets())
     assert revised.is_complete and revised.value == old_asset.value
     assert len(revised.messages) == len(old_asset.messages) + 2
@@ -134,7 +129,7 @@ def test_feedback_moves_the_leaf_but_preserves_old_assets_and_publication():
         prompt=current.prompt,
         env_ids=["C"],
         tool_specs=[READ],
-        agent=current,
+        snapshot=current,
     )
     tool = replay.next_request()
     replay.complete(ToolCompletion(tool.request_id, (("C", "shared"),)))
@@ -154,7 +149,7 @@ def test_asset_views_keep_lossy_evidence_and_real_null_values():
     loop.complete(ToolCompletion(r.request_id, (("A", b"bytes "), ("B", b"bytes"))))
     r = loop.next_request()
     loop.complete(LlmCompletion(r.request_id, None))
-    asset = next(loop.agent.assets())
+    asset = next(loop.snapshot.assets())
     assert asset.is_complete and asset.has_value and asset.value is None
     assert asset.published_message.content is None
     assert asset.messages[-2].content == b"bytes "
@@ -165,7 +160,7 @@ def test_asset_views_keep_lossy_evidence_and_real_null_values():
     assert asset.env_ids == ("A", "B")
 
 
-def test_asset_enumeration_is_lazy_read_only_and_does_not_visit_child_agents():
+def test_asset_enumeration_is_lazy_read_only_and_does_not_visit_child_updates():
     agent, _, _ = record()
     records = {ref: pickle.dumps(node) for ref, node in agent.store.records().items()}
     loaded = []
@@ -174,7 +169,7 @@ def test_asset_enumeration_is_lazy_read_only_and_does_not_visit_child_agents():
         loaded.append(reference)
         return pickle.loads(records[reference])
 
-    restored = Agent(pickle.loads(pickle.dumps(agent.descriptor)), RecordStore(load=load))
+    restored = AgentSnapshot(pickle.loads(pickle.dumps(agent.descriptor)), RecordStore(load=load))
     views = restored.assets()
     assert loaded == []
     first = next(views)
@@ -187,95 +182,8 @@ def test_asset_enumeration_is_lazy_read_only_and_does_not_visit_child_agents():
     assert restored.store.records() == {}
 
 
-def test_new_names_are_aliases_and_legacy_wire_classes_are_retained():
-    pairs = (
-        ("Agent", "History"),
-        ("AgentDescriptor", "HistoryDescriptor"),
-        ("AgentQuery", "HistoryQuery"),
-        ("SubagentRecord", "SubagentHistory"),
-        ("ChildAgentRun", "ChildHistoryRun"),
-        ("ChildAgentUpdate", "ChildHistoryUpdate"),
-    )
-    for new, old in pairs:
-        assert getattr(api, new) is getattr(api, old)
-        assert new in api.__all__ and old in api.__all__
-    assert api.AgentResolver == api.HistoryResolver
-    agent, _, _ = record()
-    assert type(agent).__name__ == "Agent"
-    assert type(agent.descriptor).__name__ == "HistoryDescriptor"  # pickle wire global unchanged
-    assert AgentDescriptor is api.HistoryDescriptor
-    assert AgentQuery is api.HistoryQuery
-    encoded = pickle.dumps(agent.descriptor, protocol=4)
-    assert b"HistoryDescriptor" in encoded and b"AgentDescriptor" not in encoded
-    assert isinstance(pickle.loads(encoded), AgentDescriptor)
-    for reference, node in agent.store.records().items():
-        assert pickle.loads(pickle.dumps(node)) == node
-        assert reference in agent.store.records()
-    for options in (
-        {"agent": agent, "history": agent},
-        {"agent_resolver": lambda _: None, "history_resolver": lambda _: None},
-    ):
-        with pytest.raises(ValueError, match="not both"):
-            BatchLoop(prompt="p", env_ids=["e"], tool_specs=[], **options)
 
 
-def test_pre_rename_pickle_fixture_loads_replays_and_preserves_wire_names():
-    encoded = (Path(__file__).parent / "fixtures" / "agent-naming-2c6d901.pickle").read_bytes()
-    wire = pickle.loads(encoded)  # trusted fixture generated by unmodified 2c6d901
-    reencoded = pickle.dumps(wire, protocol=4)
-    assert pickle.loads(reencoded) == wire
-
-    # Pickle memoization depends on string identity/interning; require stable
-    # record globals/evidence values, excluding labels, not memo-table bytes.
-    def wire_strings(data):
-        return {arg for op, arg, _ in pickletools.genops(data) if op.name.endswith("UNICODE")}
-
-    assert wire_strings(encoded) - wire_strings(reencoded) == {
-        "contract", "history_contract", "custom_grouping", "fixture/v1", "child/v1"
-    }
-    assert isinstance(wire["descriptor"], AgentDescriptor)
-    assert isinstance(wire["query"], AgentQuery)
-    records = wire["records"]
-    loaded = []
-
-    def load(reference):
-        loaded.append(reference)
-        return records[reference]
-
-    agent = Agent(wire["descriptor"], RecordStore(load=load))
-    asset = next(agent.assets())
-    assert asset.value == b"same answer" and asset.env_ids == ("A", "B")
-    assert [m.role for m in asset.messages] == [
-        "user",
-        "assistant",
-        "tool",
-        "tool",
-        "assistant",
-        "user",
-        "assistant",
-    ]
-    assert len(loaded) == 3  # do not walk child-agent provenance as parent assets
-    assert asset.observations[0].evidence[1].outputs[0].tool_output == b"same"
-    entry = agent.root.subagents[0]
-    assert entry.agent_descriptor is entry.history
-    assert entry.runs[0].agent_descriptor is entry.runs[0].history
-    assert next(agent.child(entry).assets()).value == b"child answer"
-    sub = SubagentTool(
-        "delegate", "child investigation", {}, lambda _: b"child", lambda _: (), subagents=()
-    )
-    loop = BatchLoop(
-        prompt=agent.prompt,
-        env_ids=["C"],
-        tool_specs=agent.descriptor.tools,
-        agent=agent,
-        subagents=[sub],
-        comparison_key=bytes.strip,
-    )
-    tool = loop.next_request()
-    assert not isinstance(tool, LlmRequest)
-    loop.complete(ToolCompletion(tool.request_id, (("C", b"same "),)))
-    assert loop.done and loop.result().results == {"C": b"same answer"}
-    assert pickle.dumps(wire, protocol=4) == reencoded
 
 
 def test_deep_asset_inspection_is_iterative_and_read_only():
@@ -290,7 +198,7 @@ def test_deep_asset_inspection_is_iterative_and_read_only():
                 observations=(Observation(outputs, (EnvObservation("A", outputs),), root),),
             )
         )
-    agent = Agent(AgentDescriptor("inspect", (READ,), root), store)
+    agent = AgentSnapshot(AgentDescriptor("inspect", (READ,), root), store)
     before = len(store.records())
     asset = next(agent.assets())
     assert len(asset.observations) == 1500
@@ -299,7 +207,7 @@ def test_deep_asset_inspection_is_iterative_and_read_only():
     assert len(store.records()) == before
 
 
-def test_child_agent_aliases_preserve_lookup_provenance_and_persistence():
+def test_child_snapshots_preserve_lookup_provenance_and_persistence():
     tool = SubagentTool("inspect", "", {}, lambda _: "child", lambda _: ())
     assert not hasattr(tool, "agent_contract") and not hasattr(tool, "history_contract")
     loop = BatchLoop(
@@ -316,30 +224,30 @@ def test_child_agent_aliases_preserve_lookup_provenance_and_persistence():
     r = loop.next_request()
     loop.complete(LlmCompletion(r.request_id, "parent value"))
     result = loop.result()
-    update = result.child_agents[0]
-    assert update.agent is update.history
-    assert len(list(result.agent.assets())) == 1  # child leaves are not parent assets
-    entry = result.agent.root.subagents[0]
-    assert entry.agent_descriptor is entry.history
-    assert entry.runs[0].agent_descriptor is entry.runs[0].history
-    assert [a.value for a in result.agent.child(entry).assets()] == ["child value"]
-    assert update.agent.descriptor.query() == update.history.descriptor.query()
-    stored = pickle.dumps(result.agent.root)
-    assert b"SubagentHistory" in stored and b"ChildHistoryRun" in stored
-    assert b"SubagentRecord" not in stored and b"ChildAgentRun" not in stored
-    assert "history" in vars(entry) and "agent_descriptor" not in vars(entry)
-    # Preferred aliases drive the same child cache and still rerun/resolve its conversation.
+    update = result.child_updates[0]
+    assert isinstance(update.snapshot, AgentSnapshot)
+    assert len(list(result.snapshot.assets())) == 1  # child leaves are not parent assets
+    entry = result.snapshot.root.subagents[0]
+    assert entry.agent_descriptor is entry.snapshot
+    assert entry.runs[0].agent_descriptor is entry.runs[0].snapshot
+    assert [a.value for a in result.snapshot.child(entry).assets()] == ["child value"]
+    assert update.snapshot.descriptor.query().prompt == "child"
+    stored = pickle.dumps(result.snapshot.root)
+    assert b"SubagentRecord" in stored and b"ChildAgentRun" in stored
+    assert pickle.loads(stored) == result.snapshot.root
+    assert "snapshot" in vars(entry) and "agent_descriptor" not in vars(entry)
+    # Snapshot descriptors select the child cache and still replay its conversation.
     replay = BatchLoop(
         prompt="changed parent",
         env_ids=["B"],
         tool_specs=[],
         subagents=[tool],
-        agent_resolver=lambda _: update.agent.descriptor,
-        record_store=update.agent.store,
+        agent_resolver=lambda _: update.snapshot.descriptor,
+        record_store=update.snapshot.store,
     )
     r = replay.next_request()
     replay.complete(LlmCompletion(r.request_id, "delegate", (ToolCall("new", "inspect", {}),)))
     r = replay.next_request()
     assert r.messages[0].content == "changed parent"  # child final was reused
     replay.complete(LlmCompletion(r.request_id, "parent value"))
-    assert replay.result().child_agents[0].base == update.agent.descriptor
+    assert replay.result().child_updates[0].base == update.snapshot.descriptor

@@ -4,7 +4,6 @@ from dataclasses import dataclass, replace
 import pytest
 
 from lockstep_loop import (
-    BatchLoop,
     Budget,
     Feedback,
     LlmCompletion,
@@ -16,6 +15,7 @@ from lockstep_loop import (
     ToolSpec,
     run_to_completion,
 )
+from lockstep_loop.core import BatchLoop
 
 READ = ToolSpec("read_file", "Read without modifying", {"type": "object"})
 STATUS = ToolSpec("status", "Read status", {})
@@ -61,7 +61,7 @@ def make(
     *,
     resolver=None,
     store=None,
-    history=None,
+    snapshot=None,
     registered=None,
     **options,
 ):
@@ -70,8 +70,8 @@ def make(
         env_ids=envs,
         tool_specs=(STATUS,),
         subagents=definitions() if registered is None else registered,
-        history=history,
-        history_resolver=resolver,
+        snapshot=snapshot,
+        agent_resolver=resolver,
         record_store=store,
         **options,
     )
@@ -132,12 +132,12 @@ def drive(loop, values, parent_calls=None, *, expect_child_llms=None):
     return loop.result(), llms, tools
 
 
-def publish(history, backend):
-    for reference, node in history.store.records().items():
+def publish(snapshot, backend):
+    for reference, node in snapshot.store.records().items():
         encoded = pickle.dumps(node)
         assert reference not in backend or backend[reference] == encoded
         backend[reference] = encoded
-    return pickle.loads(pickle.dumps(history.descriptor))
+    return pickle.loads(pickle.dumps(snapshot.descriptor))
 
 
 def loader(backend):
@@ -153,9 +153,9 @@ def test_multiple_tools_changed_parent_reuses_independent_children_and_persists_
     old, _, _ = drive(first, {"old": "same"}, expect_child_llms=6)
     assert old.results == {"old": "imports:done|metrics:done|ok"}
     backend, selected = {}, {}
-    for update in old.child_histories:
-        selected[update.history.descriptor.prompt] = publish(
-            update.history, backend
+    for update in old.child_updates:
+        selected[update.snapshot.descriptor.prompt] = publish(
+            update.snapshot, backend
         )
         assert update.base is None and update.env_ids == ("old",)
     assert len(selected) == 2
@@ -180,44 +180,44 @@ def test_multiple_tools_changed_parent_reuses_independent_children_and_persists_
         expect_child_llms=0,
     )
     assert len(requests) == 2 and all(r.messages[0].content == "parent-B" for r in requests)
-    assert old.history.descriptor.root not in loaded  # no parent history dependency
+    assert old.snapshot.descriptor.root not in loaded  # no parent snapshot dependency
     assert len([r for r in tools if r.tool_call.name == "read_file"]) == 4
     assert {q.prompt for q in lookups} == {"imports:foo.py", "metrics:foo.py"}
     assert second.results["tomorrow"] == old.results["old"]
-    assert len(second.child_histories) == 2
-    for update in second.child_histories:
-        key = update.history.descriptor.prompt
+    assert len(second.child_updates) == 2
+    for update in second.child_updates:
+        key = update.snapshot.descriptor.prompt
         assert update.base == selected[key]
-        assert update.history.descriptor.root != update.base.root
+        assert update.snapshot.descriptor.root != update.base.root
         assert update.tool_call.id.startswith("opaque/")
-        entry = next(s for s in second.history.root.subagents if s.call_id == update.tool_call.id)
+        entry = next(s for s in second.snapshot.root.subagents if s.call_id == update.tool_call.id)
         assert entry.runs[-1].base == update.base
-        assert entry.runs[-1].history == update.history.descriptor
+        assert entry.runs[-1].snapshot == update.snapshot.descriptor
         assert entry.runs[-1].env_ids == ("tomorrow",)
-        publish(update.history, backend)
-    assert all(u.history.root.env_ids == ("old",) for u in old.child_histories)
+        publish(update.snapshot, backend)
+    assert all(u.snapshot.root.env_ids == ("old",) for u in old.child_updates)
 
     # Replaying the parent uses its pinned revision, not today's external cache pointer.
     def must_not_resolve(_):
         raise AssertionError("recorded parent invocation must remain pinned")
 
     replay, requests, _ = drive(
-        make("parent-B", ("later",), resolver=must_not_resolve, history=second.history),
+        make("parent-B", ("later",), resolver=must_not_resolve, snapshot=second.snapshot),
         {"later": "same"},
         changed_ids,
         expect_child_llms=0,
     )
     assert not requests
-    for entry in replay.history.root.subagents:
+    for entry in replay.snapshot.root.subagents:
         assert len(entry.runs) == 2
-        assert entry.runs[0].history == next(
-            s.history for s in second.history.root.subagents if s.call_id == entry.call_id
+        assert entry.runs[0].snapshot == next(
+            s.snapshot for s in second.snapshot.root.subagents if s.call_id == entry.call_id
         )
 
 
 def test_changed_file_and_changed_observation_branch_without_parent_splits():
     old, _, _ = drive(make(), {"old": "same"})
-    base = next(u.history for u in old.child_histories if u.tool_call.name == "list_imports")
+    base = next(u.snapshot for u in old.child_updates if u.tool_call.name == "list_imports")
     backend = {}
     descriptor = publish(base, backend)
     queries = []
@@ -237,7 +237,7 @@ def test_changed_file_and_changed_observation_branch_without_parent_splits():
         selected_calls,
         expect_child_llms=1,
     )
-    child = changed.child_histories[0].history
+    child = changed.child_updates[0].snapshot
     checkpoint = child.load(child.root.observations[0].continuation)
     assert len(checkpoint.observations) == 2
     assert {e.evidence[-1].outputs[0].tool_output for e in checkpoint.observations} == {
@@ -254,9 +254,9 @@ def test_changed_file_and_changed_observation_branch_without_parent_splits():
             (calls(path)[0],),
             expect_child_llms=3,
         )
-        update = result.child_histories[0]
+        update = result.child_updates[0]
         assert update.base is None
-        assert update.history.descriptor.prompt == f"imports:{path}"
+        assert update.snapshot.descriptor.prompt == f"imports:{path}"
         assert all(r.tool_call.args["path"] == path for r in tools)
     new_definition = replace(definition(), build_prompt=lambda a: f"imports:{a['file_path']}")
     versioned, _, _ = drive(
@@ -270,12 +270,12 @@ def test_changed_file_and_changed_observation_branch_without_parent_splits():
         (calls()[0],),
         expect_child_llms=0,
     )
-    assert versioned.child_histories[0].base == descriptor
+    assert versioned.child_updates[0].base == descriptor
 
 
 def test_concurrent_cache_hits_are_independent_roots_not_single_flight_or_last_writer():
     old, _, _ = drive(make(), {"old": "same"})
-    base = old.child_histories[0].history
+    base = old.child_updates[0].snapshot
     # Completion ordering puts metrics first in this driver's update list.
     name = "count_lines" if base.prompt.startswith("metrics:") else "list_imports"
     backend = {}
@@ -297,25 +297,25 @@ def test_concurrent_cache_hits_are_independent_roots_not_single_flight_or_last_w
         expect_child_llms=2,
     )
     assert len(lookups) == 2 and lookups[0] == lookups[1]
-    updates = result.child_histories
+    updates = result.child_updates
     assert len(updates) == 2
     assert {u.tool_call.id for u in updates} == {c.id for c in invocations}
     assert len({u.request_prefix for u in updates}) == 2
-    assert len({u.history.descriptor.root for u in updates}) == 2
+    assert len({u.snapshot.descriptor.root for u in updates}) == 2
     assert all(u.base == descriptor for u in updates)
-    assert len(result.history.root.subagents) == 2
+    assert len(result.snapshot.root.subagents) == 2
     assert len(base.load(base.root.observations[0].continuation).observations) == 1
     for update in updates:
         assert (
-            len(update.history.load(update.history.root.observations[0].continuation).observations)
+            len(update.snapshot.load(update.snapshot.root.observations[0].continuation).observations)
             == 2
         )
-        publish(update.history, backend)  # both remain publishable; caller chooses future pointer
+        publish(update.snapshot, backend)  # both remain publishable; caller chooses future pointer
 
 
 def test_concurrent_parent_branches_publish_distinct_child_forks():
     old, _, _ = drive(make(), {"old": "same"})
-    base = next(u.history for u in old.child_histories if u.tool_call.name == "list_imports")
+    base = next(u.snapshot for u in old.child_updates if u.tool_call.name == "list_imports")
     backend = {}
     descriptor = publish(base, backend)
     loop = make("parent-split", ("A", "B"), resolver=lambda _: descriptor, store=loader(backend))
@@ -335,11 +335,11 @@ def test_concurrent_parent_branches_publish_distinct_child_forks():
         expect_child_llms=2,
     )
     assert len(result.classes) == 2  # classes never merge despite equal child answers
-    assert len(result.child_histories) == 2
+    assert len(result.child_updates) == 2
     forks = {}
-    for update in result.child_histories:
+    for update in result.child_updates:
         assert update.base == descriptor
-        child = update.history
+        child = update.snapshot
         checkpoint = child.load(child.root.observations[0].continuation)
         forks[update.env_ids] = {e.representative[0].tool_output for e in checkpoint.observations}
         publish(child, backend)
@@ -352,34 +352,27 @@ def test_concurrent_parent_branches_publish_distinct_child_forks():
 
 def test_resolver_compatibility_failures_and_argument_errors_are_transactional():
     old, _, _ = drive(make(), {"old": "same"})
-    base = next(u.history for u in old.child_histories if u.tool_call.name == "list_imports")
+    base = next(u.snapshot for u in old.child_updates if u.tool_call.name == "list_imports")
     backend = {}
     descriptor = publish(base, backend)
-    legacy = pickle.loads(pickle.dumps(descriptor))
-    legacy.__dict__["subagent"] = legacy.__dict__.pop("subagents")
-    legacy_loop = make(resolver=lambda _: legacy, store=loader(backend))
-    legacy_request = legacy_loop.next_request()
-    with pytest.raises(ValueError, match="migrate legacy"):
-        legacy_loop.complete(LlmCompletion(legacy_request.request_id, "bad", (calls()[0],)))
-    assert legacy_loop.outstanding_llm == 1 and legacy_loop.history.root.assistant is None
     for bad in (
         replace(descriptor, prompt="other prompt"),
-        replace(descriptor, subagents=(old.history.descriptor.subagents[0],)),
+        replace(descriptor, subagents=(old.snapshot.descriptor.subagents[0],)),
         replace(descriptor, tools=()),
     ):
         loop = make(resolver=lambda _, bad=bad: bad, store=loader(backend))
         request = loop.next_request()
-        before = loop.history
+        before = loop.snapshot
         with pytest.raises(ValueError, match="incompatible"):
             loop.complete(LlmCompletion(request.request_id, "bad", (calls()[0],)))
-        assert loop.history is before and loop.outstanding_llm == 1 and loop.error is None
+        assert loop.snapshot is before and loop.outstanding_llm == 1 and loop.error is None
         assert loop.next_request() is None
         loop.complete(LlmCompletion(request.request_id, "corrected"))
         assert loop.done and loop.result().results == {"old": "corrected"}
-        assert not loop.result().child_histories
+        assert not loop.result().child_updates
     loop = make(resolver=lambda _: descriptor, store=loader(backend))
     request = loop.next_request()
-    before = loop.history
+    before = loop.snapshot
     with pytest.raises(ValueError, match="file_path"):
         loop.complete(
             LlmCompletion(
@@ -392,12 +385,12 @@ def test_resolver_compatibility_failures_and_argument_errors_are_transactional()
                 ),
             )
         )
-    assert loop.history is before and loop.outstanding_count == 1
+    assert loop.snapshot is before and loop.outstanding_count == 1
     assert loop.next_request() is None
     with pytest.raises(ValueError, match="duplicate"):
         loop.complete(LlmCompletion(request.request_id, "bad", (calls()[0], calls()[0])))
     loop.complete(LlmCompletion(request.request_id, "corrected"))
-    assert loop.result().history.root.assistant.content == "corrected"
+    assert loop.result().snapshot.root.assistant.content == "corrected"
     with pytest.raises(ValueError, match="no outstanding"):
         loop.complete(LlmCompletion(request.request_id, "overwrite"))
 
@@ -405,7 +398,7 @@ def test_resolver_compatibility_failures_and_argument_errors_are_transactional()
 def test_resolver_failure_after_a_prepared_hit_keeps_the_whole_turn_pending():
     old, _, _ = drive(make(), {"old": "same"})
     backend = {}
-    base = next(u.history for u in old.child_histories if u.tool_call.name == "list_imports")
+    base = next(u.snapshot for u in old.child_updates if u.tool_call.name == "list_imports")
     descriptor = publish(base, backend)
     broken = True
     queried = []
@@ -420,18 +413,18 @@ def test_resolver_failure_after_a_prepared_hit_keeps_the_whole_turn_pending():
 
     loop = make("parent-retry", ("new",), resolver=resolve, store=loader(backend))
     request = loop.next_request()
-    before = loop.history
+    before = loop.snapshot
     with pytest.raises(OSError, match="unavailable"):
         loop.complete(model(request, calls()))
     assert queried == ["imports:foo.py", "metrics:foo.py"]
-    assert loop.history is before and loop.outstanding_count == 1 and loop.error is None
+    assert loop.snapshot is before and loop.outstanding_count == 1 and loop.error is None
     assert not loop._children and not loop._child_histories
     assert loop.next_request() is None
     broken = False
     loop.complete(model(request, calls()))
     result, _, _ = drive(loop, {"new": "same"}, expect_child_llms=3)
     assert result.results == {"new": "imports:done|metrics:done|ok"}
-    assert len(result.child_histories) == 2
+    assert len(result.child_updates) == 2
 
 
 def test_registration_rules_legacy_advertisements_and_serial_driver():
@@ -449,8 +442,8 @@ def test_registration_rules_legacy_advertisements_and_serial_driver():
         )
     with pytest.raises(ValueError, match="duplicate tool"):
         BatchLoop(prompt="p", env_ids=["e"], tool_specs=[READ, READ])
-    assert make(registered=(imports,), resolver=lambda _: None).agent.root.assistant is None
-    assert make(resolver=lambda _: None, budget=Budget(100)).agent.root.assistant is None
+    assert make(registered=(imports,), resolver=lambda _: None).snapshot.root.assistant is None
+    assert make(resolver=lambda _: None, budget=Budget(100)).snapshot.root.assistant is None
     legacy = BatchLoop(
         prompt="parent",
         env_ids=["e"],
@@ -475,9 +468,9 @@ def test_registration_rules_legacy_advertisements_and_serial_driver():
         complete_llm=lambda r: model(r, calls()[:2]),
     )
     assert result.results == {"e": "imports:done|metrics:done"}
-    assert len(result.child_histories) == 2
-    assert len(result.agent.root.subagents) == 2
-    assert all(not hasattr(u.history.descriptor, "custom_grouping") for u in result.child_histories)
+    assert len(result.child_updates) == 2
+    assert len(result.snapshot.root.subagents) == 2
+    assert all(not hasattr(u.snapshot.descriptor, "custom_grouping") for u in result.child_updates)
     with pytest.raises(ValueError, match="duplicate tool implementation"):
         run_to_completion(
             prompt="parent-driver",
@@ -528,14 +521,14 @@ def test_nested_allowlists_and_ancestor_depth_cap_do_not_leak_reserved_tools():
     )
     child = loop.next_request()
     assert [s.name for s in child.tools] == ["read_file", "middle"]
-    before = loop.history
+    before = loop.snapshot
     with pytest.raises(ValueError, match="unavailable"):
         loop.complete(
             LlmCompletion(
                 child.request_id, "bad", (ToolCall("s", "sibling", {"file_path": "foo.py"}),)
             )
         )
-    assert loop.history is before and loop.outstanding_llm == 1
+    assert loop.snapshot is before and loop.outstanding_llm == 1
     loop.complete(
         LlmCompletion(child.request_id, "", (ToolCall("m", "middle", {"file_path": "foo.py"}),))
     )
@@ -552,20 +545,20 @@ def test_nested_allowlists_and_ancestor_depth_cap_do_not_leak_reserved_tools():
         r = loop.next_request()
         loop.complete(LlmCompletion(r.request_id, "nested answer"))
     assert loop.done
-    updates = loop.result().child_histories
+    updates = loop.result().child_updates
     assert [u.tool_call.name for u in updates] == ["middle", "outer"]
-    assert updates[0].history.descriptor.subagents == ()
-    assert updates[1].history.descriptor.subagents[0].max_depth == 1
+    assert updates[0].snapshot.descriptor.subagents == ()
+    assert updates[1].snapshot.descriptor.subagents[0].max_depth == 1
 
 
 def test_caller_selected_child_feedback_revision_does_not_rewrite_old_parent():
     old, _, _ = drive(make(), {"old": "same"}, (calls()[0],))
-    child = old.child_histories[0].history
+    child = old.child_updates[0].snapshot
     feedback = BatchLoop(
         prompt=child.descriptor.prompt,
         env_ids=["old"],
         tool_specs=child.descriptor.tools,
-        history=child,
+        snapshot=child,
         feedback=Feedback("Also inspect the header"),
     )
     while True:
@@ -581,7 +574,7 @@ def test_caller_selected_child_feedback_revision_does_not_rewrite_old_parent():
                 (("old", f"{a['path']}:{'prefix' if a['checkpoint'] == 0 else 'same'}"),),
             )
         )
-    improved = feedback.result().history
+    improved = feedback.result().snapshot
     assert not child.load(
         child.load(child.root.observations[0].continuation).observations[0].continuation
     ).user_continuations
@@ -600,18 +593,21 @@ def test_caller_selected_child_feedback_revision_does_not_rewrite_old_parent():
         expect_child_llms=0,
     )
     assert new.results == {"new": "improved imports"}
-    assert new.child_histories[0].base == selected
+    assert new.child_updates[0].base == selected
     count = len(queries)
     pinned, llms, _ = drive(
-        make(history=old.history, resolver=resolve, envs=("new",)),
+        make(snapshot=old.snapshot, resolver=resolve, envs=("new",)),
         {"new": "same"},
         (calls()[0],),
         expect_child_llms=0,
     )
     assert not llms and pinned.results == {"new": "imports:done"}
     assert len(queries) == count  # completed parent pins old child, no automatic propagation
-    assert len(pinned.history.root.subagents[0].runs) == 2
-    assert pinned.history.root.subagents[0].runs[0].history == old.history.root.subagents[0].history
+    assert len(pinned.snapshot.root.subagents[0].runs) == 2
+    assert (
+        pinned.snapshot.root.subagents[0].runs[0].snapshot
+        == old.snapshot.root.subagents[0].snapshot
+    )
 
 
 def test_opaque_prompts_and_hash_collisions_are_verified_by_value():
@@ -640,7 +636,7 @@ def test_opaque_prompts_and_hash_collisions_are_verified_by_value():
             env_ids=["e"],
             tool_specs=[],
             subagents=(tool,),
-            history_resolver=resolver,
+            agent_resolver=resolver,
             record_store=store,
         )
 
@@ -653,8 +649,8 @@ def test_opaque_prompts_and_hash_collisions_are_verified_by_value():
     first.complete(LlmCompletion(r.request_id, Blob(b"answer")))
     r = first.next_request()
     first.complete(LlmCompletion(r.request_id, Blob(b"parent answer")))
-    update = first.result().child_histories[0]
-    second = make_opaque(b"parent-B", lambda _: update.history.descriptor, update.history.store)
+    update = first.result().child_updates[0]
+    second = make_opaque(b"parent-B", lambda _: update.snapshot.descriptor, update.snapshot.store)
     r = second.next_request()
     before_count = second.outstanding_count
     with pytest.raises(ValueError, match="incompatible"):

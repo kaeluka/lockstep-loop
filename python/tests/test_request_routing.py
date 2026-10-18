@@ -1,9 +1,9 @@
+
 """Routing addresses must not be assembled from opaque provider tool-call IDs."""
 
 import pytest
 
 from lockstep_loop import (
-    BatchLoop,
     LlmCompletion,
     LlmRequest,
     SubagentTool,
@@ -11,6 +11,7 @@ from lockstep_loop import (
     ToolCompletion,
     ToolSpec,
 )
+from lockstep_loop.core import BatchLoop
 
 OPAQUE_IDS = ("a/turn-1/sub:root/b", "\0/sub:1/turn-1/llm-1/☃:b")
 PROBE_ID = "probe/turn-1/sub:root/b/llm-1:\0☃"
@@ -18,7 +19,7 @@ EXPECTED = "child1:grandchild:observed:grandchild|child2:observed:child2"
 SPECS = (ToolSpec("investigate", "", {}), ToolSpec("probe", "", {}))
 
 
-def make_loop(env="old", history=None):
+def make_loop(env="old", snapshot=None):
     return BatchLoop(
         prompt="parent",
         env_ids=[env],
@@ -26,7 +27,7 @@ def make_loop(env="old", history=None):
         subagent=SubagentTool(
             "investigate", "", {}, lambda args: args["prompt"], lambda _: SPECS, max_depth=2
         ),
-        history=history,
+        snapshot=snapshot,
     )
 
 
@@ -137,11 +138,11 @@ def test_opaque_nested_ids_route_concurrent_completions_without_aliasing(
         loop.complete(LlmCompletion(grandchild.request_id, "stale"))
     assert loop.outstanding_count == 0
 
-    history = loop.history
-    assert history.root.assistant.tool_calls[1].id == opaque_id
-    assert {entry.call_id for entry in history.root.subagents} == {"a", opaque_id}
+    snapshot = loop.snapshot
+    assert snapshot.root.assistant.tool_calls[1].id == opaque_id
+    assert {entry.call_id for entry in snapshot.root.subagents} == {"a", opaque_id}
     for replay_reverse in (False, True):
-        replay = make_loop("new", history)
+        replay = make_loop("new", snapshot)
         assert finish(replay, set(), opaque_id, replay_reverse, replay=True) == (0, 4)
         assert replay.result().results == {"new": EXPECTED}
-    assert history.root.env_ids == ("old",)
+    assert snapshot.root.env_ids == ("old",)

@@ -26,9 +26,11 @@ stable evidence by the caller first.
 
 ![Product-check agent: the initial prompt and tool configuration are inside the trie. A/B/C share enclosure and temperature observations; D follows a different path. Checking limitations splits A/B from C. A/B share one asset. A blue root-to-leaf path is one conversation.](diagrams/agent-trie.svg)
 
-**Agent** means the whole trie: its initial prompt/investigation recipe, structural
-configuration, and accumulated experience. Not just a prompt, and not the executor
-running it. A trie is a tree whose paths share their common beginnings.
+An **Agent** owns its current experience and starts investigations. Its immutable
+**AgentSnapshot** contains the initial prompt/investigation recipe, structural
+configuration, and accumulated trie. A trie is a tree whose paths share their
+common beginnings. **AgentRun** serves one investigation and publishes a new
+snapshot to the owning Agent on successful completion.
 
 **Conversation** means one root-to-endpoint path: the prompt, assistant messages,
 tool calls and observations, and any later user feedback.
@@ -38,13 +40,12 @@ its published value. The value alone is not the asset: A/B and D above both say
 “meets needs” but arrived there through different evidence. One leaf can represent
 several environments. An open continuation need not have a new completed value yet.
 
-> **Today's API:** `Agent` is the complete immutable snapshot (`History` remains
-> an alias). `agent.assets()` exposes read-only, path-backed `Asset` views, not
-> independent endpoint handles. Values are terminal assistant replies **with no
-> tool calls**, not designated result-tool arguments. An open asset can retain an
-> older value without having a new completed answer.
+> **Today's API:** `agent.snapshot().assets()` exposes read-only, path-backed
+> Asset views anchored in that immutable snapshot, not independent endpoint
+> handles. Values are terminal assistant replies **with no tool calls**, not
+> designated result-tool arguments. An open asset can retain an older value.
 >
-> [Inspect agents/assets and migrate API names →](agent-assets.md)
+> [Inspect agents, runs, snapshots and Assets →](agent-assets.md)
 
 ## Subdivide only when evidence requires it
 
@@ -84,8 +85,11 @@ unseen observation—for example a different unit definition—ask for new reaso
 Even a turn that originally split nobody is a checkpoint where new evidence can
 diverge. Reuse also works for a different dataset with the same observed properties.
 
-Extending experience creates a **new immutable agent snapshot**. Both paths stay
-reusable; the old snapshot stays unchanged. Your application persists descriptors
+Extending experience creates a **new immutable AgentSnapshot**. Successful runs
+publish automatically, so sequential starts accumulate experience. **Warning:**
+overlapping runs capture independent roots and do not merge; the last completion
+wins. Retain each run's snapshot to preserve independent work. Both paths within
+a snapshot stay reusable; old snapshots stay unchanged. Your application persists descriptors
 and records using its own storage. Changed prompts or tool specs require compatible
 history selection or a fresh investigation. Pure tool implementation changes need
 no version bump: tools rerun, matching outputs reuse, different outputs branch.

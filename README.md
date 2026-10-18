@@ -33,7 +33,9 @@ for what can be shared, what causes branching, and when this is a poor fit.
 
 ## The model
 
-- An **Agent** is its prompt, structural configuration, and accumulated investigation trie.
+- An **Agent** is a mutable handle for starting investigations and accumulating experience.
+- An **AgentSnapshot** is its immutable prompt, structural configuration and recorded trie.
+- An **AgentRun** captures the current snapshot, serves requests, and publishes on completion.
 - An **Asset** is a leaf investigation backed by its complete conversation—not
   merely its answer. Several environments can share an asset.
 - **Replay** re-executes tools and reuses recorded assistant turns until an
@@ -73,9 +75,11 @@ environments, and immutable payloads. Environment IDs are caller-side routing
 metadata, not model-visible context. Snapshot live sources before using them;
 recording does not make a changing web page or database query pure.
 
-Every loop and convenience driver records an immutable `Agent`, including children.
-Supplying a prior `Agent` enables replay. Persist
-Agent descriptors and full records with your own codecs and storage. No manual
+Recording is unconditional, including children. Start with `Agent`, drive
+`agent.start(environments)`, and save `agent.snapshot()`. Restore with
+`Agent.from_snapshot(snapshot, ...runtime callbacks...)`, without repeating prompt
+or tool specs. Successful completion automatically advances the handle exactly once.
+Persist snapshot descriptors and full records with your own codecs and storage. No manual
 version key is needed: pure tools are rerun, so implementation changes either
 preserve observations (reuse) or change them (branch). The current grouping function
 compares fresh outputs and recorded representatives; default/custom mode and
@@ -83,6 +87,12 @@ function identity are not cache keys. Coarser keys select the first matching sto
 edge without merging history. External provider/grouping policy and cache isolation
 remain caller responsibilities. This is observation-based reuse, not
 semantic similarity search, model training, or a guarantee of exhaustive research.
+
+**Warning — overlapping runs:** Each start captures the current root. Histories
+are **not merged**; the last completion replaces the Agent's state, potentially
+excluding other runs' experience. Retain each run's snapshot, or complete runs
+sequentially to accumulate experience. Old snapshots remain usable; inspecting
+an old run never republishes it. Failed/abandoned runs do not advance the handle.
 
 ## Go deeper
 

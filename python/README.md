@@ -1,464 +1,202 @@
 # lockstep-loop for Python
 
-Share an investigation across similar, read-only environments, branching only
-when observations differ. An environment can be a document bundle, a product
-specification, a dataset release, or a repository snapshot—not necessarily a
-filesystem. [Start with the visual guide](../docs/concepts.md) or explore
-[use cases and tool designs](../docs/use-cases.md).
+Provider-neutral investigations across stable, read-only environments. The core
+shares reasoning until tool observations differ; your application executes all
+LLM and tool requests. [Visual guide](../docs/concepts.md) ·
+[Use cases](../docs/use-cases.md) · [Technical reference](../docs/history-reference.md).
 
-`Agent` is the complete immutable prompt + structural configuration + accumulated trie
-(`History` remains an alias). `Asset` is a read-only leaf investigation backed by
-its full conversation, not just an answer or an environment class. See the
-[glossary and compatibility mapping](../docs/agent-assets.md).
+## Agent entry point
 
-## How it works
-
-- All environments start in one equivalence class sharing **one** LLM
-  conversation.
-- When the model makes a tool call, the call is evaluated on **every**
-  environment still in the class (SIMD-style fan-out).
-- Results are compared by value equality (or by keys computed with a
-  caller-provided `comparison_key`) and the class is refined — one
-  sub-conversation per distinct result. Branches then advance
-  independently as their completions arrive.
-- The process repeats per branch until done, yielding a prefix-sharing trie
-  whose leaves are **equivalence classes of environments**. LLM work follows
-  distinct observation paths; tools still run per environment. Equal final
-  answers do not merge previously split classes.
-
-Two invariants make this sound: tools must be **pure** (results depend only
-on environment + arguments), and the model must never see which environment
-it is in (tool specs identical across environments).
-
-## Status
-
-Working prototype. The core is a provider-agnostic orchestrator: `BatchLoop`
-owns partition refinement and the trie; the caller owns all LLM and tool
-execution. Pull work with `next_request(kind)` — `"llm"`, `"tool"`, or
-`"any"` — serve it however you like (any order, any concurrency), and feed
-results back with `complete()` as they arrive, so a slow provider or tool
-delays only its own branch. Both request kinds carry their env set (the
-branch's equivalence class), and requests carry a `stats` block (depth,
-split depth, sequence) with facts the caller can compose into a serving
-policy, e.g. "deepest currently available branch first" for prompt-cache
-warmth. All methods are internally synchronized, so separate LLM and tool
-consumer loops can share one `BatchLoop`. A generator adapter (`run_batch`)
-remains for pump-style drivers. Payloads are opaque: the loop is generic in
-the content type, so multimodal conversations (content blocks, image bytes)
-work unchanged — tool results only need to be hashable for value-equality
-grouping.
-
-For the common serial case there is a convenience driver. This integration sketch
-assumes your `my_provider` adapter and `make_tools` factory; it is not standalone.
-Convert provider tool calls to `lockstep_loop.ToolCall` values before completion:
+`Agent` is a mutable handle owning a current immutable `AgentSnapshot` and
+caller-owned runtime callbacks. `AgentRun` is mutable request/completion state.
+Recording is unconditional, including children. No provider clients or storage
+backends are included.
 
 ```python
-from lockstep_loop import LlmCompletion, run_to_completion
+from lockstep_loop import Agent, LlmCompletion
 
-def complete_llm(req):  # the only provider seam
-    resp = my_provider.chat(messages=req.messages, tools=req.tools)
-    return LlmCompletion(request_id=req.request_id, content=resp.text,
-                         tool_calls=resp.tool_calls)
+agent = Agent(prompt="Explain the checklist.", tool_specs=[])
+run = agent.start(["packet-a/v1", "packet-b/v1"])
+request = run.next_request()
+run.complete(LlmCompletion(request.request_id, "done"))  # mock provider
+assert agent.snapshot() is run.snapshot()  # automatic publication, before result()
+assert run.result().results == {"packet-a/v1": "done", "packet-b/v1": "done"}
 
-result = run_to_completion(
-    prompt="Assess whether the supplier's submitted evidence is complete.",
-    env_ids=["packet-a/v1", "packet-b/v1", "packet-c/v2"],
-    tools=make_tools,          # env_id -> tool impls (specs must be identical)
-    complete_llm=complete_llm,
-)
-# result.tree, result.classes, result.results (env_id -> final message)
+old = agent.snapshot()
+cached = agent.start(["packet-c/v1"])
+assert cached.done                         # cached final-only start also publishes
+assert cached.next_request() is None
+assert old.root.env_ids == ("packet-a/v1", "packet-b/v1")
 ```
 
-`make_tools(env_id)` binds reads to that frozen evidence packet. The tool specs
-are the same for every packet; routing IDs stay outside model-visible content.
-The library supplies neither document extraction nor compliance judgments.
+For tools, drive the run until `run.done`: pull `next_request("any")`, execute each
+`LlmRequest` or `ToolRequest`, then `complete(...)`. Return exactly one tool output
+per requested environment. Multiple calls can finish in any order; refinement
+uses their complete tuple in assistant call order. `None` from `next_request`
+means blocked, not done. Filters `"llm"` and `"tool"` support separate consumers;
+`outstanding_llm`, `outstanding_tool`, and `outstanding_count` expose counters.
+`RequestStats` reports depth (including reused turns), split depth and issue order.
+Request IDs are run-local: route responses to the run that issued them.
 
-For a complete, provider-free product-ratings example:
+**Warning — overlapping runs:** Each start captures the agent's current root.
+Their histories are **not merged**. The last run to complete replaces the agent's
+current state, potentially excluding experience from other runs. Retain each
+run's snapshot to preserve independent results, or finish each run before starting
+the next to accumulate experience sequentially. There is no queue or active-run
+restriction. Publication happens exactly once on successful completion, not when
+`result()` or `snapshot()` is inspected. Inspecting an older run cannot republish it.
 
-```sh
-PYTHONPATH=src python examples/product_screening.py
-```
-
-[Source](examples/product_screening.py): three products share one initial LLM turn,
-ratings split them into two classes, and a matching new product replays with zero
-new LLM calls. The scripted replies demonstrate orchestration, not model quality.
-
-For parallel serving, drive `BatchLoop` yourself (scheduling sketch):
-
-```python
-loop = BatchLoop(prompt=..., env_ids=..., tool_specs=[...])
-while not loop.done:
-    if (req := loop.next_request("any")) is None:
-        await any_completion_arrives()  # outstanding work, nothing runnable
-    else:
-        spawn_somewhere(req)
-# elsewhere, as completions arrive: loop.complete(completion)
-result = loop.result()
-```
-
-## Comparison keys
-
-`comparison_key` computes a hashable key from each raw tool output. It defaults
-to identity: exact value equality. The same function is applied to **both fresh
-outputs and stored representative outputs**, for partition grouping and replay
-matching. For example, `comparison_key=lambda output: output.strip()` deliberately
-ignores surrounding whitespace when comparing, not when presenting evidence.
-Keys never rewrite model-visible payloads: recorded conversations reuse the original
-representative, and full raw per-environment outputs remain in the evidence.
-Callables/lambdas are never compared by identity. The current function determines
-matches, including when its semantics differ from the recording's function.
-
-**Source-level API break:** the `group_by=` keyword is now `comparison_key=` on
-`BatchLoop`, `run_batch`, and `run_to_completion`; the old keyword is not an alias.
-This rename adds no persisted fields. See the migration notes below for the
-separate removal of manual contract labels and `custom_grouping` metadata.
+Public run advancement is synchronized. The head lock is held only to capture or
+replace a root, never across a run's lifetime or while executing callbacks.
+`Agent.from_snapshot(agent.snapshot(), ...)` creates an independent handle;
+records can be structurally shared without sharing future publications.
 
 ## Recording and replay
 
-Every loop and convenience driver records an immutable Agent, including children.
-Supply a prior Agent to replay. Legacy `history` spellings remain aliases:
+Sequential `agent.start(environments)` calls learn and reuse paths automatically.
+Recorded assistant turns are reused, but pure tools are always re-executed.
+Matching observations require zero fresh LLM requests; changed observations branch
+at their first divergence, including formerly non-splitting checkpoints.
+Old snapshots remain unchanged and reusable.
+
+Restore without repeating the prompt or tool specs:
 
 ```python
-loop = BatchLoop(
-    prompt="Assess the evidence packet.", env_ids=["packet-a/v1"], tool_specs=specs,
-)
-# Drive the ordinary requests/completions as above.
-snapshot = loop.agent             # immutable agent, including fulfilled turns
-# After completion: snapshot = loop.result().agent
-next_loop = BatchLoop(
-    prompt="Assess the evidence packet.", env_ids=["packet-a/v2"], tool_specs=specs,
-    agent=snapshot,  # replay prior reasoning
-)
-```
+from lockstep_loop import AgentSnapshot, RecordStore
 
-`next_loop` may immediately emit tools (or already be done for a recorded final
-answer). Always use `done`, not the assumption that the first request is an LLM
-request. `stats.depth` counts reused assistant turns too; `split_depth` describes
-only the new execution's partition. Independent calls can finish in any order.
-
-Run the complete, executable [caller-side example](examples/history_replay.py):
-
-```sh
-PYTHONPATH=src python examples/history_replay.py
-# unchanged: 0 LLM calls; changed: 1; both paths reusable
-```
-
-It records a non-splitting turn, persists **individual shallow records** plus a
-`AgentDescriptor`, lazily restores, and branches on changed observations. It
-publishes records before descriptors, checks insert-only collisions, and reuses
-both new and old published roots. Pickle is only for **trusted** data. Substitute
-your own codecs/backend; do not pickle a live `Agent`/resolver or an `Asset` view.
-
-```python
-# Save each record with your own codec, then publish the descriptor atomically:
+# Caller-owned backend/codecs (integration sketch):
+snapshot = agent.snapshot()
 for reference, record in snapshot.store.records().items():
     backend.insert_immutable(reference, encode_node(record))
-published = encode_descriptor(snapshot.descriptor)
+published = encode_descriptor(snapshot.descriptor)  # publish AFTER records
 
-# Fresh writer namespace (UUID default); no traversal or matching in this callback:
-store = RecordStore(load=lambda ref: decode_node(backend.read(ref)))
-restored = Agent(decode_descriptor(published), store)
+restored = AgentSnapshot(
+    decode_descriptor(published),
+    RecordStore(load=lambda ref: decode_node(backend.read(ref))),
+)
+agent = Agent.from_snapshot(restored)  # no node loads; prompt/specs from descriptor
+run = agent.start(["packet-a/v2"])
 ```
 
-`RecordStore(namespace=..., load=...)` is an in-memory append-only write set/cache,
-not a backend. `BatchLoop(record_store=store, ...)` uses a chosen
-store for a new recording; replay uses the store attached to `Agent`. Allocate
-a globally unique namespace per persistent writer. New records use exact
-`NodeRef(namespace, index)` addresses, never hashes. Persist only local writes;
-the new root may still reference old backend records. Loader errors/missing or
-corrupt records are fatal, not completion-validation errors. See the
-[complete persistence protocol](../docs/history-reference.md#individually-addressable-records-and-lazy-persistence).
+`RecordStore` is an append-only write set/cache with an optional synchronous
+loader. Reserve a fresh namespace for each durable writer (Python defaults to a
+UUID). Persist local writes and retain all referenced old records. The core loads
+only the relevant path; it performs no persistence I/O. Pickle examples use trusted
+bytes only. Do not pickle live handles/callbacks or Asset views. There is no stable
+cross-language/version wire format or legacy migration layer.
 
-Inspect `snapshot.root.assistant`, `root.observations[i].representative`, and
-`observations[i].evidence[j].outputs[k].tool_output`. Load a continuation with
-`snapshot.load(edge.continuation)`; its `NodeRef` is only a storage address.
-Output order matches call order. Full payloads/arguments survive; custom grouping
-keeps exact per-environment evidence separate from historical representative
-context. Snapshot extension path-copies records, leaving prior roots unchanged.
+Full messages, tool calls/arguments and exact per-environment outputs are retained.
+Payloads, schemas and arguments are **borrowed immutable-by-contract values**,
+including nested contents and all aliases; the library does not deep-copy them.
 
-**Subagents are recorded and replayed**, including mixed ordinary/subagent turns,
-concurrent child calls and configured nesting depth. `node.subagents` entries
-contain the assistant call ID, latest child descriptor, and immutable `runs`
-(selected base, resulting revision, and inherited env IDs). Inspect the latest
-child with `snapshot.child(entry)`. Child tool observations are rerun; only
-child final answers enter the parent's result tuple. Divergent child traces with
-identical answers do not split the parent. Active child snapshots retain fulfilled
-turns, not partial tool collections.
+### Comparison keys and compatibility
 
-**Compatibility:** replay checks equal prompts, ordered tool specs and nested
-subagent specs/allowlists/depth. Child prompts and specs
-are checked on entry. Pure tools are always re-executed: changed implementation
-with equal observations reuses reasoning; different observations branch. No manual
-version key is needed. Provider/adapter settings and custom grouping semantics
-cannot be inferred; callers own external cache isolation and snapshot selection
-when those policies change. Payloads, arguments and schemas are **borrowed immutable values**: do not
-mutate nested contents through any alias after handing them to the loop. Convert
-mutable provider objects to stable values or make your own copies first.
+Configure `comparison_key` on `Agent(...)` or `Agent.from_snapshot(...)`.
+Default identity requires hashable outputs. A custom function returns hashable
+keys, e.g. `str.strip`. It is applied to **both** current outputs and historical
+representatives, with no function-identity/default-vs-custom gate. Raw evidence
+is never replaced by keys. Stricter keys can branch despite matching an old
+evidence item; coarser keys choose the first matching stored edge without merging.
+Replay retains that edge's historical representative in model context.
 
-Default `comparison_key` is identity. Neither default/custom mode nor callback identity
-is persisted or compared. The current function compares **both** fresh raw outputs
-and stored representative outputs. Stricter keys can miss despite a match in old
-per-environment evidence; coarser keys can reuse the first matching existing edge
-in stored observation order, even if several now match. Replay preserves that
-edge's historical representative context and appends full fresh evidence. It does
-not merge historical edges, retroactively regroup evidence, or mutate old roots.
-The callback must accept historical outputs and remain stable during execution.
+Structural checks cover prompts, ordered tool specs, nested specs/allowlists/depth,
+and actual child factory outputs. Provider/adapter and grouping-policy compatibility
+remain caller-owned. No manual contract/version key or callback registry exists.
 
-### Inspecting assets
+### Feedback, budgets and failures
 
 ```python
-snapshot = result.agent
+from lockstep_loop import Budget, Feedback
+
+run = agent.start(["packet-a/v2"], feedback=Feedback("Also check exclusions."),
+                  budget=Budget(max_steps_per_branch=20))
+```
+
+Feedback first resolves an existing completed path through tool replay without new
+LLM work. It appends one user message and resumes. Every environment reaching that
+path in the new snapshot inherits the continuation, not just the resolving
+environment. Old snapshots and unrelated paths stay unchanged. Use transferable
+instructions, not environment-specific assertions. `Feedback(None)` is a real null
+intervention; `feedback=None` means absent. Repeated explicit interventions append
+again at the latest completed endpoint. There are no public endpoint IDs.
+
+Budgets count accepted fresh **and reused** assistant turns per branch. Exhaustion
+returns a string fallback in `results`, never an assistant fact. Successful budget
+completion publishes the real checkpoint; later replay with a larger/no budget
+can resume it. Child fallbacks are actual parent tool observations, not child
+assistant records. Exhaustion during feedback resolution is a failure.
+
+Invalid completions and Python callback exceptions leave pending work correctable.
+Child preparation and cached rollup occur transactionally before publication.
+`FeedbackResolutionError`/`InvalidHistoryError` indicate terminal failures;
+`done` becomes true and `result()` raises. Failures and abandoned runs **do not
+replace the owner's head**. `run.snapshot()` may expose validated partial history,
+not pending requests or a crash-recovery protocol. Caller side effects, warmed
+caches and unreachable append-only writes are not rolled back.
+
+### Specialized children and Asset views
+
+Configure `subagents=[SubagentTool(...), ...]` and optional `agent_resolver` on the
+Agent. Reattach matching subagent definitions on `from_snapshot`; executable
+prompt/spec factories are never serialized. `AgentQuery(prompt, tools, subagents)`
+selects a child `AgentDescriptor` or None. The shared store must load its records.
+Queries do not include parent identity, environment IDs or grouping mode.
+Recorded parent invocations pin their child revision; new invocations may consult
+the caller's cache. Child tools rerun and equal child answers need not split parents.
+Nested allowlists and depth caps remain enforced.
+
+`result.snapshot` is the run's immutable final root. `result.child_updates` contains
+separate `ChildAgentUpdate` records with a **snapshot**, selected `base`, tool call,
+environments and invocation provenance. Concurrent child forks are not merged or
+automatically published to an external cache; the caller selects future revisions.
+
+```python
+snapshot = agent.snapshot()
 for asset in snapshot.assets():
-    print(asset.env_ids, asset.is_complete)
+    print(asset.env_ids, asset.is_complete, asset.messages)
     if asset.has_value:
-        print(asset.value)  # latest terminal assistant payload; may be None
-    print(asset.messages)   # prompt through leaf, including tool calls and feedback
-    print(asset.observations)  # full actual per-env evidence plus representatives
+        print(asset.value)
+    # asset.observations retains representatives AND exact per-environment evidence
 ```
 
-An open continuation can have a previous value without a new completed answer.
-The view retains its agent/path context; an isolated node or `EnvClass` is not an
-asset. Known `env_ids` reflect the latest selected checkpoint and later visits,
-not a global latest environment partition. `Asset` is immutable, has no ID or
-resume method, and is not independently persisted. Feedback still takes an agent
-snapshot and environment and reruns tools. Iteration is lazy/read-only and does not
-walk child-agent tries automatically; inspect `snapshot.child(entry).assets()`.
-See [view semantics and costs](../docs/agent-assets.md#inspecting-assets).
+Assets are immutable, lazy, path-backed views anchored in that snapshot. Subsequent
+Agent publications do not retarget them. An open continuation can retain an older
+published value; a real None differs from no value. `asset.snapshot` is its owner.
+Inspect children separately with `snapshot.child(entry).assets()`.
+
+## Executable examples and convenience drivers
+
+From this directory, no paid APIs or credentials required:
 
 ```sh
-PYTHONPATH=src python examples/agent_assets.py
+for example in product_screening history_replay feedback specialized_subagents agent_assets; do
+    PYTHONPATH=src python examples/$example.py
+done
 ```
 
-The [end-to-end example](examples/agent_assets.py) loads an agent, resolves a new
-environment, inspects its asset, continues with feedback, and saves the new agent
-while retaining old and open snapshots. No new stored leaf identities are added.
+[Product screening](examples/product_screening.py) reuses one mutable handle across
+sequential runs. [History replay](examples/history_replay.py) demonstrates caller
+storage; [feedback](examples/feedback.py), [children](examples/specialized_subagents.py)
+and [assets](examples/agent_assets.py) cover the other boundaries.
 
-### Specialized tools and independent child caches
+The one-shot `run_batch(prompt=..., env_ids=..., tool_specs=..., ...)` generator and
+`run_to_completion(prompt=..., env_ids=..., tools=..., complete_llm=..., ...)` local
+tool driver construct Agents internally and return `BatchResult` with snapshots.
+Use `Agent.start` for repeated investigations, feedback and child-cache selection.
+The underlying `core.BatchLoop` is internal execution machinery, not a competing
+entry point.
 
-```python
-from lockstep_loop import BatchLoop, RecordStore, SubagentTool, ToolSpec
+## Limits and development
 
-study_design = SubagentTool(
-    name="assess_design", description="Assess a study-design criterion.",
-    parameters={"type": "object", "properties": {"criterion": {"type": "string"}},
-                "required": ["criterion"], "additionalProperties": False},
-    build_prompt=lambda args: f"Assess study design against criterion {args['criterion']!r}.",
-    sub_tool_specs=lambda env: study_tool_specs,
-    subagents=(),  # explicit leaf
-)
-loop = BatchLoop(
-    prompt="Screen the study against our review criteria.", env_ids=["study-packet/v2"],
-    tool_specs=ordinary_parent_specs, subagents=[study_design, another_specialist],
-    agent_resolver=lambda query: selected.get(query.prompt),  # fixed config in this sketch
-    record_store=RecordStore(load=load_node),
-)
-```
-
-The subagent specs are advertised automatically; no duplicate entries are needed
-in `tool_specs`. The child prompt is an initial **user** message, not a system
-message. The caller must construct it deterministically and validate structured
-args (the example above's minimal lambda raises on a missing key; the executable
-example validates keys/types). The core neither evaluates JSON Schema nor
-canonicalizes criterion names or paraphrases delegation. Distinct criteria yield
-distinct prompts/tries under this template. Child environment IDs are inherited
-unchanged: the specialist reads the same study packet as the parent.
-
-The full [independent-cache example](examples/specialized_subagents.py) uses file
-imports as a small fixture for this same protocol:
-
-```sh
-PYTHONPATH=src python examples/specialized_subagents.py
-# Changed parent: 2 fresh parent LLM calls, 0 child LLM calls, 1 child tool rerun
-```
-
-An agent resolver receives `AgentQuery(prompt, tools, subagents)`
-and returns a caller-selected **AgentDescriptor**, or None for a miss. Lookup is
-independent of parent prompt/identity, invocation/call IDs, and env membership.
-No child key is required. Every parent and child records an immutable Agent;
-supplying a prior Agent enables replay.
-Child grouping is inherited. External provider/grouping policy isolation belongs
-to the caller, not a core version field.
-
-The resolver only selects a revision; the existing shared `RecordStore` loads its
-nodes lazily. Its loader must resolve all selected descriptor references. For
-in-memory reuse, share the same store; for persistence, save immutable record
-writes first, publish child descriptors, and attach a new writer with a loader
-covering those records. Do not return a live `Agent` from the metadata callback
-or assume the descriptor carries its records. Full prompt/spec/nested
-configuration compatibility is checked even if the caller indexes only by a
-hash or prompt. An incompatible hit raises, never silently falls back.
-
-`result.child_agents` contains `ChildAgentUpdate` records for every completed
-recorded invocation (descendants included when their containing child finishes):
-`tool_call`, `env_ids`, selected `base`, resulting `agent`, parent `branch_id`/`depth`,
-and run-local `request_prefix`. This is provenance, not a new conversation identity.
-Persist `update.agent.descriptor` and `update.agent.store.records()` with the normal
-codecs. Store writes may include parent/orphan records; the child descriptor is an
-independent entry point with no parent descriptor dependency. Two concurrent hits
-on the same base expose two separate updates, not a hidden mutable cache merge.
-Do not blindly collapse them into a dict unless you intend to select one; caller
-coordination/root publication is explicit.
-
-A **recorded parent invocation is pinned** to its recorded child revision and
-bypasses the resolver. Only new invocations consult the external cache. Thus child
-feedback can be selected by a new parent investigation without automatically
-rewriting completed parents. Child feedback's shared-path semantics are preserved;
-there is no assumption that one prompt implies one revision. Parent entries retain
-all prior `runs`; `entry.agent_descriptor` exposes the latest/current run (wire
-field `history`). Root agent selection remains the explicit `agent=` argument. Strict feedback resolution
-cannot synthesize missing invocation provenance from an external cache hit.
-
-**Registration/nesting:** duplicate definitions and duplicate ordinary spec names
-are errors. Conflicting ordinary/subagent specs are errors; an exact matching spec
-is accepted as a redundant legacy advertisement, not as a second executor. Serial
-`run_to_completion` now recognizes all subagent entries and rejects actual callable/
-subagent name collisions. Use direct `BatchLoop` for resolver-driven serving.
-Mixing `subagent=` and `subagents=` (even an empty list) is rejected. Singular callers
-remain supported. A definition's `subagents` is its explicit child allowlist; `()`
-means leaf, and None preserves bounded self-recursion, not parent siblings. Each
-nested definition is capped to the remaining `max_depth`; known unavailable
-reserved names are omitted/rejected, never ordinary tool requests.
-
-Resolver/factory failures during advancement preserve the pending Python work via
-the existing journal, including mixed turns. Callbacks are not rerun at commit;
-caller side effects and orphan record writes are not rolled back. Budgets cannot
-be combined with recorded children. No environment remapping, dependency
-invalidation, logical asset registry, single-flight, or root-merging service is
-introduced.
-
-**API/schema migration:** manual contract arguments, fields, and builders have
-been removed, not renamed. Legacy pickle class aliases and provenance `history`
-fields remain; old `contract`/`history_contract` labels and `custom_grouping` mode
-are discarded on pickle load and omitted on new writes. Remove mode flags from
-caller cache indices too. Custom codecs may need migration. Immutable fixtures still load and replay. Earlier singular
-`subagent` schemas still need caller migration. See the
-[exact mapping and wire guarantees](../docs/agent-assets.md#preferred-names-and-compatibility).
-
-### Feedback and shared-path resumption
-
-```python
-from lockstep_loop import BatchLoop, Feedback, FeedbackResolutionError
-
-loop = BatchLoop(
-    prompt="Assess the evidence packet.", env_ids=["packet-a/v1"], tool_specs=specs,
-    agent=snapshot,
-    feedback=Feedback("Also check certificate exclusions and revise if needed."),
-)
-# Serve ordinary requests/completions. Resolution reruns tools but emits NO new
-# LLM work until an existing completed conversation has been found and feedback appended.
-# revised = loop.result()  # only after completion; revised.agent is a new snapshot
-```
-
-Run the full caller-side [feedback example](examples/feedback.py):
-
-```sh
-PYTHONPATH=src python examples/feedback.py
-```
-
-The operation requires a supplied agent and **exactly one environment to locate
-the target**, not to scope the improvement. In the new snapshot, **everyone who
-reaches that observation path inherits the feedback**: old siblings and new
-revision IDs alike. Additional observations can split them. Other paths and all
-old snapshots remain unchanged. There are no session/endpoint handles or
-answer-value triggers. The source environment field is provenance, never a gate.
-A repeated explicit operation replays through prior feedback to the revised
-endpoint and appends again, including identical messages. The same final answer
-is valid and terminates without reinjection.
-
-`Feedback(content)` makes presence explicit: `feedback=None` means absent, while
-`feedback=Feedback(None)` submits an actual null payload. Content is the normal
-opaque `P` and obeys the same borrowed-immutable ownership contract. Feedback is
-stored in `node.user_continuations[0].message`; load its continuation reference
-with the existing resolver. The old answer remains at that node. Pending new
-assistant turns are open nodes, never overwritten historical answers. No parallel
-persistence format or core I/O is added.
-
-**Failure protocol:** an unseen observation or unfulfilled selected endpoint
-raises `FeedbackResolutionError`, possibly during construction or after tool
-results arrive. No fresh reasoning manufactures a target. The loop becomes done,
-`loop.error` is set, outstanding/queued work is cancelled, `next_request()` returns
-None, and `result()`/further completions raise the stored error. On a resolution
-miss `loop.agent` is the supplied root again (orphan writes may remain in the
-store). Invalid completions instead leave requests correctable and `error` unset.
-An open prior feedback continuation is not a completed target for another explicit
-operation; ordinary replay can resume it without adding more feedback. Imported
-multiple user successors or malformed user edges fail with `InvalidHistoryError`;
-separate roots are not implicitly merged.
-
-Feedback targets the given loop's no-tool assistant endpoint. Cached nested child
-tools are rerun during strict resolution and may not request fresh LLM work to
-manufacture a target; after injection, fresh nested work is supported normally.
-No targeting/routing API for a nested asset or result-tool publication is added.
-Lossy custom grouping keeps its existing representative/evidence semantics and
-shares feedback across that entire grouped path. The legacy `append_user_message`
-helper forks an already completed live run to an open snapshot without resuming
-that loop; use constructor feedback for strict resolution and resumption.
-
-**Caveat:** feedback changes the investigation for the entire path, not a private
-annotation on one environment. Express transferable instructions (“check whether
-X”), not unqualified subject-specific assertions, or retain a separate snapshot.
-There is no automatic rewriting/classification, scope switch or environment
-binding. Budget exhaustion during strict resolution fails without appending
-feedback; the new continuation uses the remaining step allowance.
-“Once” is per live operation, not crash-safe publication.
-
-**Transactional callback preparation:** all child prompt/spec factories (including
-spec iterators) and child constructors run before the parent assistant turn is
-fulfilled or its ordinary requests are queued. A callback exception preserves the
-pending request, history root, queues/routes, branch messages/steps and counters;
-retry with a corrected completion. This also covers callbacks reached by a tool
-completion, nested child rollup or polling cached work. Commit uses the prepared
-children without rerunning factories. An undo journal touches only affected
-builders/entries, sharing immutable history and retaining partition/final entries;
-there is no whole-execution, sibling, or historical-message copying. Queue pulls
-and `done` checks with no rollup work do not visit conversations. Child history
-links are maintained incrementally, so `agent` (legacy `history`) does not flush mutable state.
-Callbacks may read it reentrantly and see only the committed pre-transition root;
-reentrant advancement is rejected. Caller side effects, warmed loader caches and
-unreachable append-only records are not rolled back. Explicit terminal
-failures, such as `FeedbackResolutionError`, retain their cancellation semantics.
-See the [transaction boundary](../docs/history-reference.md#transactional-child-preparation-and-callback-failures).
-
-**Budgets:** fresh and replayed assistant turns count toward the per-branch limit.
-Exhaustion returns the string fallback in `results`, never a fabricated assistant
-message. The Agent retains the real checkpoint (open on a fresh path), so later
-replay with a larger or no budget can resume it. Smaller replay budgets stop before
-the next stored turn without truncating old history. Child fallbacks become actual
-parent tool observations, while the child Agent stays at its real checkpoint.
-
-**Limits:** use direct `BatchLoop` for replay and resolver-driven serving;
-convenience drivers expose root and child Agents. No core storage I/O, async
-loader, eviction/GC, independent-root merge, or crash recovery.
-Stores retain local writes and cached loads; deep path copying can have quadratic
-write volume. Pending tool collections/queues are not persisted. Valid imported
-records are trusted; no stable cross-version wire format is promised. Invalid
-completions leave requests correctable, including nested routes. Branch IDs use
-collision-free run-local counters; legacy tree labels retain `str(result_tuple)`.
-Python mapping label collisions append ` [collision N]` without dropping groups
-or changing noncolliding labels. Asset views are inspection only; result-tool
-publication, DAG scheduling and UI remain out of scope. Multiple specialized
-subagent tools and independent child-agent lookup are supported as described above.
-See the [shared design and limitations](../docs/history-reference.md#immutable-recorded-history-and-incremental-replay).
-
-## Development
-
-Non-timing guards in `tests/test_transition_cost.py` check that individual serving
-operations do not traverse/copy sibling or historical conversations. To reproduce
-the shared-tool-call / all-distinct-results / immediate-final-answer workload:
-
-```sh
-PYTHONPATH=src python benchmarks/split_completion.py --repeats 3
-```
-
-This reports 100/400/1000-environment timings including construction and the plain
-`while not loop.done: next_request(); complete(...)` serving loop. Result validation
-is outside the timer. Recording is disabled, and no external executors are used.
-
-From this `python/` directory:
+Synchronous loaders; no GC/eviction, automatic root merge, in-flight crash recovery,
+DAG scheduling, designated result-tool publication or UI. Deep path copying can
+produce quadratic writes; observation lookup is linear. Valid imported graphs and
+payload codecs are caller responsibilities. See the [full reference](../docs/history-reference.md).
 
 ```sh
 uv sync
 uv run pytest
 uv run mypy src
 uv run ruff check .
+PYTHONPATH=src python benchmarks/split_completion.py --repeats 3
 ```

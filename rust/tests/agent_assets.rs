@@ -1,13 +1,9 @@
 use lockstep_loop::{
-    Agent, AgentDescriptor, AgentQuery, AgentResolver, BatchLoop, ChildAgentRun, ChildAgentUpdate,
-    ChildHistoryRun, ChildHistoryUpdate, Completion, EnvObservation, History, HistoryDescriptor,
-    HistoryNode, HistoryQuery, HistoryResolver, LlmCompletion, LoopConfig, Message, NodeRef,
-    Observation, OutputRecord, RecordStore, Request, RequestKind, Role, SubagentHistory,
-    SubagentRecord, SubagentTool, ToolCall, ToolCompletion, ToolSpec,
+    AgentDescriptor, AgentSnapshot, BatchLoop, Completion, EnvObservation, HistoryNode,
+    LlmCompletion, LoopConfig, Message, Observation, OutputRecord, RecordStore, Request,
+    RequestKind, Role, ToolCall, ToolCompletion, ToolSpec,
 };
-use serde::Deserialize;
-use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use serde_json::json;
 use std::sync::{Arc, Mutex};
 
 fn spec() -> ToolSpec {
@@ -20,9 +16,13 @@ fn config(envs: &[&str]) -> LoopConfig<String> {
         vec![spec()],
     )
 }
-fn record() -> (Agent<String>, Agent<String>, Agent<String>) {
+fn record() -> (
+    AgentSnapshot<String>,
+    AgentSnapshot<String>,
+    AgentSnapshot<String>,
+) {
     let mut loop_ = BatchLoop::new(config(&["A", "B", "D"])).unwrap();
-    let empty = loop_.agent();
+    let empty = loop_.snapshot();
     let initial = empty.assets().next().unwrap();
     assert!(!initial.is_complete() && !initial.has_value());
     assert_eq!(initial.value(), None);
@@ -36,7 +36,7 @@ fn record() -> (Agent<String>, Agent<String>, Agent<String>) {
             tool_calls: vec![ToolCall::new("r", "read", json!({"path": "/entry"}))],
         }))
         .unwrap();
-    let pending = loop_.agent();
+    let pending = loop_.snapshot();
     let asset = pending.assets().next().unwrap();
     assert!(!asset.is_complete() && !asset.has_value());
     assert_eq!(asset.env_ids(), ["A", "B", "D"]);
@@ -55,7 +55,7 @@ fn record() -> (Agent<String>, Agent<String>, Agent<String>) {
             ],
         }))
         .unwrap();
-    let opened = loop_.agent();
+    let opened = loop_.snapshot();
     assert_eq!(
         opened.assets().map(|a| a.env_ids()).collect::<Vec<_>>(),
         [vec!["A", "B"], vec!["D"]]
@@ -71,10 +71,10 @@ fn record() -> (Agent<String>, Agent<String>, Agent<String>) {
             .unwrap();
     }
     let result = loop_.result().unwrap();
-    assert_eq!(result.agent(), &result.history);
-    assert_eq!(loop_.agent(), loop_.history());
-    assert_eq!(result.child_agents(), result.child_histories);
-    (result.history, empty, opened)
+    assert_eq!(result.snapshot(), &result.snapshot);
+    assert_eq!(loop_.snapshot(), result.snapshot);
+    assert!(result.child_updates.is_empty());
+    (result.snapshot, empty, opened)
 }
 
 #[test]
@@ -91,7 +91,7 @@ fn assets_are_path_backed_leaves_not_values_or_environment_classes() {
             .all(|a| a.is_complete() && a.value().unwrap() == "no issues")
     );
     assert_ne!(assets[0].messages(), assets[1].messages()); // values do not identify assets
-    assert!(std::ptr::eq(assets[0].agent(), &agent));
+    assert!(std::ptr::eq(assets[0].snapshot(), &agent));
     assert_eq!(
         assets[0]
             .messages()
@@ -115,7 +115,7 @@ fn feedback_moves_the_leaf_without_mutating_old_assets_or_overwriting_values() {
     let old_asset = old.assets().next().unwrap();
     let mut loop_ = BatchLoop::new(
         config(&["A"])
-            .with_agent(old.clone())
+            .with_snapshot(old.clone())
             .with_feedback("check /foo".into()),
     )
     .unwrap();
@@ -127,7 +127,7 @@ fn feedback_moves_the_leaf_without_mutating_old_assets_or_overwriting_values() {
             results: vec![("A".into(), "shared".into())],
         }))
         .unwrap();
-    let pending_agent = loop_.agent();
+    let pending_agent = loop_.snapshot();
     let pending = pending_agent.assets().next().unwrap();
     assert_eq!(pending.env_ids(), ["A", "B"]);
     assert!(!pending.is_complete() && pending.has_value());
@@ -146,7 +146,7 @@ fn feedback_moves_the_leaf_without_mutating_old_assets_or_overwriting_values() {
             "no issues".into(),
         )))
         .unwrap();
-    let current = loop_.result().unwrap().history;
+    let current = loop_.result().unwrap().snapshot;
     let revised = current.assets().next().unwrap();
     assert!(revised.is_complete());
     assert_eq!(revised.value(), old_asset.value());
@@ -156,7 +156,7 @@ fn feedback_moves_the_leaf_without_mutating_old_assets_or_overwriting_values() {
     assert!(!nodes[nodes.len() - 2].user_continuations.is_empty());
     assert_eq!(current.assets().count(), 2);
     assert!(!pending_agent.assets().next().unwrap().is_complete());
-    let mut replay = BatchLoop::new(config(&["C"]).with_agent(current)).unwrap();
+    let mut replay = BatchLoop::new(config(&["C"]).with_snapshot(current)).unwrap();
     let request = replay.next_request(RequestKind::Any).unwrap();
     replay
         .complete(Completion::Tool(ToolCompletion {
@@ -204,7 +204,7 @@ fn asset_views_retain_lossy_evidence_and_real_null_publications() {
             None,
         )))
         .unwrap();
-    let agent = loop_.agent();
+    let agent = loop_.snapshot();
     let asset = agent.assets().next().unwrap();
     assert!(asset.is_complete() && asset.has_value());
     assert_eq!(asset.value(), Some(&None));
@@ -229,7 +229,7 @@ fn asset_enumeration_is_lazy_read_only_and_does_not_clone_payloads() {
     let records = agent.store.records();
     let loads = Arc::new(Mutex::new(vec![]));
     let loaded = loads.clone();
-    let restored = Agent {
+    let restored = AgentSnapshot {
         descriptor: agent.descriptor.clone(),
         store: RecordStore::with_loader("asset-reader", move |r| {
             loaded.lock().unwrap().push(r.clone());
@@ -258,7 +258,7 @@ fn asset_enumeration_is_lazy_read_only_and_does_not_clone_payloads() {
         env_ids: vec!["e".into()],
         ..HistoryNode::default()
     });
-    let opaque = Agent {
+    let opaque = AgentSnapshot {
         descriptor: AgentDescriptor {
             prompt: NonClone("prompt"),
             tools: vec![],
@@ -269,200 +269,7 @@ fn asset_enumeration_is_lazy_read_only_and_does_not_clone_payloads() {
     };
     let asset = opaque.assets().next().unwrap();
     assert_eq!(asset.value().unwrap().0, "answer"); // traversal/value access do not require P: Clone
-    assert_eq!(asset.agent().prompt().0, "prompt");
-}
-
-#[test]
-fn public_aliases_preserve_types_and_serde_records() {
-    use std::any::type_name;
-    assert_eq!(type_name::<Agent<String>>(), type_name::<History<String>>());
-    assert_eq!(
-        type_name::<AgentDescriptor<String>>(),
-        type_name::<HistoryDescriptor<String>>()
-    );
-    assert_eq!(
-        type_name::<AgentQuery<String>>(),
-        type_name::<HistoryQuery<String>>()
-    );
-    assert_eq!(
-        type_name::<AgentResolver<String>>(),
-        type_name::<HistoryResolver<String>>()
-    );
-    assert_eq!(
-        type_name::<SubagentRecord<String>>(),
-        type_name::<SubagentHistory<String>>()
-    );
-    assert_eq!(
-        type_name::<ChildAgentRun<String>>(),
-        type_name::<ChildHistoryRun<String>>()
-    );
-    assert_eq!(
-        type_name::<ChildAgentUpdate<String>>(),
-        type_name::<ChildHistoryUpdate<String>>()
-    );
-    let (agent, _, _) = record();
-    let serialized = serde_json::to_vec(&agent.descriptor).unwrap();
-    let old: HistoryDescriptor<String> = serde_json::from_slice(&serialized).unwrap();
-    let new: AgentDescriptor<String> = serde_json::from_slice(&serialized).unwrap();
-    assert_eq!(old, new);
-    assert_eq!(serde_json::to_vec(&new).unwrap(), serialized);
-    for node in agent.store.records().values() {
-        let restored: HistoryNode<String> =
-            serde_json::from_slice(&serde_json::to_vec(node).unwrap()).unwrap();
-        assert_eq!(&restored, node.as_ref());
-    }
-}
-
-#[derive(Deserialize)]
-struct Fixture {
-    descriptor: AgentDescriptor<String>,
-    query: AgentQuery<String>,
-    records: Vec<(NodeRef, HistoryNode<String>)>,
-}
-#[test]
-fn pre_rename_fixture_loads_inspects_replays_and_omits_legacy_labels() {
-    let bytes = include_bytes!("fixtures/agent-naming-2c6d901.json");
-    let mut raw: Value = serde_json::from_slice(bytes).unwrap();
-    fn strip_labels(value: &mut Value) {
-        match value {
-            Value::Object(fields) => {
-                fields.remove("contract");
-                fields.remove("history_contract");
-                fields.remove("custom_grouping");
-                fields.values_mut().for_each(strip_labels);
-            }
-            Value::Array(values) => values.iter_mut().for_each(strip_labels),
-            _ => {}
-        }
-    }
-    strip_labels(&mut raw);
-    let fixture: Fixture = serde_json::from_slice(bytes).unwrap();
-    assert_eq!(
-        serde_json::to_value(&fixture.descriptor).unwrap(),
-        raw["descriptor"]
-    );
-    assert_eq!(serde_json::to_value(&fixture.query).unwrap(), raw["query"]);
-    assert_eq!(
-        serde_json::to_value(&fixture.records).unwrap(),
-        raw["records"]
-    );
-    let records: BTreeMap<_, _> = fixture
-        .records
-        .into_iter()
-        .map(|(r, n)| (r, Arc::new(n)))
-        .collect();
-    let loaded = Arc::new(Mutex::new(vec![]));
-    let loads = loaded.clone();
-    let agent = Agent {
-        descriptor: fixture.descriptor,
-        store: RecordStore::with_loader("fixture-reader", move |r| {
-            loads.lock().unwrap().push(r.clone());
-            records[r].clone()
-        }),
-    };
-    let asset = agent.assets().next().unwrap();
-    assert_eq!(asset.value().unwrap(), "same answer");
-    assert_eq!(asset.env_ids(), ["A", "B"]);
-    assert_eq!(
-        asset.messages().iter().map(|m| m.role).collect::<Vec<_>>(),
-        [
-            Role::User,
-            Role::Assistant,
-            Role::Tool,
-            Role::Tool,
-            Role::Assistant,
-            Role::User,
-            Role::Assistant
-        ]
-    );
-    assert_eq!(loaded.lock().unwrap().len(), 3); // not the child agents' roots
-    assert_eq!(
-        asset.observations()[0].evidence[1].outputs[0].tool_output,
-        "same"
-    );
-    let root = agent.root();
-    let entry = &root.subagents[0];
-    assert!(std::ptr::eq(entry.agent_descriptor(), &entry.history));
-    assert!(std::ptr::eq(
-        entry.runs[0].agent_descriptor(),
-        &entry.runs[0].history
-    ));
-    let child = agent.child(entry);
-    assert_eq!(
-        child.assets().next().unwrap().value().unwrap(),
-        "child answer"
-    );
-    let sub = SubagentTool::new(
-        ToolSpec::new("delegate", "child investigation", json!({})),
-        |_| "child".to_owned(),
-        |_| vec![],
-        1,
-    )
-    .with_subagents(vec![]);
-    let config = LoopConfig::new(
-        agent.prompt().clone(),
-        vec!["C".into()],
-        agent.descriptor.tools.clone(),
-    )
-    .with_agent(agent.clone())
-    .with_subagents(vec![sub.clone()]);
-    let mut replay =
-        BatchLoop::with_comparison_key(config, |s: &String| s.trim().to_owned()).unwrap();
-    let request = replay.next_request(RequestKind::Any).unwrap();
-    assert!(matches!(request, Request::Tool(_)));
-    replay
-        .complete(Completion::Tool(ToolCompletion {
-            request_id: request.request_id().into(),
-            results: vec![("C".into(), "same ".into())],
-        }))
-        .unwrap();
-    assert!(replay.is_done());
-    let result = replay.result().unwrap();
-    assert_eq!(result.results["C"], "same answer");
-    assert_eq!(result.child_agents().len(), 1);
-    assert!(std::ptr::eq(
-        result.child_agents()[0].agent(),
-        &result.child_histories[0].history
-    ));
-    assert_eq!(
-        serde_json::to_value(&agent.descriptor).unwrap(),
-        raw["descriptor"]
-    );
-    let encoded_record = serde_json::to_value(agent.root()).unwrap();
-    assert!(encoded_record["subagents"][0].get("history").is_some());
-    assert!(
-        encoded_record["subagents"][0]
-            .get("agent_descriptor")
-            .is_none()
-    );
-    let selected = entry.agent_descriptor().clone();
-    let config = LoopConfig::new("new parent".to_owned(), vec!["new".into()], vec![])
-        .with_subagents(vec![sub])
-        .with_record_store(agent.store.clone())
-        .with_agent_resolver(move |_| Ok(Some(selected.clone())));
-    let mut new_parent =
-        BatchLoop::with_comparison_key(config, |s: &String| s.trim().to_owned()).unwrap();
-    let request = new_parent.next_request(RequestKind::Any).unwrap();
-    new_parent
-        .complete(Completion::Llm(LlmCompletion {
-            request_id: request.request_id().into(),
-            content: "delegate".into(),
-            tool_calls: vec![ToolCall::new("new", "delegate", json!({"q": "child"}))],
-        }))
-        .unwrap();
-    let Request::Llm(request) = new_parent.next_request(RequestKind::Any).unwrap() else {
-        panic!()
-    };
-    assert_eq!(request.messages[0].content, "new parent");
-    assert_eq!(request.messages.last().unwrap().content, "child answer");
-    new_parent
-        .complete(Completion::Llm(LlmCompletion::final_answer(
-            request.request_id,
-            "parent answer".into(),
-        )))
-        .unwrap();
-    assert!(new_parent.is_done());
-    assert_eq!(new_parent.result().unwrap().child_agents().len(), 1);
+    assert_eq!(asset.snapshot().prompt().0, "prompt");
 }
 
 #[test]
@@ -494,7 +301,7 @@ fn deep_asset_paths_are_iterative_and_inspection_never_writes_records() {
             ..HistoryNode::default()
         });
     }
-    let agent = Agent {
+    let agent = AgentSnapshot {
         descriptor: AgentDescriptor {
             prompt: "inspect".into(),
             tools: vec![spec()],

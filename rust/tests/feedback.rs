@@ -1,7 +1,7 @@
 use lockstep_loop::{
-    BatchLoop, BatchResult, Budget, Completion, History, HistoryNode, LlmCompletion, LlmRequest,
-    LoopConfig, LoopError, NodeRef, RecordStore, Request, RequestKind, Role, SubagentTool,
-    ToolCall, ToolCompletion, ToolRequest, ToolSpec,
+    AgentSnapshot, BatchLoop, BatchResult, Budget, Completion, HistoryNode, LlmCompletion,
+    LlmRequest, LoopConfig, LoopError, NodeRef, RecordStore, Request, RequestKind, Role,
+    SubagentTool, ToolCall, ToolCompletion, ToolRequest, ToolSpec,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -18,7 +18,7 @@ fn specs() -> Vec<ToolSpec> {
 }
 fn config(
     envs: &[&str],
-    history: Option<History<String>>,
+    snapshot: Option<AgentSnapshot<String>>,
     feedback: Option<&str>,
 ) -> LoopConfig<String> {
     let c = LoopConfig::new(
@@ -26,8 +26,8 @@ fn config(
         envs.iter().map(|e| (*e).into()).collect(),
         specs(),
     );
-    let mut c = match history {
-        Some(h) => c.with_replay(h),
+    let mut c = match snapshot {
+        Some(h) => c.with_snapshot(h),
         None => c,
     };
     if let Some(content) = feedback {
@@ -37,10 +37,10 @@ fn config(
 }
 fn loop_for(
     envs: &[&str],
-    history: Option<History<String>>,
+    snapshot: Option<AgentSnapshot<String>>,
     feedback: Option<&str>,
 ) -> BatchLoop<String> {
-    BatchLoop::new(config(envs, history, feedback)).unwrap()
+    BatchLoop::new(config(envs, snapshot, feedback)).unwrap()
 }
 fn next_llm(loop_: &mut BatchLoop<String>) -> LlmRequest<String> {
     let Request::Llm(r) = loop_.next_request(RequestKind::Llm).unwrap() else {
@@ -153,23 +153,23 @@ fn drive(loop_: &mut BatchLoop<String>, allow_llm: bool) -> Driven {
         tools,
     }
 }
-fn initial() -> History<String> {
+fn initial() -> AgentSnapshot<String> {
     drive(&mut loop_for(&["A", "B", "D"], None, None), true)
         .result
-        .history
+        .snapshot
 }
-fn shared_node(history: &History<String>) -> Arc<HistoryNode<String>> {
-    let root = history.root();
+fn shared_node(snapshot: &AgentSnapshot<String>) -> Arc<HistoryNode<String>> {
+    let root = snapshot.root();
     let edge = root
         .observations
         .iter()
         .find(|e| e.representative[0].tool_output.trim() == "shared")
         .unwrap();
-    history.load(&edge.continuation)
+    snapshot.load(&edge.continuation)
 }
 type Backend = BTreeMap<NodeRef, Vec<u8>>;
-fn publish(history: &History<String>, backend: &mut Backend) -> Vec<u8> {
-    for (r, n) in history.store.records() {
+fn publish(snapshot: &AgentSnapshot<String>, backend: &mut Backend) -> Vec<u8> {
+    for (r, n) in snapshot.store.records() {
         let bytes = serde_json::to_vec(&n).unwrap();
         if let Some(old) = backend.get(&r) {
             assert_eq!(old, &bytes);
@@ -177,10 +177,10 @@ fn publish(history: &History<String>, backend: &mut Backend) -> Vec<u8> {
             backend.insert(r, bytes);
         }
     }
-    serde_json::to_vec(&history.descriptor).unwrap()
+    serde_json::to_vec(&snapshot.descriptor).unwrap()
 }
-fn restore(descriptor: &[u8], backend: Backend, namespace: &str) -> History<String> {
-    History {
+fn restore(descriptor: &[u8], backend: Backend, namespace: &str) -> AgentSnapshot<String> {
+    AgentSnapshot {
         descriptor: serde_json::from_slice(descriptor).unwrap(),
         store: RecordStore::with_loader(namespace, move |r| {
             Arc::new(serde_json::from_slice(&backend[r]).unwrap())
@@ -216,14 +216,14 @@ fn resume_once_shared_path_inheritance_splits_and_immutable_snapshots() {
         request.messages[1].tool_calls[0].args,
         json!({"path": "/entry"})
     );
-    let opened = loop_.history();
+    let opened = loop_.snapshot();
     let edge = shared_node(&opened).user_continuations[0].clone();
     assert_eq!(edge.message.content, NOTE);
     assert!(opened.load(&edge.continuation).assistant.is_none());
     assert!(old_shared.user_continuations.is_empty());
     assert_eq!(opened.root().observations[1].continuation, old_unrelated);
 
-    let before = loop_.history();
+    let before = loop_.snapshot();
     assert!(matches!(
         loop_.complete(Completion::Tool(ToolCompletion {
             request_id: request.request_id.clone(),
@@ -240,12 +240,12 @@ fn resume_once_shared_path_inheritance_splits_and_immutable_snapshots() {
         })),
         Err(LoopError::DuplicateToolCallId(_))
     ));
-    assert_eq!(loop_.history(), before);
+    assert_eq!(loop_.snapshot(), before);
     assert_eq!(loop_.outstanding_llm(), 1);
     loop_.complete(Completion::Llm(model(&request))).unwrap();
     let detail = next_tool(&mut loop_);
     let extra = next_tool(&mut loop_);
-    let before = loop_.history();
+    let before = loop_.snapshot();
     assert!(matches!(
         loop_.complete(Completion::Tool(ToolCompletion {
             request_id: extra.request_id.clone(),
@@ -253,7 +253,7 @@ fn resume_once_shared_path_inheritance_splits_and_immutable_snapshots() {
         })),
         Err(LoopError::InvalidToolCompletion(_))
     ));
-    assert_eq!(loop_.history(), before);
+    assert_eq!(loop_.snapshot(), before);
     assert_eq!(loop_.outstanding_tool(), 2);
     loop_.complete(Completion::Tool(output(&extra))).unwrap();
     assert!(loop_.next_request(RequestKind::Llm).is_none());
@@ -281,7 +281,7 @@ fn resume_once_shared_path_inheritance_splits_and_immutable_snapshots() {
         .unwrap();
     assert!(loop_.is_done());
     assert!(loop_.next_request(RequestKind::Any).is_none());
-    let revised = loop_.result().unwrap().history;
+    let revised = loop_.result().unwrap().snapshot;
     let revised_shared = shared_node(&revised);
     assert_eq!(revised_shared.assistant.as_ref().unwrap().content, OLD);
     let after_user = revised.load(&revised_shared.user_continuations[0].continuation);
@@ -350,7 +350,7 @@ fn resume_once_shared_path_inheritance_splits_and_immutable_snapshots() {
     assert!(old_shared.user_continuations.is_empty());
     assert_eq!(old.root().env_ids, ["A", "B", "D"]);
     assert_eq!(after_user.observations.len(), 1);
-    let extended = driven.result.history;
+    let extended = driven.result.snapshot;
     assert!(
         extended
             .load(&extended.root().observations[1].continuation)
@@ -369,13 +369,13 @@ fn resume_once_shared_path_inheritance_splits_and_immutable_snapshots() {
 fn interleaved_feedback_paths_preserve_each_others_updates() {
     let first = drive(&mut loop_for(&["A"], Some(initial()), Some(NOTE)), true)
         .result
-        .history;
+        .snapshot;
     let second = drive(
         &mut loop_for(&["D"], Some(first.clone()), Some("Check another path")),
         true,
     )
     .result
-    .history;
+    .snapshot;
     assert!(
         first
             .load(&first.root().observations[1].continuation)
@@ -435,7 +435,7 @@ fn interleaved_feedback_paths_preserve_each_others_updates() {
             ])
         );
         assert_eq!(result.classes.len(), 3);
-        assert_eq!(shared_node(&result.history).user_continuations.len(), 1);
+        assert_eq!(shared_node(&result.snapshot).user_continuations.len(), 1);
     }
 }
 
@@ -443,7 +443,7 @@ fn interleaved_feedback_paths_preserve_each_others_updates() {
 fn repeated_identical_feedback_after_storage_roundtrip_targets_revised_endpoint() {
     let first = drive(&mut loop_for(&["B"], Some(initial()), Some(NOTE)), true).result;
     assert_eq!(first.results["B"], "found");
-    let first_history = first.history;
+    let first_history = first.snapshot;
     let mut backend = Backend::new();
     let descriptor = publish(&first_history, &mut backend);
     let restored = restore(&descriptor, backend.clone(), "second-intervention");
@@ -479,7 +479,7 @@ fn repeated_identical_feedback_after_storage_roundtrip_targets_revised_endpoint(
         )))
         .unwrap();
     assert!(loop_.is_done());
-    let second = loop_.result().unwrap().history;
+    let second = loop_.result().unwrap().snapshot;
     let descriptor = publish(&second, &mut backend);
     let reopened = restore(&descriptor, backend, "replay-second");
     let driven = drive(&mut loop_for(&["NEW"], Some(reopened), None), false);
@@ -491,12 +491,12 @@ fn repeated_identical_feedback_after_storage_roundtrip_targets_revised_endpoint(
     assert!(first_end.user_continuations.is_empty());
 }
 
-fn assert_failed(loop_: &mut BatchLoop<String>, old: &History<String>) {
+fn assert_failed(loop_: &mut BatchLoop<String>, old: &AgentSnapshot<String>) {
     assert!(loop_.is_done());
     assert_eq!(loop_.error(), Some(&LoopError::FeedbackResolutionMiss));
     assert!(loop_.next_request(RequestKind::Any).is_none());
     assert_eq!(loop_.outstanding_count(), 0);
-    assert_eq!(&loop_.history(), old);
+    assert_eq!(&loop_.snapshot(), old);
     assert_eq!(loop_.result(), Err(LoopError::FeedbackResolutionMiss));
 }
 #[test]
@@ -531,7 +531,7 @@ fn feedback_miss_is_terminal_not_correctable_validation_or_fresh_reasoning() {
 #[test]
 fn partial_paths_and_unfinished_feedback_are_not_targets() {
     let mut pending = loop_for(&["A"], None, None);
-    let empty = pending.history();
+    let empty = pending.snapshot();
     assert!(matches!(
         BatchLoop::new(config(&["A"], Some(empty), Some(NOTE))),
         Err(LoopError::FeedbackResolutionMiss)
@@ -542,7 +542,7 @@ fn partial_paths_and_unfinished_feedback_are_not_targets() {
     pending
         .complete(Completion::Tool(output(&request)))
         .unwrap();
-    let partial = pending.history();
+    let partial = pending.snapshot();
     let mut loop_ = loop_for(&["A"], Some(partial.clone()), Some(NOTE));
     let tool = next_tool(&mut loop_);
     assert_eq!(
@@ -553,7 +553,7 @@ fn partial_paths_and_unfinished_feedback_are_not_targets() {
     let mut first = loop_for(&["A"], Some(initial()), Some(NOTE));
     let tool = next_tool(&mut first);
     first.complete(Completion::Tool(output(&tool))).unwrap();
-    let open = first.history();
+    let open = first.snapshot();
     let mut second = loop_for(&["A"], Some(open.clone()), Some("another intervention"));
     let tool = next_tool(&mut second);
     assert_eq!(
@@ -574,10 +574,10 @@ fn opaque_null_feedback_presence_and_constructor_limits() {
             Some(vec![1, 254]),
         )))
         .unwrap();
-    let old = initial_loop.history();
+    let old = initial_loop.snapshot();
     let mut updated = old.clone();
     for _ in 0..3 {
-        let mut loop_ = BatchLoop::new(base().with_replay(updated).with_feedback(None)).unwrap();
+        let mut loop_ = BatchLoop::new(base().with_snapshot(updated).with_feedback(None)).unwrap();
         let Request::Llm(request) = loop_.next_request(RequestKind::Any).unwrap() else {
             panic!()
         };
@@ -594,9 +594,9 @@ fn opaque_null_feedback_presence_and_constructor_limits() {
             )))
             .unwrap();
         assert!(loop_.is_done());
-        updated = loop_.history();
+        updated = loop_.snapshot();
     }
-    let mut replay_config = base().with_replay(updated);
+    let mut replay_config = base().with_snapshot(updated);
     replay_config.env_ids = vec!["C".into()];
     let mut replay = BatchLoop::new(replay_config).unwrap();
     assert!(replay.is_done());
@@ -606,13 +606,13 @@ fn opaque_null_feedback_presence_and_constructor_limits() {
         BatchLoop::new(base().with_feedback(None)),
         Err(LoopError::InvalidFeedback)
     ));
-    let mut multiple = base().with_replay(old.clone()).with_feedback(None);
+    let mut multiple = base().with_snapshot(old.clone()).with_feedback(None);
     multiple.env_ids.push("B".into());
     assert!(matches!(
         BatchLoop::new(multiple),
         Err(LoopError::InvalidFeedback)
     ));
-    let mut changed = base().with_replay(old.clone()).with_feedback(None);
+    let mut changed = base().with_snapshot(old.clone()).with_feedback(None);
     changed.prompt = Some(vec![99]);
     assert!(matches!(
         BatchLoop::new(changed),
@@ -620,7 +620,7 @@ fn opaque_null_feedback_presence_and_constructor_limits() {
     ));
     let mut bounded = BatchLoop::new(
         base()
-            .with_replay(old)
+            .with_snapshot(old)
             .with_feedback(None)
             .with_budget(Budget::new(100, |_| None)),
     )
@@ -655,7 +655,7 @@ fn lossy_grouping_keeps_actual_evidence_and_shared_feedback_context() {
         )))
         .unwrap();
     let mut feedback = BatchLoop::with_comparison_key(
-        config(&["B"], Some(loop_.history()), Some(NOTE)),
+        config(&["B"], Some(loop_.snapshot()), Some(NOTE)),
         |s: &String| s.trim().to_owned(),
     )
     .unwrap();
@@ -674,9 +674,9 @@ fn lossy_grouping_keeps_actual_evidence_and_shared_feedback_context() {
             OLD.into(),
         )))
         .unwrap();
-    let history = feedback.history();
+    let snapshot = feedback.snapshot();
     assert_eq!(
-        history.root().observations[0]
+        snapshot.root().observations[0]
             .evidence
             .last()
             .unwrap()
@@ -685,7 +685,7 @@ fn lossy_grouping_keeps_actual_evidence_and_shared_feedback_context() {
         "shared\n"
     );
     let mut replay = BatchLoop::with_comparison_key(
-        config(&["C"], Some(history.clone()), None),
+        config(&["C"], Some(snapshot.clone()), None),
         |s: &String| s.trim().to_owned(),
     )
     .unwrap();
@@ -699,7 +699,7 @@ fn lossy_grouping_keeps_actual_evidence_and_shared_feedback_context() {
     assert!(replay.is_done());
     assert_eq!(replay.result().unwrap().results["C"], OLD);
     assert_eq!(
-        history.root().observations[0]
+        snapshot.root().observations[0]
             .evidence
             .last()
             .unwrap()
@@ -714,7 +714,7 @@ fn ambiguous_user_edges_are_rejected_not_implicitly_merged() {
     let mut pending = loop_for(&["A"], Some(initial()), Some(NOTE));
     let tool = next_tool(&mut pending);
     pending.complete(Completion::Tool(output(&tool))).unwrap();
-    let mut malformed = pending.history();
+    let mut malformed = pending.snapshot();
     let mut node = shared_node(&malformed).as_ref().clone();
     node.user_continuations
         .push(node.user_continuations[0].clone());
@@ -733,7 +733,10 @@ fn ambiguous_user_edges_are_rejected_not_implicitly_merged() {
     drive(&mut loop_for(&["D"], Some(malformed), None), false);
 }
 
-fn nested_config(previous: Option<History<String>>, feedback: Option<&str>) -> LoopConfig<String> {
+fn nested_config(
+    previous: Option<AgentSnapshot<String>>,
+    feedback: Option<&str>,
+) -> LoopConfig<String> {
     let specs = || {
         ["investigate", "probe"]
             .iter()
@@ -749,7 +752,7 @@ fn nested_config(previous: Option<History<String>>, feedback: Option<&str>) -> L
         ),
     );
     let mut config = match previous {
-        Some(h) => config.with_replay(h),
+        Some(h) => config.with_snapshot(h),
         None => config,
     };
     if let Some(f) = feedback {
@@ -757,7 +760,10 @@ fn nested_config(previous: Option<History<String>>, feedback: Option<&str>) -> L
     }
     config
 }
-fn nested_loop(previous: Option<History<String>>, feedback: Option<&str>) -> BatchLoop<String> {
+fn nested_loop(
+    previous: Option<AgentSnapshot<String>>,
+    feedback: Option<&str>,
+) -> BatchLoop<String> {
     BatchLoop::new(nested_config(previous, feedback)).unwrap()
 }
 fn serve_nested(r: &LlmRequest<String>) -> LlmCompletion<String> {
@@ -819,12 +825,12 @@ fn resolution_miss_in_child_cancels_other_work_and_new_children_can_resume() {
         .complete(Completion::Llm(serve_nested(&request)))
         .unwrap();
     assert!(matches!(
-        BatchLoop::new(nested_config(Some(pending.history()), Some(NOTE))),
+        BatchLoop::new(nested_config(Some(pending.snapshot()), Some(NOTE))),
         Err(LoopError::FeedbackResolutionMiss)
     ));
     let mut original = nested_loop(None, None);
     nested_drive(&mut original, false);
-    let old = original.history();
+    let old = original.snapshot();
     let mut loop_ = nested_loop(Some(old.clone()), Some(NOTE));
     let child = next_tool(&mut loop_);
     let local = next_tool(&mut loop_);
@@ -856,7 +862,7 @@ fn resolution_miss_in_child_cancels_other_work_and_new_children_can_resume() {
             .collect::<Vec<_>>(),
         ["parent", "new-child", "new-child", "parent"]
     );
-    assert!(nested_drive(&mut nested_loop(Some(feedback.history()), None), true).is_empty());
+    assert!(nested_drive(&mut nested_loop(Some(feedback.snapshot()), None), true).is_empty());
     assert!(
         old.load(&old.root().observations[0].continuation)
             .user_continuations

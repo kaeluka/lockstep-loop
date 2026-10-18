@@ -1,8 +1,9 @@
 //! cargo run -p lockstep-loop --example specialized_subagents
 //! Caller metadata selection + ordinary RecordStore loading. Initial prompts use USER role.
 use lockstep_loop::{
-    AgentDescriptor, BatchLoop, BatchResult, Completion, LlmCompletion, LoopConfig, LoopError,
-    NodeRef, RecordStore, Request, RequestKind, SubagentTool, ToolCall, ToolCompletion, ToolSpec,
+    Agent, AgentConfig, AgentDescriptor, AgentResolver, BatchResult, Completion, LlmCompletion,
+    LoopError, NodeRef, RecordStore, Request, RequestKind, RunOptions, SubagentTool, ToolCall,
+    ToolCompletion, ToolSpec,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -53,14 +54,17 @@ fn investigate(
         Arc::new(serde_json::from_slice(&read_backend.lock().unwrap()[reference]).unwrap())
     });
     let selected = cache.clone();
-    let config = LoopConfig::new(parent_prompt.into(), vec![env.into()], vec![])
+    let config = AgentConfig::new(parent_prompt.into(), vec![])
         .with_subagents(vec![imports()])
         .with_record_store(store)
-        .with_agent_resolver(move |query| {
+        .with_agent_resolver(AgentResolver::new(move |query| {
             // Fixed configuration in this example; core still checks full compatibility.
             Ok(selected.lock().unwrap().get(&query.prompt).cloned())
-        });
-    let mut loop_ = BatchLoop::new(config).unwrap();
+        }));
+    let agent = Agent::new(config).unwrap();
+    let mut loop_ = agent
+        .start(vec![env.into()], RunOptions::default())
+        .unwrap();
     let (mut parent_llms, mut child_llms, mut child_tools) = (0, 0, 0);
     while !loop_.is_done() {
         match loop_.next_request(RequestKind::Any).unwrap() {
@@ -128,8 +132,8 @@ fn investigate(
     )
 }
 fn publish(result: &BatchResult<String>, backend: &Backend) -> AgentDescriptor<String> {
-    assert_eq!(result.child_agents().len(), 1); // concurrent updates need explicit caller coordination
-    let agent = result.child_agents()[0].agent();
+    assert_eq!(result.child_updates().len(), 1); // concurrent updates need explicit caller coordination
+    let agent = result.child_updates()[0].snapshot();
     let mut backend = backend.lock().unwrap();
     // Insert-only shallow records BEFORE publishing any descriptor. No parent
     // descriptor is required to load this child investigation in another run.
@@ -156,7 +160,7 @@ fn main() {
         &backend,
     );
     assert_eq!(counts, (2, 2, 1));
-    let original = first.child_agents()[0].agent();
+    let original = first.child_updates()[0].snapshot();
     let selected = publish(&first, &backend);
     cache
         .lock()
@@ -171,14 +175,14 @@ fn main() {
     );
     assert_eq!(counts, (2, 0, 1));
     assert_eq!(second.results["repo@commit-2"], "os, sys");
-    let update = &second.child_agents()[0];
+    let update = &second.child_updates()[0];
     assert_eq!(update.base.as_ref(), Some(&selected));
-    assert_ne!(update.agent().descriptor.root, selected.root);
+    assert_ne!(update.snapshot().descriptor.root, selected.root);
     assert_eq!(original.root().env_ids, ["repo@commit-1"]);
-    let parent_root = second.agent().root();
+    let parent_root = second.snapshot().root();
     let provenance = parent_root.subagents[0].runs.last().unwrap();
     assert_eq!(provenance.base.as_ref(), Some(&selected));
-    assert_eq!(provenance.agent_descriptor(), &update.agent().descriptor);
+    assert_eq!(provenance.agent_descriptor(), &update.snapshot().descriptor);
     let updated = publish(&second, &backend);
     cache
         .lock()

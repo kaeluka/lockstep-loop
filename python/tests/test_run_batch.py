@@ -1,3 +1,4 @@
+
 """Tests for the prototype lockstep loop."""
 
 from collections.abc import Callable, Mapping
@@ -7,7 +8,6 @@ from typing import Any
 import pytest
 
 from lockstep_loop import (
-    BatchLoop,
     Budget,
     LlmCompletion,
     LlmRequest,
@@ -20,6 +20,7 @@ from lockstep_loop import (
     run_batch,
     run_to_completion,
 )
+from lockstep_loop.core import BatchLoop
 
 
 @dataclass(frozen=True)

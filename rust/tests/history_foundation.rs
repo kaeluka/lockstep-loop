@@ -1,5 +1,5 @@
 use lockstep_loop::{
-    BatchLoop, BatchResult, Completion, History, HistoryDescriptor, HistoryNode, LlmCompletion,
+    AgentDescriptor, AgentSnapshot, BatchLoop, BatchResult, Completion, HistoryNode, LlmCompletion,
     LoopConfig, LoopError, Message, NodeRef, Observation, OutputRecord, RecordStore, Request,
     RequestKind, SubagentTool, ToolCall, ToolCompletion, ToolSpec, UserContinuation,
 };
@@ -15,7 +15,7 @@ fn specs() -> Vec<ToolSpec> {
 }
 fn nested_config(
     envs: &[&str],
-    previous: Option<History<String>>,
+    previous: Option<AgentSnapshot<String>>,
     depth: usize,
 ) -> LoopConfig<String> {
     let config = LoopConfig::new(
@@ -30,14 +30,14 @@ fn nested_config(
         depth,
     ));
     match previous {
-        Some(h) => config.with_replay(h),
+        Some(h) => config.with_snapshot(h),
         None => config,
     }
 }
 struct Driven {
     result: BatchResult<String>,
     llms: Vec<String>,
-    early: History<String>,
+    early: AgentSnapshot<String>,
     tools: usize,
 }
 fn nested_drive(mut loop_: BatchLoop<String>, values: &[(&str, &str)]) -> Driven {
@@ -124,7 +124,7 @@ fn nested_drive(mut loop_: BatchLoop<String>, values: &[(&str, &str)]) -> Driven
                 }
             }
             if early.is_none() {
-                early = Some(loop_.history());
+                early = Some(loop_.snapshot());
             }
         }
     }
@@ -135,19 +135,19 @@ fn nested_drive(mut loop_: BatchLoop<String>, values: &[(&str, &str)]) -> Driven
         tools,
     }
 }
-fn child(history: &History<String>, call: &str) -> History<String> {
-    let root = history.root();
+fn child(snapshot: &AgentSnapshot<String>, call: &str) -> AgentSnapshot<String> {
+    let root = snapshot.root();
     let entry = root.subagents.iter().find(|s| s.call_id == call).unwrap();
-    History {
-        descriptor: entry.history.clone(),
-        store: history.store.clone(),
+    AgentSnapshot {
+        descriptor: entry.snapshot.clone(),
+        store: snapshot.store.clone(),
     }
 }
 
 type Backend = BTreeMap<NodeRef, Vec<u8>>;
-fn save(history: &History<String>, backend: &mut Backend) -> Vec<u8> {
+fn save(snapshot: &AgentSnapshot<String>, backend: &mut Backend) -> Vec<u8> {
     // Insert-only persistence: never silently overwrite a different record.
-    for (reference, node) in history.store.records() {
+    for (reference, node) in snapshot.store.records() {
         let bytes = serde_json::to_vec(&node).unwrap();
         if let Some(old) = backend.get(&reference) {
             assert_eq!(old, &bytes);
@@ -155,16 +155,16 @@ fn save(history: &History<String>, backend: &mut Backend) -> Vec<u8> {
             backend.insert(reference, bytes);
         }
     }
-    serde_json::to_vec(&history.descriptor).unwrap()
+    serde_json::to_vec(&snapshot.descriptor).unwrap()
 }
 fn restore(
     descriptor: &[u8],
     backend: Backend,
     namespace: &str,
     loads: Arc<Mutex<Vec<NodeRef>>>,
-) -> History<String> {
-    History {
-        descriptor: serde_json::from_slice::<HistoryDescriptor<String>>(descriptor).unwrap(),
+) -> AgentSnapshot<String> {
+    AgentSnapshot {
+        descriptor: serde_json::from_slice::<AgentDescriptor<String>>(descriptor).unwrap(),
         store: RecordStore::with_loader(namespace, move |reference| {
             loads.lock().unwrap().push(reference.clone());
             Arc::new(serde_json::from_slice(&backend[reference]).unwrap())
@@ -181,7 +181,7 @@ fn nested_histories_mixed_calls_depth_equal_parent_answers_and_snapshots() {
     assert_eq!(driven.result.classes.len(), 1);
     assert_eq!(driven.result.classes[0].env_ids, ["a", "b"]);
     assert_eq!(driven.llms.iter().filter(|s| *s == "main").count(), 2);
-    let old = driven.result.history;
+    let old = driven.result.snapshot;
     let grand = child(&child(&old, "child"), "nested");
     assert!(grand.descriptor.subagents.is_empty());
     assert!(
@@ -212,7 +212,7 @@ fn nested_histories_mixed_calls_depth_equal_parent_answers_and_snapshots() {
     assert!(
         driven.early.root().subagents.iter().all(|s| driven
             .early
-            .load(&s.history.root)
+            .load(&s.snapshot.root)
             .assistant
             .is_none())
     );
@@ -235,7 +235,7 @@ fn nested_histories_mixed_calls_depth_equal_parent_answers_and_snapshots() {
     assert!(!changed.llms.is_empty());
     assert!(changed.llms.iter().all(|scope| scope != "main"));
     assert_eq!(changed.result.classes.len(), 1);
-    let extended = changed.result.history;
+    let extended = changed.result.snapshot;
     assert_eq!(
         child(&child(&extended, "child"), "nested")
             .root()
@@ -302,7 +302,7 @@ fn repeated_subagent_call_ids_cannot_accept_stale_completions() {
             "done".into(),
         )))
         .unwrap();
-    let old = loop_.history();
+    let old = loop_.snapshot();
     assert!(loop_.is_done());
     let mut replay = BatchLoop::new(nested_config(&["next"], Some(old.clone()), 2)).unwrap();
     assert!(replay.is_done());
@@ -327,7 +327,7 @@ fn invalid_nested_completion_preserves_routes_and_snapshot() {
         }))
         .unwrap();
     let child_request = loop_.next_request(RequestKind::Any).unwrap();
-    let before = loop_.history();
+    let before = loop_.snapshot();
     let duplicate = ToolCall::new("p", "probe", json!({}));
     assert!(matches!(
         loop_.complete(Completion::Llm(LlmCompletion {
@@ -337,7 +337,7 @@ fn invalid_nested_completion_preserves_routes_and_snapshot() {
         })),
         Err(LoopError::DuplicateToolCallId(_))
     ));
-    assert_eq!(loop_.history(), before);
+    assert_eq!(loop_.snapshot(), before);
     assert_eq!(loop_.outstanding_llm(), 1);
     loop_
         .complete(Completion::Llm(LlmCompletion {
@@ -347,7 +347,7 @@ fn invalid_nested_completion_preserves_routes_and_snapshot() {
         }))
         .unwrap();
     let tool = loop_.next_request(RequestKind::Any).unwrap();
-    let before = loop_.history();
+    let before = loop_.snapshot();
     assert!(matches!(
         loop_.complete(Completion::Tool(ToolCompletion {
             request_id: tool.request_id().into(),
@@ -356,7 +356,7 @@ fn invalid_nested_completion_preserves_routes_and_snapshot() {
         Err(LoopError::InvalidToolCompletion(_))
     ));
     assert_eq!(loop_.outstanding_tool(), 1);
-    assert_eq!(loop_.history(), before);
+    assert_eq!(loop_.snapshot(), before);
     loop_
         .complete(Completion::Tool(ToolCompletion {
             request_id: tool.request_id().into(),
@@ -375,19 +375,19 @@ fn invalid_nested_completion_preserves_routes_and_snapshot() {
     assert!(loop_.is_done());
     assert!(child(&before, "child").root().observations.is_empty());
     assert_eq!(
-        child(&loop_.history(), "child").root().observations[0].evidence[1].env_id,
+        child(&loop_.snapshot(), "child").root().observations[0].evidence[1].env_id,
         "b"
     );
 }
 
-fn simple(envs: &[&str], previous: Option<History<String>>) -> BatchLoop<String> {
+fn simple(envs: &[&str], previous: Option<AgentSnapshot<String>>) -> BatchLoop<String> {
     let config = LoopConfig::new(
         "inspect".into(),
         envs.iter().map(|s| (*s).into()).collect(),
         vec![specs()[0].clone()],
     );
     BatchLoop::new(match previous {
-        Some(h) => config.with_replay(h),
+        Some(h) => config.with_snapshot(h),
         None => config.with_record_store(RecordStore::new("initial-writer")),
     })
     .unwrap()
@@ -438,7 +438,7 @@ fn sequential<K: Eq + std::hash::Hash + std::fmt::Debug + 'static>(
 fn deep_individual_records_roundtrip_and_lazy_traversal_then_publish_new_path() {
     let mut original = simple(&["left", "right"], None);
     sequential(&mut original, &[("left", "L"), ("right", "R")], 256);
-    let old = original.history();
+    let old = original.snapshot();
     let mut backend = Backend::new();
     // Each record AND envelope deserialize using ordinary serde_json defaults.
     // No recursion-limit increase, recursive export tree, or caller replay logic.
@@ -452,7 +452,7 @@ fn deep_individual_records_roundtrip_and_lazy_traversal_then_publish_new_path() 
     assert_eq!(loads.lock().unwrap().len(), 257);
     assert!(!loads.lock().unwrap().contains(&right));
     assert_eq!(old.root().observations[0].evidence.len(), 1);
-    let new_descriptor = save(&replay.history(), &mut backend);
+    let new_descriptor = save(&replay.snapshot(), &mut backend);
     let restored = restore(
         &new_descriptor,
         backend.clone(),
@@ -461,7 +461,7 @@ fn deep_individual_records_roundtrip_and_lazy_traversal_then_publish_new_path() 
     );
     let mut changed = simple(&["new"], Some(restored));
     assert_eq!(sequential(&mut changed, &[("new", "NEW")], 1), 1);
-    let extended_descriptor = save(&changed.history(), &mut backend);
+    let extended_descriptor = save(&changed.snapshot(), &mut backend);
     for (index, value) in ["L", "R", "NEW"].iter().enumerate() {
         let restored = restore(
             &extended_descriptor,
@@ -490,7 +490,7 @@ fn deep_individual_records_roundtrip_and_lazy_traversal_then_publish_new_path() 
 fn user_continuations_belong_to_resolved_investigation_not_answer_value() {
     let mut original = simple(&["a", "b"], None);
     sequential(&mut original, &[("a", "A"), ("b", "B")], 1);
-    let old = original.history();
+    let old = original.snapshot();
     let mut resolved = simple(&["a"], Some(old.clone()));
     assert_eq!(sequential(&mut resolved, &[("a", "A")], 1), 0);
     let extended = resolved
@@ -509,7 +509,7 @@ fn user_continuations_belong_to_resolved_investigation_not_answer_value() {
             .user_continuations
             .is_empty()
     );
-    let resolved_history = resolved.history();
+    let resolved_history = resolved.snapshot();
     assert!(
         resolved_history
             .load(&resolved_history.root().observations[0].continuation)
@@ -627,7 +627,7 @@ fn partition_labels_retain_meaning() {
     .unwrap();
     sequential(&mut loop_, &[("a", "A"), ("b", "B")], 1);
     let result = loop_.result().unwrap();
-    assert_eq!(result.agent().root().observations.len(), 2);
+    assert_eq!(result.snapshot().root().observations.len(), 2);
     assert_eq!(
         result
             .tree

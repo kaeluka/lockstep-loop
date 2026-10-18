@@ -5,11 +5,10 @@ from dataclasses import replace
 import pytest
 
 from lockstep_loop import (
-    BatchLoop,
+    AgentSnapshot,
     Budget,
     Feedback,
     FeedbackResolutionError,
-    History,
     InvalidHistoryError,
     LlmCompletion,
     LlmRequest,
@@ -20,6 +19,7 @@ from lockstep_loop import (
     ToolRequest,
     ToolSpec,
 )
+from lockstep_loop.core import BatchLoop
 
 SPECS = tuple(ToolSpec(name, "read-only", {}) for name in ("read", "detail", "extra"))
 PROMPT = "Inspect the repository"
@@ -27,12 +27,12 @@ NOTE = "Also inspect /foo"
 OLD = "no issues"
 
 
-def loop_for(envs, history=None, feedback=None, **options):
+def loop_for(envs, snapshot=None, feedback=None, **options):
     return BatchLoop(
         prompt=PROMPT,
         env_ids=envs,
         tool_specs=SPECS,
-        history=history,
+        snapshot=snapshot,
         feedback=feedback,
         **options,
     )
@@ -89,26 +89,26 @@ def initial():
             "D": {"read": "unrelated"},
         },
     )
-    return result.history
+    return result.snapshot
 
 
-def shared_node(history):
+def shared_node(snapshot):
     edge = next(
-        e for e in history.root.observations if e.representative[0].tool_output.strip() == "shared"
+        e for e in snapshot.root.observations if e.representative[0].tool_output.strip() == "shared"
     )
-    return history.load(edge.continuation)
+    return snapshot.load(edge.continuation)
 
 
-def publish(history, backend):
-    for reference, node in history.store.records().items():
+def publish(snapshot, backend):
+    for reference, node in snapshot.store.records().items():
         encoded = pickle.dumps(node)
         assert reference not in backend or backend[reference] == encoded
         backend[reference] = encoded
-    return pickle.dumps(history.descriptor)
+    return pickle.dumps(snapshot.descriptor)
 
 
 def restore(descriptor, backend):
-    return History(
+    return AgentSnapshot(
         pickle.loads(descriptor), RecordStore(load=lambda ref: pickle.loads(backend[ref]))
     )
 
@@ -127,28 +127,28 @@ def test_resume_once_shared_path_inheritance_splits_and_immutable_snapshots():
     assert request.messages[0].content == PROMPT
     assert [m.content for m in request.messages[-2:]] == [OLD, NOTE]
     assert request.messages[1].tool_calls[0].args == {"path": "/entry"}
-    opened = loop.history
+    opened = loop.snapshot
     edge = shared_node(opened).user_continuations[0]
     assert edge.message.content == NOTE
     assert opened.load(edge.continuation).assistant is None
     assert not old_shared.user_continuations
     assert opened.root.observations[1].continuation == old_unrelated
 
-    # Invalid fulfillments leave both history and pending request recoverable.
-    before = loop.history
+    # Invalid fulfillments leave both snapshot and pending request recoverable.
+    before = loop.snapshot
     with pytest.raises(TypeError):
         loop.complete(ToolCompletion(request.request_id, (("A", "bad"),)))
     duplicate = ToolCall("dup", "detail", {})
     with pytest.raises(ValueError, match="duplicate"):
         loop.complete(LlmCompletion(request.request_id, "bad", (duplicate, duplicate)))
-    assert loop.history is before
+    assert loop.snapshot is before
     assert loop.outstanding_llm == 1
     loop.complete(model(request))
     detail, extra = loop.next_request("tool"), loop.next_request("tool")
-    before = loop.history
+    before = loop.snapshot
     with pytest.raises(ValueError, match="exactly one"):
         loop.complete(ToolCompletion(extra.request_id, (("wrong", "bad"),)))
-    assert loop.history is before
+    assert loop.snapshot is before
     assert loop.outstanding_tool == 2
     loop.complete(output_for(extra, {"A": {"extra": "metadata"}}))
     assert loop.next_request("llm") is None
@@ -160,7 +160,7 @@ def test_resume_once_shared_path_inheritance_splits_and_immutable_snapshots():
     loop.complete(LlmCompletion(final.request_id, OLD))  # same answer is valid
     assert loop.done
     assert loop.next_request() is None
-    revised = loop.result().history
+    revised = loop.result().snapshot
     revised_shared = shared_node(revised)
     assert revised_shared.assistant.content == OLD
     after_user = revised.load(revised_shared.user_continuations[0].continuation)
@@ -184,14 +184,14 @@ def test_resume_once_shared_path_inheritance_splits_and_immutable_snapshots():
     assert [m.content for m in llms[0].messages if m.role == "user"] == [PROMPT, NOTE]
     assert {r.env_ids for r in tools if r.tool_call.name != "read"} == {("A", "B", "C")}
     assert sorted(c.env_ids for c in result.classes) == [("A", "C"), ("B",), ("D",)]
-    assert result.history.load(old_unrelated).user_continuations == ()
+    assert result.snapshot.load(old_unrelated).user_continuations == ()
     assert not old_shared.user_continuations
     assert old.root.env_ids == ("A", "B", "D")
     assert len(after_user.observations) == 1
     _, _, tools = drive(loop_for(("B",), old), {"B": {"read": "shared"}}, allow_llm=False)
     assert [r.tool_call.name for r in tools] == ["read"]
     for env in data:
-        drive(loop_for((env,), result.history), {env: data[env]}, allow_llm=False)
+        drive(loop_for((env,), result.snapshot), {env: data[env]}, allow_llm=False)
 
 
 def test_interleaved_feedback_paths_preserve_each_others_updates():
@@ -202,13 +202,13 @@ def test_interleaved_feedback_paths_preserve_each_others_updates():
         "D": {"read": "unrelated", "detail": "safe", "extra": "metadata"},
     }
     first, _, _ = drive(loop_for(("A",), initial(), Feedback(NOTE)), data)
-    second, _, _ = drive(loop_for(("D",), first.history, Feedback("Check another path")), data)
-    assert not first.history.load(
-        first.history.root.observations[1].continuation
+    second, _, _ = drive(loop_for(("D",), first.snapshot, Feedback("Check another path")), data)
+    assert not first.snapshot.load(
+        first.snapshot.root.observations[1].continuation
     ).user_continuations
     for seed in range(8):
         rng = random.Random(seed)
-        loop = loop_for(tuple(data), second.history)
+        loop = loop_for(tuple(data), second.snapshot)
         pending, llms = [], []
         while not loop.done:
             for _ in range(rng.randrange(1, 5)):
@@ -232,7 +232,7 @@ def test_interleaved_feedback_paths_preserve_each_others_updates():
         result = loop.result()
         assert result.results == {"A": OLD, "B": "found", "C": OLD, "D": OLD}
         assert len(result.classes) == 3
-        assert len(shared_node(result.history).user_continuations) == 1
+        assert len(shared_node(result.snapshot).user_continuations) == 1
 
 
 def test_repeated_identical_feedback_after_storage_roundtrip_targets_revised_endpoint():
@@ -241,7 +241,7 @@ def test_repeated_identical_feedback_after_storage_roundtrip_targets_revised_end
     first, _, _ = drive(loop_for(("A",), old, Feedback(NOTE)), data)
     assert first.results == {"A": "found"}
     backend = {}
-    descriptor = publish(first.history, backend)
+    descriptor = publish(first.snapshot, backend)
     restored = restore(descriptor, backend)
     loop = loop_for(("A",), restored, Feedback(NOTE))
     requests = []
@@ -257,7 +257,7 @@ def test_repeated_identical_feedback_after_storage_roundtrip_targets_revised_end
     assert request.messages[-1].content == NOTE
     loop.complete(LlmCompletion(request.request_id, "found"))
     assert loop.done
-    second = loop.result().history
+    second = loop.result().snapshot
     second_descriptor = publish(second, backend)
     reopened = restore(second_descriptor, backend)
     result, _, tools = drive(loop_for(("NEW",), reopened), {"NEW": data["A"]}, allow_llm=False)
@@ -274,7 +274,7 @@ def assert_failed(loop, old):
     assert loop.done
     assert isinstance(loop.error, FeedbackResolutionError)
     assert loop.next_request() is None and loop.outstanding_count == 0
-    assert loop.history.descriptor == old.descriptor
+    assert loop.snapshot.descriptor == old.descriptor
     with pytest.raises(FeedbackResolutionError):
         loop.result()
 
@@ -297,14 +297,14 @@ def test_feedback_miss_is_terminal_not_correctable_validation_or_fresh_reasoning
 
 def test_partial_paths_and_unfinished_feedback_are_not_targets():
     pending = loop_for(("A",))
-    empty = pending.history
+    empty = pending.snapshot
     with pytest.raises(FeedbackResolutionError):
         loop_for(("A",), empty, Feedback(NOTE))
     request = pending.next_request()
     pending.complete(model(request))
     request = pending.next_request()
     pending.complete(ToolCompletion(request.request_id, (("A", "shared"),)))
-    partial = pending.history  # observation known, assistant answer not yet fulfilled
+    partial = pending.snapshot  # observation known, assistant answer not yet fulfilled
     loop = loop_for(("A",), partial, Feedback(NOTE))
     tool = loop.next_request()
     with pytest.raises(FeedbackResolutionError):
@@ -313,7 +313,7 @@ def test_partial_paths_and_unfinished_feedback_are_not_targets():
     old = initial()
     first = loop_for(("A",), old, Feedback(NOTE))
     first.complete(output_for(first.next_request(), {"A": {"read": "shared"}}))
-    open_feedback = first.history
+    open_feedback = first.snapshot
     second = loop_for(("A",), open_feedback, Feedback("another intervention"))
     with pytest.raises(FeedbackResolutionError):
         second.complete(output_for(second.next_request(), {"A": {"read": "shared"}}))
@@ -326,14 +326,14 @@ def test_opaque_null_feedback_presence_and_constructor_limits():
     )
     request = initial_loop.next_request()
     initial_loop.complete(LlmCompletion(request.request_id, b"same"))
-    old = initial_loop.history
+    old = initial_loop.snapshot
     updated = old
     for _ in range(3):
         loop = BatchLoop(
             prompt=b"prompt",
             env_ids=["A"],
             tool_specs=[],
-            history=updated,
+            snapshot=updated,
             feedback=Feedback(None),
         )
         request = loop.next_request()
@@ -341,19 +341,19 @@ def test_opaque_null_feedback_presence_and_constructor_limits():
         assert request.messages[-2].content == b"same"
         loop.complete(LlmCompletion(request.request_id, b"same"))
         assert loop.done
-        updated = loop.history
+        updated = loop.snapshot
     replay = BatchLoop(
-        prompt=b"prompt", env_ids=["C"], tool_specs=[], history=updated
+        prompt=b"prompt", env_ids=["C"], tool_specs=[], snapshot=updated
     )
     assert replay.done and replay.result().results == {"C": b"same"}
     assert not old.root.user_continuations
     bounded = BatchLoop(
-        prompt=b"prompt", env_ids=["A"], tool_specs=[], history=old,
+        prompt=b"prompt", env_ids=["A"], tool_specs=[], snapshot=old,
         feedback=Feedback(None), budget=Budget(100),
     )
     assert isinstance(bounded.next_request(), LlmRequest)
     for options in (
-        {"history": None},
+        {"snapshot": None},
         {"env_ids": ["A", "B"]},
         {"prompt": b"changed"},
     ):
@@ -361,7 +361,7 @@ def test_opaque_null_feedback_presence_and_constructor_limits():
             prompt=b"prompt",
             env_ids=["A"],
             tool_specs=[],
-            history=old,
+            snapshot=old,
             feedback=Feedback(None),
         )
         config.update(options)
@@ -377,28 +377,28 @@ def test_lossy_grouping_keeps_actual_evidence_and_shared_feedback_context():
             "B": {"read": "shared"},
         },
     )
-    loop = loop_for(("B",), result.history, Feedback(NOTE), comparison_key=str.strip)
+    loop = loop_for(("B",), result.snapshot, Feedback(NOTE), comparison_key=str.strip)
     loop.complete(output_for(loop.next_request(), {"B": {"read": "shared\n"}}))
     request = loop.next_request()
     assert request.messages[2].content == "shared "  # historical representative
     loop.complete(LlmCompletion(request.request_id, OLD))
-    history = loop.history
-    assert history.root.observations[0].evidence[-1].outputs[0].tool_output == "shared\n"
-    replay = loop_for(("C",), history, comparison_key=str.strip)
+    snapshot = loop.snapshot
+    assert snapshot.root.observations[0].evidence[-1].outputs[0].tool_output == "shared\n"
+    replay = loop_for(("C",), snapshot, comparison_key=str.strip)
     replay.complete(output_for(replay.next_request(), {"C": {"read": "shared\t"}}))
     assert replay.done and replay.result().results == {"C": OLD}
-    assert history.root.observations[0].evidence[-1].outputs[0].tool_output == "shared\n"
+    assert snapshot.root.observations[0].evidence[-1].outputs[0].tool_output == "shared\n"
 
 
 def test_ambiguous_user_edges_are_rejected_not_implicitly_merged():
     old = initial()
     loop = loop_for(("A",), old, Feedback(NOTE))
     loop.complete(output_for(loop.next_request(), {"A": {"read": "shared"}}))
-    history = loop.history
-    node = shared_node(history)
-    root = history.root
-    bad_node = history.store.put(replace(node, user_continuations=node.user_continuations * 2))
-    bad_root = history.store.put(
+    snapshot = loop.snapshot
+    node = shared_node(snapshot)
+    root = snapshot.root
+    bad_node = snapshot.store.put(replace(node, user_continuations=node.user_continuations * 2))
+    bad_root = snapshot.store.put(
         replace(
             root,
             observations=(
@@ -407,7 +407,7 @@ def test_ambiguous_user_edges_are_rejected_not_implicitly_merged():
             ),
         )
     )
-    malformed = replace(history, descriptor=replace(history.descriptor, root=bad_root))
+    malformed = replace(snapshot, descriptor=replace(snapshot.descriptor, root=bad_root))
     loop = loop_for(("A",), malformed)
     with pytest.raises(InvalidHistoryError):
         loop.complete(output_for(loop.next_request(), {"A": {"read": "shared"}}))
@@ -416,14 +416,14 @@ def test_ambiguous_user_edges_are_rejected_not_implicitly_merged():
     drive(loop_for(("D",), malformed), {"D": {"read": "unrelated"}}, allow_llm=False)
 
 
-def nested_loop(history=None, feedback=None):
+def nested_loop(snapshot=None, feedback=None):
     specs = (ToolSpec("investigate", "", {}), ToolSpec("probe", "", {}))
     return BatchLoop(
         prompt="parent",
         env_ids=["A"],
         tool_specs=specs,
         subagent=SubagentTool("investigate", "", {}, lambda a: a["prompt"], lambda _: specs, 1),
-        history=history,
+        snapshot=snapshot,
         feedback=feedback,
     )
 
@@ -456,7 +456,7 @@ def nested_drive(loop, *, replay=False):
                 loop.complete(serve_nested(request))
             else:
                 loop.complete(ToolCompletion(request.request_id, (("A", "known"),)))
-    return loop.history, llms
+    return loop.snapshot, llms
 
 
 def test_resolution_miss_in_nested_child_cancels_other_work_then_new_children_can_resume():
@@ -465,7 +465,7 @@ def test_resolution_miss_in_nested_child_cancels_other_work_then_new_children_ca
     # The child exists but has no fulfilled assistant turn: do not generate one
     # just to manufacture a parent feedback target.
     with pytest.raises(FeedbackResolutionError):
-        nested_loop(pending.history, Feedback(NOTE))
+        nested_loop(pending.snapshot, Feedback(NOTE))
     old, _ = nested_drive(nested_loop())
     loop = nested_loop(old, Feedback(NOTE))
     child_tool, local_tool = loop.next_request(), loop.next_request()

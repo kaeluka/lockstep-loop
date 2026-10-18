@@ -1,5 +1,5 @@
 use lockstep_loop::{
-    Agent, BatchLoop, Budget, Completion, LlmCompletion, LoopConfig, LoopError, Request,
+    AgentSnapshot, BatchLoop, Budget, Completion, LlmCompletion, LoopConfig, LoopError, Request,
     RequestKind, SubagentTool, ToolCall, ToolCompletion, ToolSpec, run_to_completion,
     run_to_completion_by,
 };
@@ -8,10 +8,14 @@ use serde_json::json;
 fn read() -> ToolSpec {
     ToolSpec::new("read", "", json!({}))
 }
-fn config(agent: Option<Agent<String>>, budget: Option<usize>, env: &str) -> LoopConfig<String> {
+fn config(
+    agent: Option<AgentSnapshot<String>>,
+    budget: Option<usize>,
+    env: &str,
+) -> LoopConfig<String> {
     let mut c = LoopConfig::new("p".into(), vec![env.into()], vec![read()]);
     if let Some(agent) = agent {
-        c = c.with_agent(agent);
+        c = c.with_snapshot(agent);
     }
     if let Some(limit) = budget {
         c = c.with_budget(Budget::new(limit, |steps| format!("exhausted:{steps}")));
@@ -68,17 +72,17 @@ fn observations(loop_: &mut BatchLoop<String>) {
 #[test]
 fn constructor_and_sync_driver_publish_immutable_agents() {
     let mut loop_ = BatchLoop::new(config(None, None, "e")).unwrap();
-    let empty = loop_.agent();
+    let empty = loop_.snapshot();
     answer(&mut loop_, "answer", vec![]);
     let result = loop_.result().unwrap();
     assert_eq!(
-        result.agent().root().assistant.as_ref().unwrap().content,
+        result.snapshot().root().assistant.as_ref().unwrap().content,
         "answer"
     );
     assert!(empty.root().assistant.is_none());
-    let mut lower = BatchLoop::new(config(Some(result.into_agent()), Some(0), "new")).unwrap();
+    let mut lower = BatchLoop::new(config(Some(result.into_snapshot()), Some(0), "new")).unwrap();
     assert!(lower.is_done());
-    assert_eq!(lower.agent().root().env_ids, ["e"]);
+    assert_eq!(lower.snapshot().root().env_ids, ["e"]);
     assert_eq!(lower.result().unwrap().results["new"], "exhausted:0");
     assert_eq!(
         lower.append_user_message("feedback".into()),
@@ -93,7 +97,7 @@ fn constructor_and_sync_driver_publish_immutable_agents() {
     )
     .unwrap();
     assert_eq!(
-        result.agent().root().assistant.as_ref().unwrap().content,
+        result.snapshot().root().assistant.as_ref().unwrap().content,
         "answer"
     );
 }
@@ -109,12 +113,12 @@ fn zero_budget_is_an_open_agent_and_generic_fallback_needs_only_clone() {
     );
     let result = loop_.result().unwrap();
     assert_eq!(result.results["e"], "exhausted:0");
-    assert!(result.agent().root().assistant.is_none());
-    assert!(result.agent().root().env_ids.is_empty());
-    let mut resumed = BatchLoop::new(config(Some(result.agent().clone()), None, "new")).unwrap();
+    assert!(result.snapshot().root().assistant.is_none());
+    assert!(result.snapshot().root().env_ids.is_empty());
+    let mut resumed = BatchLoop::new(config(Some(result.snapshot().clone()), None, "new")).unwrap();
     answer(&mut resumed, "real answer", vec![]);
     assert_eq!(resumed.result().unwrap().results["new"], "real answer");
-    assert!(result.agent().root().assistant.is_none());
+    assert!(result.snapshot().root().assistant.is_none());
 
     // No PartialEq, Eq, Hash, Debug, Serialize, Send or Sync bound on payloads.
     #[derive(Clone)]
@@ -129,14 +133,14 @@ fn zero_budget_is_an_open_agent_and_generic_fallback_needs_only_clone() {
     )
     .unwrap();
     assert_eq!(*result.results["e"].0, 0);
-    assert!(result.agent().root().assistant.is_none());
-    assert_eq!(*result.agent().descriptor.prompt.0, 10);
+    assert!(result.snapshot().root().assistant.is_none());
+    assert_eq!(*result.snapshot().descriptor.prompt.0, 10);
 }
 
 #[test]
 fn budget_checkpoint_resumes_and_replay_obeys_lower_limit() {
     let mut loop_ = BatchLoop::new(config(None, Some(1), "e")).unwrap();
-    let empty = loop_.agent();
+    let empty = loop_.snapshot();
     answer(
         &mut loop_,
         "inspect",
@@ -145,11 +149,11 @@ fn budget_checkpoint_resumes_and_replay_obeys_lower_limit() {
             ToolCall::new("two", "read", json!({})),
         ],
     );
-    let pending = loop_.agent();
+    let pending = loop_.snapshot();
     observations(&mut loop_);
     let result = loop_.result().unwrap();
     assert_eq!(result.results["e"], "exhausted:1");
-    let old = result.into_agent();
+    let old = result.into_snapshot();
     let edge = old.root().observations[0].clone();
     assert!(old.load(&edge.continuation).assistant.is_none());
     assert_eq!(
@@ -182,7 +186,7 @@ fn budget_checkpoint_resumes_and_replay_obeys_lower_limit() {
             "real answer".into(),
         )))
         .unwrap();
-    let full = resumed.result().unwrap().into_agent();
+    let full = resumed.result().unwrap().into_snapshot();
     assert!(old.load(&edge.continuation).assistant.is_none());
 
     let mut lower = BatchLoop::new(config(Some(full.clone()), Some(1), "lower")).unwrap();
@@ -190,7 +194,7 @@ fn budget_checkpoint_resumes_and_replay_obeys_lower_limit() {
     assert!(lower.is_done());
     assert!(lower.next_request(RequestKind::Any).is_none());
     assert_eq!(lower.result().unwrap().results["lower"], "exhausted:1");
-    let snapshot = lower.agent();
+    let snapshot = lower.snapshot();
     let endpoint = snapshot.load(&snapshot.root().observations[0].continuation);
     assert_eq!(endpoint.assistant.as_ref().unwrap().content, "real answer");
     assert_eq!(endpoint.env_ids, ["new"]); // not accepted by the lower-budget run
@@ -228,23 +232,24 @@ fn budget_checkpoint_resumes_and_replay_obeys_lower_limit() {
             }
         );
     }
-    assert_eq!(feedback.agent(), full);
+    assert_eq!(feedback.snapshot(), full);
 }
 
 #[test]
 fn budget_after_feedback_preserves_open_continuation_and_counts_replayed_answers() {
     let mut original = BatchLoop::new(config(None, None, "e")).unwrap();
     answer(&mut original, "old answer", vec![]);
-    let mut bounded =
-        BatchLoop::new(config(Some(original.agent()), Some(1), "e").with_feedback("revise".into()))
-            .unwrap();
+    let mut bounded = BatchLoop::new(
+        config(Some(original.snapshot()), Some(1), "e").with_feedback("revise".into()),
+    )
+    .unwrap();
     assert!(bounded.is_done());
     assert_eq!(bounded.result().unwrap().results["e"], "exhausted:1");
-    let opened = bounded.agent();
+    let opened = bounded.snapshot();
     let continuation = opened.root().user_continuations[0].clone();
     assert_eq!(continuation.message.content, "revise");
     assert!(opened.load(&continuation.continuation).assistant.is_none());
-    assert!(original.agent().root().user_continuations.is_empty());
+    assert!(original.snapshot().root().user_continuations.is_empty());
     let mut resumed = BatchLoop::new(config(Some(opened.clone()), None, "e")).unwrap();
     let Request::Llm(r) = resumed.next_request(RequestKind::Any).unwrap() else {
         panic!()
@@ -263,11 +268,11 @@ fn budget_after_feedback_preserves_open_continuation_and_counts_replayed_answers
             "new answer".into(),
         )))
         .unwrap();
-    let full = resumed.agent();
+    let full = resumed.snapshot();
     let mut lower = BatchLoop::new(config(Some(full.clone()), Some(1), "lower")).unwrap();
     assert!(lower.is_done());
     assert_eq!(lower.result().unwrap().results["lower"], "exhausted:1");
-    let snapshot = lower.agent();
+    let snapshot = lower.snapshot();
     let endpoint = snapshot.load(&snapshot.root().user_continuations[0].continuation);
     assert_eq!(endpoint.assistant.as_ref().unwrap().content, "new answer");
     assert_eq!(endpoint.env_ids, ["e"]);
@@ -298,7 +303,7 @@ fn child_budget_keeps_child_open_and_parent_records_actual_tool_result() {
     );
     observe(&mut loop_);
     let result = loop_.result().unwrap();
-    let child = result.child_agents()[0].agent();
+    let child = result.child_updates()[0].snapshot();
     assert!(
         child
             .load(&child.root().observations[0].continuation)
@@ -306,16 +311,18 @@ fn child_budget_keeps_child_open_and_parent_records_actual_tool_result() {
             .is_none()
     );
     assert_eq!(
-        result.agent().root().observations[0].representative[0].tool_output,
+        result.snapshot().root().observations[0].representative[0].tool_output,
         result.results["e"]
     );
     assert_eq!(
-        &result.agent().child(&result.agent().root().subagents[0]),
+        &result
+            .snapshot()
+            .child(&result.snapshot().root().subagents[0]),
         child
     );
 
     let mut resumed =
-        BatchLoop::new(config(Some(result.agent().clone()), Some(2), "new").with_subagent(sub))
+        BatchLoop::new(config(Some(result.snapshot().clone()), Some(2), "new").with_subagent(sub))
             .unwrap();
     observe(&mut resumed);
     answer(&mut resumed, "child answer", vec![]);
@@ -330,8 +337,8 @@ fn child_budget_keeps_child_open_and_parent_records_actual_tool_result() {
         )))
         .unwrap();
     assert_eq!(resumed.result().unwrap().results["new"], "parent answer");
-    assert_eq!(resumed.agent().root().observations.len(), 2);
-    assert_eq!(result.agent().root().observations.len(), 1);
+    assert_eq!(resumed.snapshot().root().observations.len(), 2);
+    assert_eq!(result.snapshot().root().observations.len(), 1);
     assert!(
         child
             .load(&child.root().observations[0].continuation)

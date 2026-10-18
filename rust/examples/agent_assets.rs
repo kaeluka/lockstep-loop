@@ -1,8 +1,9 @@
 //! cargo run -p lockstep-loop --example agent_assets
-//! An Agent is prompt + structural configuration + accumulated trie. Assets are contextual leaf views.
+//! An AgentSnapshot is prompt + structural configuration + accumulated trie. Assets are contextual leaf views.
 use lockstep_loop::{
-    Agent, BatchLoop, BatchResult, Completion, LlmCompletion, LoopConfig, NodeRef, RecordStore,
-    Request, RequestKind, Role, ToolCall, ToolCompletion, ToolSpec,
+    Agent, AgentConfig, AgentRun, AgentRuntime, AgentSnapshot, BatchResult, Completion,
+    LlmCompletion, NodeRef, RecordStore, Request, RequestKind, Role, RunOptions, ToolCall,
+    ToolCompletion, ToolSpec,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -10,17 +11,16 @@ use std::sync::Arc;
 
 const PROMPT: &str = "Inspect the repository";
 const NOTE: &str = "Also inspect /foo";
-fn config(envs: &[&str]) -> LoopConfig<String> {
-    LoopConfig::new(
+fn config() -> AgentConfig<String> {
+    AgentConfig::new(
         PROMPT.into(),
-        envs.iter().map(|s| (*s).into()).collect(),
         vec![
             ToolSpec::new("read", "Read entry", json!({})),
             ToolSpec::new("foo", "Inspect /foo", json!({})),
         ],
     )
 }
-fn serve(mut loop_: BatchLoop<String>) -> (BatchResult<String>, usize) {
+fn serve(mut loop_: AgentRun<String>) -> (BatchResult<String>, usize) {
     let mut llms = 0;
     while !loop_.is_done() {
         match loop_.next_request(RequestKind::Any).unwrap() {
@@ -74,7 +74,7 @@ fn serve(mut loop_: BatchLoop<String>) -> (BatchResult<String>, usize) {
 }
 
 type Backend = BTreeMap<NodeRef, Vec<u8>>;
-fn persist(agent: &Agent<String>, backend: &mut Backend) -> Vec<u8> {
+fn persist(agent: &AgentSnapshot<String>, backend: &mut Backend) -> Vec<u8> {
     // Caller persistence: shallow records first, descriptor publication last.
     for (reference, node) in agent.store.records() {
         let encoded = serde_json::to_vec(&node).unwrap();
@@ -86,8 +86,8 @@ fn persist(agent: &Agent<String>, backend: &mut Backend) -> Vec<u8> {
     }
     serde_json::to_vec(&agent.descriptor).unwrap()
 }
-fn restore(descriptor: &[u8], backend: Backend, fresh_writer: &str) -> Agent<String> {
-    Agent {
+fn restore(descriptor: &[u8], backend: Backend, fresh_writer: &str) -> AgentSnapshot<String> {
+    AgentSnapshot {
         descriptor: serde_json::from_slice(descriptor).unwrap(),
         store: RecordStore::with_loader(fresh_writer, move |reference| {
             Arc::new(serde_json::from_slice(&backend[reference]).unwrap())
@@ -95,37 +95,47 @@ fn restore(descriptor: &[u8], backend: Backend, fresh_writer: &str) -> Agent<Str
     }
 }
 fn main() {
+    let agent = Agent::new(config().with_record_store(RecordStore::new("initial-writer"))).unwrap();
     let recorded = serve(
-        BatchLoop::new(
-            config(&["A", "B", "D"]).with_record_store(RecordStore::new("initial-writer")),
-        )
-        .unwrap(),
+        agent
+            .start(
+                vec!["A".into(), "B".into(), "D".into()],
+                RunOptions::default(),
+            )
+            .unwrap(),
     )
     .0;
     let mut backend = Backend::new();
-    let original_descriptor = persist(recorded.agent(), &mut backend);
+    let original_descriptor = persist(recorded.snapshot(), &mut backend);
     let original = restore(&original_descriptor, backend.clone(), "replay-writer");
     let original_assets: Vec<_> = original.assets().collect();
     assert_eq!(original_assets.len(), 2);
     assert_eq!(original_assets[0].value(), original_assets[1].value());
     assert_ne!(original_assets[0].messages(), original_assets[1].messages());
-    let (replayed, llms) =
-        serve(BatchLoop::new(config(&["C"]).with_agent(original.clone())).unwrap());
+    let agent = Agent::from_snapshot(original.clone(), AgentRuntime::default()).unwrap();
+    let (replayed, llms) = serve(
+        agent
+            .start(vec!["C".into()], RunOptions::default())
+            .unwrap(),
+    );
     assert_eq!(llms, 0);
-    let before = replayed.into_agent();
+    let before = replayed.into_snapshot();
     let old_asset = before.assets().next().unwrap();
     assert_eq!(old_asset.env_ids(), ["A", "B", "C"]);
-    println!("Agent prompt: {}", before.prompt());
+    println!("AgentSnapshot prompt: {}", before.prompt());
     println!("Asset known environments: {:?}", old_asset.env_ids());
     println!("Asset conversation: {:?}", old_asset.messages());
 
     // No Asset ID or endpoint is supplied: replay the agent + environment again.
-    let mut loop_ = BatchLoop::new(
-        config(&["C"])
-            .with_agent(before.clone())
-            .with_feedback(NOTE.into()),
-    )
-    .unwrap();
+    let mut loop_ = agent
+        .start(
+            vec!["C".into()],
+            RunOptions {
+                feedback: Some(NOTE.into()),
+                budget: None,
+            },
+        )
+        .unwrap();
     let read = loop_.next_request(RequestKind::Any).unwrap();
     assert!(matches!(read, Request::Tool(_)));
     loop_
@@ -134,7 +144,7 @@ fn main() {
             results: vec![("C".into(), "shared".into())],
         }))
         .unwrap();
-    let opened = loop_.agent();
+    let opened = loop_.snapshot();
     let pending = opened.assets().next().unwrap();
     assert!(!pending.is_complete() && pending.value().unwrap() == "no issues");
     let Request::Llm(request) = loop_.next_request(RequestKind::Any).unwrap() else {
@@ -162,7 +172,7 @@ fn main() {
             "no issues".into(),
         )))
         .unwrap();
-    let revised = loop_.result().unwrap().into_agent();
+    let revised = loop_.result().unwrap().into_snapshot();
     let revised_asset = revised.assets().next().unwrap();
     assert!(revised_asset.is_complete());
     assert_eq!(revised_asset.value(), old_asset.value());
@@ -174,15 +184,27 @@ fn main() {
 
     let descriptor = persist(&revised, &mut backend);
     let loaded = restore(&descriptor, backend.clone(), "inherited-writer");
-    let (inherited, _) =
-        serve(BatchLoop::new(config(&["A", "B", "C", "D"]).with_agent(loaded)).unwrap());
-    let agent = inherited.agent();
+    let loaded = Agent::from_snapshot(loaded, AgentRuntime::default()).unwrap();
+    let (inherited, _) = serve(
+        loaded
+            .start(
+                vec!["A".into(), "B".into(), "C".into(), "D".into()],
+                RunOptions::default(),
+            )
+            .unwrap(),
+    );
+    let agent = inherited.snapshot();
     let assets: Vec<_> = agent.assets().collect();
     assert_eq!(assets.len(), 3);
     assert_eq!(inherited.results["B"], "found");
     persist(agent, &mut backend);
     let old_again = restore(&original_descriptor, backend, "old-reader");
-    let (result, llms) = serve(BatchLoop::new(config(&["B"]).with_agent(old_again)).unwrap());
+    let old_again = Agent::from_snapshot(old_again, AgentRuntime::default()).unwrap();
+    let (result, llms) = serve(
+        old_again
+            .start(vec!["B".into()], RunOptions::default())
+            .unwrap(),
+    );
     assert_eq!(llms, 0);
     assert_eq!(result.results["B"], "no issues");
     println!(

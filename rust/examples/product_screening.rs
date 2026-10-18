@@ -3,8 +3,8 @@
 //! Scripted replies demonstrate orchestration, not product-certification advice.
 
 use lockstep_loop::{
-    Agent, BatchLoop, BatchResult, Completion, LlmCompletion, LlmRequest, LoopConfig, LoopError,
-    Request, RequestKind, Role, ToolCall, ToolCompletion, ToolSpec,
+    Agent, AgentConfig, BatchResult, Completion, LlmCompletion, LlmRequest, LoopError, Request,
+    RequestKind, Role, RunOptions, ToolCall, ToolCompletion, ToolSpec,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -45,26 +45,10 @@ fn scripted_model(request: &LlmRequest<String>) -> LlmCompletion<String> {
 }
 
 fn screen(
+    agent: &Agent<String>,
     evidence: BTreeMap<String, String>,
-    agent: Option<Agent<String>>,
 ) -> Result<(BatchResult<String>, usize, usize), LoopError> {
-    let mut config = LoopConfig::new(
-        PROMPT.into(),
-        evidence.keys().cloned().collect(),
-        vec![ToolSpec::new(
-            "read_ratings",
-            "Read the sensor's enclosure rating and minimum/maximum temperatures in Celsius.",
-            json!({"type": "object", "properties": {}, "additionalProperties": false}),
-        )],
-    );
-    config = if let Some(previous) = agent {
-        config.with_agent(previous)
-    } else {
-        config
-    };
-    // Default record namespaces suffice for this single-process, in-memory demo.
-    // Durable callers reserve namespaces and persist records as in history_replay.rs.
-    let mut loop_ = BatchLoop::new(config)?;
+    let mut loop_ = agent.start(evidence.keys().cloned().collect(), RunOptions::default())?;
     let (mut llm_calls, mut tool_executions) = (0, 0);
     while !loop_.is_done() {
         match loop_.next_request(RequestKind::Any).unwrap() {
@@ -95,40 +79,47 @@ fn screen(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Default namespaces suffice in memory; durable writers reserve unique namespaces.
+    let agent = Agent::new(AgentConfig::new(
+        PROMPT.into(),
+        vec![ToolSpec::new(
+            "read_ratings",
+            "Read the sensor's enclosure rating and minimum/maximum temperatures in Celsius.",
+            json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        )],
+    ))?;
     let outdoor = ratings("IP65", -20, 50);
     let (initial, llms, reads) = screen(
+        &agent,
         BTreeMap::from([
             ("product-a/v1".into(), outdoor.clone()),
             ("product-b/v1".into(), outdoor.clone()),
             ("product-c/v1".into(), ratings("IP20", 0, 40)),
         ]),
-        None,
     )?;
     assert_eq!((llms, reads, initial.classes.len()), (3, 3, 2));
-    let old = initial.agent().clone();
+    let old = initial.snapshot().clone();
     println!(
         "Initial: {llms} LLM calls, {reads} tool executions, {} classes",
         initial.classes.len()
     );
 
-    let (matching, llms, reads) = screen(
-        BTreeMap::from([("product-d/v1".into(), outdoor)]),
-        Some(old.clone()),
-    )?;
+    let (matching, llms, reads) =
+        screen(&agent, BTreeMap::from([("product-d/v1".into(), outdoor)]))?;
     assert_eq!((llms, reads), (0, 1));
     assert_eq!(matching.results["product-d/v1"], "meets toy requirements");
     println!("Matching new product: {llms} LLM calls, {reads} tool execution");
 
     let (changed, llms, reads) = screen(
+        &agent,
         BTreeMap::from([("product-a/v2".into(), ratings("IP65", 0, 50))]),
-        Some(matching.into_agent()),
     )?;
     assert_eq!((llms, reads), (1, 1));
     assert_eq!(
         changed.results["product-a/v2"],
         "does not meet toy requirements"
     );
-    let extended = changed.agent();
+    let extended = changed.snapshot();
     assert_eq!(old.assets().count(), 2);
     assert_eq!(extended.assets().count(), 3);
     println!("Revised specifications: {llms} LLM call, {reads} tool execution");

@@ -1,4 +1,4 @@
-"""Immutable Agent snapshots, contextual Asset views, and shallow history records.
+"""Immutable AgentSnapshot snapshots, contextual Asset views, and shallow snapshot records.
 
 Payloads, schemas and arguments are borrowed immutable values. NodeRef is a
 storage address, never a public conversation/session identity. No core I/O.
@@ -57,44 +57,31 @@ class UserContinuation(Generic[P]):
 
 @dataclass(frozen=True)
 class SubagentContract:
-    """Structural subagent configuration; legacy class name, no caller version key."""
+    """Structural subagent configuration, without caller version keys."""
 
     spec: ToolSpec
     max_depth: int
     # None preserves bounded self-recursion; a tuple is an explicit child allowlist.
     subagents: tuple[SubagentContract, ...] | None = None
 
-    def __setstate__(self, state: dict[str, object]) -> None:
-        # Old pickle labels are metadata, never structural identity.
-        for name, value in state.items():
-            if name != "history_contract":
-                object.__setattr__(self, name, value)
-
 
 @dataclass(frozen=True)
-class HistoryQuery(Generic[P]):
+class AgentQuery(Generic[P]):
     """Child structural configuration, independent of parent/invocation identity.
 
-    External provider/grouping policy isolation is caller-owned. The legacy class
-    path is retained for codecs; old contract labels and grouping mode are ignored.
+    External provider/grouping policy isolation is caller-owned.
     """
 
     prompt: P
     tools: tuple[ToolSpec, ...]
     subagents: tuple[SubagentContract, ...] = ()
 
-    def __setstate__(self, state: dict[str, object]) -> None:
-        for name, value in state.items():
-            if name not in ("contract", "custom_grouping"):
-                object.__setattr__(self, name, value)
-
 
 @dataclass(frozen=True)
-class HistoryDescriptor(Generic[P]):
-    """AgentDescriptor persistence envelope; legacy pickle class name is retained.
+class AgentDescriptor(Generic[P]):
+    """Persistence envelope. Save this AND the referenced shallow records.
 
-    Serialize this AND each new shallow record; a descriptor needs a RecordStore
-    to inspect its full agent. AgentDescriptor is an alias, not another model.
+    Attach a RecordStore to reconstruct an AgentSnapshot without eager loading.
     """
 
     prompt: P
@@ -102,51 +89,41 @@ class HistoryDescriptor(Generic[P]):
     root: NodeRef
     subagents: tuple[SubagentContract, ...] = ()
 
-    def __setstate__(self, state: dict[str, object]) -> None:
-        for name, value in state.items():
-            if name not in ("contract", "custom_grouping"):
-                object.__setattr__(self, name, value)
-
     def query(self) -> AgentQuery[P]:
         return AgentQuery(self.prompt, self.tools, self.subagents)
 
-    @property
-    def subagent(self) -> SubagentContract | None:
-        """Legacy singular inspection; use subagents for the complete configuration."""
-        return self.subagents[0] if len(self.subagents) == 1 else None
 
-
-HistoryResolver: TypeAlias = Callable[[HistoryQuery[P]], HistoryDescriptor[P] | None]
+AgentResolver: TypeAlias = Callable[[AgentQuery[P]], AgentDescriptor[P] | None]
 
 
 @dataclass(frozen=True)
-class ChildHistoryRun(Generic[P]):
-    """ChildAgentRun: one invocation's environments, base and resulting agent revision."""
+class ChildAgentRun(Generic[P]):
+    """ChildAgentRun: one invocation's environments, base and resulting snapshot revision."""
 
     env_ids: tuple[str, ...]
-    base: HistoryDescriptor[P] | None
-    history: HistoryDescriptor[P]
+    base: AgentDescriptor[P] | None
+    snapshot: AgentDescriptor[P]
 
     @property
     def agent_descriptor(self) -> AgentDescriptor[P]:
-        return self.history
+        return self.snapshot
 
 
 @dataclass(frozen=True)
-class SubagentHistory(Generic[P]):
-    """SubagentRecord: parent-call provenance; use Agent.child to inspect its agent."""
+class SubagentRecord(Generic[P]):
+    """SubagentRecord: parent-call provenance; use AgentSnapshot.child to inspect its snapshot."""
 
     call_id: str
-    history: HistoryDescriptor[P]
-    runs: tuple[ChildHistoryRun[P], ...] = ()
+    snapshot: AgentDescriptor[P]
+    runs: tuple[ChildAgentRun[P], ...] = ()
 
     @property
     def agent_descriptor(self) -> AgentDescriptor[P]:
-        return self.history
+        return self.snapshot
 
 
 @dataclass(frozen=True)
-class ChildHistoryUpdate(Generic[P]):
+class ChildAgentUpdate(Generic[P]):
     """Completed invocation, not a merged cache entry or public conversation identity."""
 
     request_prefix: str
@@ -154,22 +131,18 @@ class ChildHistoryUpdate(Generic[P]):
     depth: int
     tool_call: ToolCall
     env_ids: tuple[str, ...]
-    base: HistoryDescriptor[P] | None
-    history: Agent[P]
-
-    @property
-    def agent(self) -> Agent[P]:
-        return self.history
+    base: AgentDescriptor[P] | None
+    snapshot: AgentSnapshot[P]
 
 
 @dataclass(frozen=True)
 class HistoryNode(Generic[P]):
-    """A shared prefix or historical endpoint; an Asset also needs its agent/path context."""
+    """A shared prefix or historical endpoint; an Asset also needs its snapshot/path context."""
 
     assistant: Message[P] | None = None
     env_ids: tuple[str, ...] = ()
     observations: tuple[Observation[P], ...] = ()
-    subagents: tuple[SubagentHistory[P], ...] = ()
+    subagents: tuple[SubagentRecord[P], ...] = ()
     user_continuations: tuple[UserContinuation[P], ...] = ()
 
 
@@ -224,12 +197,12 @@ class RecordStore(Generic[P]):
 
 
 @dataclass(frozen=True)
-class Agent(Generic[P]):
-    """Complete immutable agent: initial prompt, structural configuration and accumulated trie.
+class AgentSnapshot(Generic[P]):
+    """Immutable prompt, structural configuration and accumulated conversation trie.
 
-    The descriptor selects a snapshot; the store resolves its immutable records.
-    This is neither a tool definition nor a running BatchLoop. History is the
-    compatibility alias. Persist the descriptor and records, not live views.
+    The descriptor selects a root; the store resolves immutable records lazily.
+    Persist the descriptor and records, not mutable Agent/AgentRun handles or views.
+    Payloads, arguments and schemas are immutable by caller contract.
     """
 
     descriptor: AgentDescriptor[P]
@@ -246,12 +219,12 @@ class Agent(Generic[P]):
     def load(self, ref: NodeRef) -> HistoryNode[P]:
         return self.store.load(ref)
 
-    def child(self, entry: SubagentRecord[P]) -> Agent[P]:
-        """Attach this store to the recorded child agent, without resolving an environment."""
-        return Agent(entry.agent_descriptor, self.store)
+    def child(self, entry: SubagentRecord[P]) -> AgentSnapshot[P]:
+        """Attach this store to the recorded child snapshot, without resolving an environment."""
+        return AgentSnapshot(entry.agent_descriptor, self.store)
 
     def assets(self) -> Iterator[Asset[P]]:
-        """Lazily inspect this agent's structural leaves, not a per-run partition.
+        """Lazily inspect this snapshot's structural leaves, not a per-run partition.
 
         Child agents are separate tries: inspect them with child(entry).assets().
         This does not execute tools, select feedback targets, or create records.
@@ -284,7 +257,7 @@ class Agent(Generic[P]):
             node = self.load(edge.continuation)
         return node
 
-    def _replace_node(self, path: _HistoryPath, node: HistoryNode[P]) -> Agent[P]:
+    def _replace_node(self, path: _HistoryPath, node: HistoryNode[P]) -> AgentSnapshot[P]:
         """Storage-level path copying. Paths are not conversation identities."""
         ancestors = []
         parent = self.root
@@ -330,28 +303,30 @@ class _AssetStep(Generic[P]):
 
 @dataclass(frozen=True, eq=False, init=False)
 class Asset(Generic[P]):
-    """Read-only leaf investigation in one Agent snapshot, backed by its path.
+    """Read-only leaf investigation in one AgentSnapshot snapshot, backed by its path.
 
     Values do not identify assets. An open continuation may retain an earlier
     published message, or have no value yet. No ID, persistence or resume API is
-    provided: feedback still requires agent snapshot + environment replay.
+    provided: feedback still requires snapshot snapshot + environment replay.
     """
 
-    agent: Agent[P] = field(repr=False)
+    snapshot: AgentSnapshot[P] = field(repr=False)
     _path: tuple[_AssetStep[P], ...] = field(repr=False)
 
     def __init__(self) -> None:
-        raise TypeError("Asset views come from Agent.assets(); persist the agent, not a leaf")
+        raise TypeError(
+            "Asset views come from AgentSnapshot.assets(); persist the snapshot, not a leaf"
+        )
 
     @classmethod
-    def _view(cls, agent: Agent[P], path: tuple[_AssetStep[P], ...]) -> Asset[P]:
+    def _view(cls, snapshot: AgentSnapshot[P], path: tuple[_AssetStep[P], ...]) -> Asset[P]:
         view = object.__new__(cls)
-        object.__setattr__(view, "agent", agent)
+        object.__setattr__(view, "snapshot", snapshot)
         object.__setattr__(view, "_path", path)
         return view
 
     def __reduce__(self) -> NoReturn:
-        raise TypeError("persist the agent descriptor and records; assets are contextual views")
+        raise TypeError("persist the snapshot descriptor and records; assets are contextual views")
 
     @property
     def node(self) -> HistoryNode[P]:
@@ -359,7 +334,7 @@ class Asset(Generic[P]):
 
     @property
     def nodes(self) -> tuple[HistoryNode[P], ...]:
-        """Shared prefix through leaf, including child-agent provenance records."""
+        """Shared prefix through leaf, including child-snapshot provenance records."""
         return tuple(step.node for step in self._path)
 
     @property
@@ -372,7 +347,7 @@ class Asset(Generic[P]):
         """The model-visible conversation, using historical representatives."""
         from .core import Message
 
-        messages = [Message(role="user", content=self.agent.descriptor.prompt)]
+        messages = [Message(role="user", content=self.snapshot.descriptor.prompt)]
         for index, step in enumerate(self._path):
             if isinstance(step.via, Observation):
                 assistant = self._path[index - 1].node.assistant
@@ -429,14 +404,3 @@ class Asset(Generic[P]):
                 evidence = tuple(e.env_id for e in step.via.evidence)
                 break
         return tuple(dict.fromkeys((*evidence, *(e for group in reversed(visits) for e in group))))
-
-
-# One implementation/model. Legacy class names remain valid pickle/codec tags.
-# Deprecated contract labels and grouping mode are discarded on pickle load.
-History = Agent
-AgentDescriptor = HistoryDescriptor
-AgentQuery = HistoryQuery
-AgentResolver: TypeAlias = HistoryResolver[P]
-SubagentRecord = SubagentHistory
-ChildAgentRun = ChildHistoryRun
-ChildAgentUpdate = ChildHistoryUpdate

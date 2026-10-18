@@ -1,4 +1,4 @@
-# Agent and Asset: vocabulary and API migration
+# Agents, snapshots, runs and Assets
 
 [Visual guide](concepts.md) · [Documentation](README.md) ·
 [History/persistence reference](history-reference.md)
@@ -7,165 +7,90 @@
 
 | Term | Meaning |
 | --- | --- |
-| **Agent** | The complete recorded trie **including its initial prompt, structural configuration, and accumulated investigations**. Not just a recipe, tool definition, provider client, or executor. |
-| **Agent snapshot / revision** | One immutable root of that whole agent. Extending it creates another snapshot; previous roots remain valid. `Agent` already represents this, so there is no redundant `Snapshot` wrapper. |
-| **Asset** | A leaf investigation in a particular agent snapshot, backed by its entire root-to-leaf conversation. It can represent multiple environments. Neither a value nor a bare leaf reference nor an `EnvClass` is the whole asset. |
-| **Asset value** | The latest published payload on the path. **Currently this is the content of the latest no-tool assistant response**, not a designated result-tool argument. An open asset may retain that older value or have no value yet. |
-| **Conversation / history** | The prompt, assistant messages, ordered tool observations, and user feedback along a path. |
-| **History node** | A shared prefix, current endpoint, or historical endpoint. It need not be a leaf. |
-| **Environment class** | A set of environments grouped by observation history. `EnvClass` and `SplitNode` are partition-only summaries, not assets or agents. |
-| **Loop / execution** | `BatchLoop`, which issues requests and accepts completions. It is not the immutable agent. |
-| **Subagent tool** | `SubagentTool`, a definition that deterministically constructs another agent's initial user prompt and tool configuration. It is not itself the complete recorded child agent. |
+| **Agent** | Mutable handle owning the current immutable history root and caller-owned runtime dependencies. The primary entry point. |
+| **AgentSnapshot** | Immutable initial prompt, structural configuration and accumulated conversation trie, paired with its record resolver. The persistence/inspection value. |
+| **AgentRun** | Mutable execution wrapper with its own immutable root and transient request/completion state. Obtained from Agent.start. |
+| **Asset** | Contextual immutable leaf investigation backed by its full root-to-leaf conversation in one snapshot. Not just a value, node address or environment class. |
+| **Asset value** | Latest no-tool assistant payload on that path. An open continuation may retain an older value or have none. Not designated result-tool publication. |
+| **Conversation** | Prompt, assistant messages, ordered tool observations and feedback along a path. |
+| **History node** | Shared prefix, current endpoint or historical endpoint; not necessarily a leaf. |
+| **Environment class** | Environments grouped by observations during one execution. EnvClass/SplitNode are partition summaries, not Assets. |
+| **Subagent tool** | Deterministic prompt/spec factories plus an advertised tool definition, not a persisted child Agent handle. |
 
-The package name, replay, grouping, scheduling, request IDs, feedback scope and
-storage protocol are unchanged. Manual contract/version plumbing has been removed;
-this is not an asset publication or dependency-DAG system.
+An Agent retains experience through sequential runs. Each start captures the current
+root; successful completion automatically replaces it once. A run's snapshot stays
+independent after another run publishes. Restore/fork via `Agent.from_snapshot`;
+loaders and runtime callbacks are caller-owned and never serialized.
 
-These terms are domain-neutral. A study-screening agent may have assets concluding
-“eligible” or “insufficient evidence”; a dataset-intake agent may have assets with
-different quality findings. Two supplier reviews can publish the same value while
-retaining different supporting conversations. See [use cases](use-cases.md) for
-concrete prompts, environment boundaries, and tools.
+> **Warning:** Overlapping runs do not merge history. The last completion wins,
+> potentially excluding other runs' experience from the Agent's head. Save each
+> run's snapshot or finish each run before starting the next to accumulate history.
+
+Failures/abandoned runs do not publish. Budgets publish real checkpoints, not
+fallback assistant messages. See the [lifecycle contract](history-reference.md#agent-and-run-lifecycle).
 
 ## Inspecting assets
 
-Python's `agent.assets()` lazily yields frozen `Asset` views; Rust returns an
-iterator of `Asset<'_, P>` views borrowing the agent snapshot. Both expose:
+Python `snapshot.assets()` yields frozen Asset views; Rust returns an iterator
+of `Asset<'_, P>` borrowing that snapshot. Each exposes:
 
-- the owning `agent` and the leaf `node`;
-- `nodes`: shared prefix through endpoint, including child-agent provenance;
-- `messages`: the full model-visible conversation, including tool calls/arguments
-  and feedback, reconstructed using historical **representative** outputs;
-- `observations`: selected checkpoints with **all exact per-environment evidence**;
-- `env_ids`: known path memberships (see below);
-- `is_complete`, `has_value`, `published_message`, and `value`.
+- `snapshot` and leaf `node`;
+- `nodes`: shared prefix through leaf, including child provenance;
+- `messages`: full model-visible conversation using historical representatives;
+- `observations`: checkpoints with representatives **and exact per-env evidence**;
+- `env_ids`: known path memberships;
+- `is_complete`, `has_value`, `published_message`, `value`.
 
 These are Python properties and Rust getter methods. Python `value` raises
-`LookupError` if no answer has ever been published; a real `None` remains a value
-when `has_value` is true. Rust `value()` returns `Option<&P>`: `Some(&None)` is a
-real null optional payload, distinct from no publication. `published_message`
-exposes the whole prior assistant response, not a hash or grouping key.
+LookupError when absent; a real None remains a value. Rust returns Option<&P>,
+so Some(&None) differs from no publication.
 
-`is_complete` describes the **current leaf**. After feedback opens a continuation,
-it is false even if `value` still exposes the earlier answer. In the new snapshot,
-that earlier endpoint is an ancestor, not an additional asset. An asset captured
-from the old snapshot remains a completed leaf there. Extra observations can
-subdivide the open continuation into several assets, possibly publishing equal
-values. Value equality never identifies an asset.
+`is_complete` describes the current leaf. After feedback opens a continuation,
+that leaf is incomplete even if an ancestor supplies an older value. The former
+endpoint is now an ancestor, not an additional Asset. A view captured from the old
+snapshot remains a completed leaf there. Later Agent publications cannot retarget
+it. Equal values never identify or merge investigations.
 
-Known environment labels come from the latest selected observation and subsequent
-recorded node visits; without observations, they come from visits on the path.
-They are deduplicated for this view, while exact/repeated evidence remains in the
-records. They are **not** a global latest partition or proof that every old
-member has already executed new post-feedback tools. A new observation bounds the
-known membership again. The feedback source environment is provenance, not a gate.
-New environments still resolve their path by replaying tools.
+Known environment IDs come from the latest selected observation and subsequent
+node visits (or all visits if there was no observation). They are deduplicated for
+the view; exact repeated evidence remains in records. They are not a global latest
+partition or proof that every old member executed new post-feedback tools.
+Feedback provenance is not an environment gate.
 
-Views describe **recorded structural leaves**, not all in-flight executions.
-A pending replay at an already branching node is not an additional stored leaf;
-partially collected tool tuples/request queues remain runtime builders. An open
-initial node can consequently have no recorded environment visits yet. Use the
-loop's requests/counters for that runtime frontier, not an invented asset index.
+Views describe recorded structural leaves, not runtime frontiers. Partially
+collected tool tuples and request queues are builders. An open initial node may
+have no recorded visits yet. Use requests/counters to inspect live serving state.
 
-Inspection is opt-in and read-only. It loads only visited main-trie nodes, uses
-iterative traversal, and captures path references once per yielded view. It does
-not run tools/LLMs, allocate history records, or add costs to ordinary serving.
-Enumerating every asset intentionally traverses the main trie. Child agents are
-separate tries: use `agent.child(entry).assets()` to inspect their assets rather
-than treating their leaves as parent assets. In Rust, keep the owning agent value
-alive while borrowing views; inspection does not clone payloads, while requesting
-owned `messages()` requires `P: Clone`.
+Traversal is lazy, iterative and read-only, retaining record/path references rather
+than copying payloads. Enumerating every Asset intentionally visits the main trie.
+Child tries are separate: inspect `snapshot.child(entry).assets()`. In Rust keep
+the snapshot binding alive while borrowing views; owned messages require P: Clone,
+while inspection/value access does not.
 
-**No new identities or shortcuts:** Asset views have no public asset ID, no
-standalone serialization, and no feedback/resume method. Their constructors are
-not a leaf-address lookup API. Persist the agent's descriptor/records and recreate
-views by traversal. A bare leaf cannot reconstruct its ancestors. Feedback still
-accepts **agent snapshot + environment** and reruns the recorded tools; never pass
-an asset/value/hash/endpoint instead. Views have no value-based identity contract.
+Assets have no public IDs, standalone persistence, resume method or endpoint lookup.
+Persist the snapshot descriptor and shallow records and reconstruct views by
+traversal. Feedback still locates its target through environment tool replay; a
+bare node or answer value cannot substitute for that resolution.
 
-## Preferred names and compatibility
+## Persistence values and API scope
 
-Aliases refer to the **same implementation**, not a second internal/export model.
-Legacy constructors, fields and methods remain usable where listed.
+`AgentDescriptor`, `AgentQuery`, `SubagentRecord`, `ChildAgentRun` and
+`ChildAgentUpdate` are the canonical record names; no deprecated public aliases
+or migration scaffolding are retained. `BatchResult.snapshot` and
+`ChildAgentUpdate.snapshot` hold immutable snapshots. Provenance record `snapshot`
+fields hold descriptors, with `agent_descriptor` accessors for inspection.
+`result.child_updates` exposes independent completed invocations.
 
-| Previous spelling | Preferred spelling | Compatibility detail |
-| --- | --- | --- |
-| `History` | `Agent` | Exact type alias to the one immutable snapshot type. |
-| `HistoryDescriptor` | `AgentDescriptor` | Persistence envelope (prompt/configuration/root reference), not an executor; exact type alias. |
-| `HistoryQuery` | `AgentQuery` | Lookup compatibility header; exact type alias. |
-| `HistoryResolver` | `AgentResolver` | Caller-owned agent revision selection; alias, not another loading interface. |
-| `SubagentHistory` | `SubagentRecord` | Parent-call provenance slot, not a complete agent by itself. |
-| `ChildHistoryRun` | `ChildAgentRun` | One invocation's selected base and resulting descriptor. |
-| `ChildHistoryUpdate` | `ChildAgentUpdate` | A completed invocation update carrying the complete child agent. |
-| Python `BatchLoop(history=...)` | `BatchLoop(agent=...)` | Old keyword retained; supplying both non-None spellings is rejected. |
-| Python loop `history_contract=` / `agent_contract=` | Removed; use `agent=snapshot` for replay | Every loop records an Agent; identity is structural. |
-| Python `history_resolver=` | `agent_resolver=` | Same callback and lookup policy; both non-None spellings are rejected. |
-| Rust `with_replay(...)` | `with_agent(...)` | Same replay-based initialization; both set the same configuration field. |
-| Rust `with_history_resolver(...)` | `with_agent_resolver(...)` | Same setter semantics. |
-| `loop.history` / `history()` | `loop.agent` / `agent()` | Same snapshot getter and existing language-specific transaction guarantees. |
-| `result.history` | Python `result.agent`; Rust `result.agent()` / `into_agent()` | Compatibility field retained, no duplicate stored snapshot. |
-| `result.child_histories` | Python `result.child_agents`; Rust `child_agents()` | Same completed invocation updates. |
-| `update.history` | Python `update.agent`; Rust `agent()` / `into_agent()` | Same complete child agent. |
-| `entry.history`, `run.history` | Python `.agent_descriptor`; Rust `agent_descriptor()` | These are descriptors; attach the store with `agent.child(entry)`. |
-| Child `history_contract`, `with_history_contract`, `with_agent_contract`, and contract getters | Removed | Every child records an Agent; identity is structural. |
-| Rust `with_agent(agent, label)` / `with_replay(agent, label)` | `with_agent(agent)` / `with_replay(agent)` | Supplying an Agent implies replay and recording. |
-| Descriptor/query `contract`, `Agent.contract` / `contract()` | Removed | Query identity is structural; no replacement namespace. |
-| Descriptor/query `custom_grouping` | Removed | No mode or function identity gate. Current `comparison_key` compares fresh outputs and historical representatives. |
+Save descriptors and individual shallow records, not live Agent/AgentRun handles,
+callbacks or Assets. Restore using an AgentSnapshot and a RecordStore loader, then
+reattach matching subagent factories/resolvers through from_snapshot. Prompt and
+ordered tool specs come from the descriptor. No general cross-version or
+cross-language wire compatibility is promised; choose caller-owned payload codecs.
 
-`Agent.prompt` / `prompt()` exposes the descriptor prompt. `SubagentContract` retains
-its class name for compatibility but contains only spec, depth and nested allowlist.
-Every loop exposes its current Agent and every result contains an Agent. Rust's `Assets` is
-only the lazy iterator type, not another persisted or runtime model.
-
-Rust's public `LoopConfig.history`/`history_resolver` fields remain compatibility
-fields; prefer the canonical builder methods. Like other Rust setters, old/new
-builder spellings write the same field, not parallel configurations. Python's
-legacy dataclass result/record constructor keywords remain the storage-shaped
-spellings; canonical properties are read aliases. `BatchLoop`, `SubagentTool`,
-`SplitNode`, `EnvClass`, requests/completions, budgets, `HistoryNode`, observations,
-`NodeRef`, `RecordStore`, and `FeedbackResolutionError`/`LoopError` retain their
-accurate operational or structural names. `RecordStore` is a node write set/loader,
-not a new logical-agent registry. The `history.py`/`history.rs` modules and existing
-example filenames remain valid structural names.
-
-## Persistence and contract removal
-
-Legacy record class aliases and provenance **`history`** fields remain. However,
-manual **`contract`** fields in descriptors/queries and **`history_contract`** in
-nested subagent configurations are removed from the API and new writes. The obsolete
-**`custom_grouping`** mode in descriptors/queries is also removed. Python
-pickle restoration discards these old fields; self-describing Rust Serde formats
-such as JSON ignore them as unknown fields. Different historical labels cannot
-poison otherwise matching structural cache entries. Do not retain those labels or
-mode flags in a caller cache's matching key when importing old data.
-
-The unchanged **2c6d901** pickle/JSON fixtures still load, inspect and replay,
-including child histories, feedback and full evidence. Re-encoding intentionally
-omits the deprecated labels, so this is not byte/schema identity with old output.
-Positional/binary Serde formats and custom codecs may need caller migration; older
-readers that require contract or grouping-mode fields are not promised to read new writes. Earlier
-singular `subagent` schemas still require explicit migration. There is no general
-cross-language or cross-version wire guarantee.
-
-`AgentDescriptor`, `AgentQuery`, `SubagentRecord`, and `ChildAgentRun` still alias
-legacy record classes/structs. Do not rename provenance keys merely because the
-API uses `.agent_descriptor`. Persist descriptors and shallow records, not live
-Agent/resolver objects or Asset views. No second model or core I/O is added.
-
-Compatibility checks cover prompt equality, ordered tool specs and nested subagent
-specs/allowlists/depth. Actual child prompts and
-specs are checked on entry. Tools are re-executed: changed implementations with
-unchanged observations reuse; changed observations branch. External provider,
-adapter and custom grouping policies remain caller-owned, including cache isolation
-and snapshot selection. No manual version or namespace replaces the removed key.
-
-Default grouping is identity; default/custom mode and callback identity are not
-cache identity. Replay applies the current function to **both** fresh outputs and
-recorded representatives. Stricter keys can miss despite matching an old evidence
-item; coarser keys may match several edges, selecting the first in stored order.
-The chosen historical representative remains conversation context; exact new
-outputs are appended as evidence. Historical branches and old roots are preserved,
-not merged or retroactively regrouped. See [matching details](history-reference.md#compatibility-and-ownership).
+The internal BatchLoop executes the same immutable history model; there is no
+separate export trie. Runtime callback identity, provider policy and comparison
+mode are not persisted keys. [Compatibility and ownership](history-reference.md#compatibility-and-ownership)
+remain explicit caller contracts.
 
 ## End-to-end examples
 
@@ -177,11 +102,7 @@ cargo run -p lockstep-loop --example agent_assets
 [Python source](../python/examples/agent_assets.py) ·
 [Rust source](../rust/examples/agent_assets.rs)
 
-Both examples use a small file-inspection fixture. They load an agent, replay a
-new environment, inspect its asset's value and conversation, resolve feedback by
-replay (not via the view), and persist the updated agent. They also inspect an
-open continuation with its prior value and verify that the old snapshot retains
-its original asset. Shared-path inheritance and subdivision remain unchanged.
-No model/provider account or storage service is needed. For a different domain,
-see the product-specification [Python](../python/examples/product_screening.py)
-and [Rust](../rust/examples/product_screening.rs) demos; the asset model is the same.
+These mock-only examples load snapshots, replay new environments, inspect Assets,
+resolve feedback through tools, and preserve old/open/revised views. For a different
+domain, see [Python product screening](../python/examples/product_screening.py)
+and [Rust product screening](../rust/examples/product_screening.rs).

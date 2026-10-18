@@ -1,9 +1,9 @@
 //! Run: cargo run -p lockstep-loop --example feedback
 //! Caller-side fake executors and shallow-record persistence, no sessions/endpoints.
 use lockstep_loop::{
-    Agent, BatchLoop, BatchResult, Completion, LlmCompletion, LlmRequest, LoopConfig, LoopError,
-    NodeRef, RecordStore, Request, RequestKind, Role, ToolCall, ToolCompletion, ToolRequest,
-    ToolSpec,
+    Agent, AgentConfig, AgentRun, AgentRuntime, AgentSnapshot, BatchResult, Completion,
+    LlmCompletion, LlmRequest, LoopError, NodeRef, RecordStore, Request, RequestKind, Role,
+    RunOptions, ToolCall, ToolCompletion, ToolRequest, ToolSpec,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -17,24 +17,28 @@ fn specs() -> Vec<ToolSpec> {
         ToolSpec::new("foo", "Inspect /foo", json!({})),
     ]
 }
-fn config(
+fn start(
     envs: &[&str],
-    previous: Option<Agent<String>>,
+    previous: Option<AgentSnapshot<String>>,
     feedback: Option<&str>,
-) -> LoopConfig<String> {
-    let config = LoopConfig::new(
-        PROMPT.into(),
-        envs.iter().map(|s| (*s).into()).collect(),
-        specs(),
-    );
-    let mut config = match previous {
-        Some(agent) => config.with_agent(agent),
-        None => config.with_record_store(RecordStore::new("initial-writer")),
-    };
-    if let Some(content) = feedback {
-        config = config.with_feedback(content.into());
+) -> AgentRun<String> {
+    let agent = match previous {
+        Some(snapshot) => Agent::from_snapshot(snapshot, AgentRuntime::default()),
+        None => Agent::new(
+            AgentConfig::new(PROMPT.into(), specs())
+                .with_record_store(RecordStore::new("initial-writer")),
+        ),
     }
-    config
+    .unwrap();
+    agent
+        .start(
+            envs.iter().map(|s| (*s).into()).collect(),
+            RunOptions {
+                feedback: feedback.map(str::to_owned),
+                budget: None,
+            },
+        )
+        .unwrap()
 }
 struct Investigation {
     result: BatchResult<String>,
@@ -43,10 +47,10 @@ struct Investigation {
 }
 fn investigate(
     envs: &[&str],
-    previous: Option<Agent<String>>,
+    previous: Option<AgentSnapshot<String>>,
     feedback: Option<&str>,
 ) -> Investigation {
-    let mut loop_ = BatchLoop::new(config(envs, previous, feedback)).unwrap();
+    let mut loop_ = start(envs, previous, feedback);
     let (mut llms, mut tools) = (vec![], vec![]);
     while !loop_.is_done() {
         match loop_.next_request(RequestKind::Any).unwrap() {
@@ -105,7 +109,7 @@ fn investigate(
 }
 
 type Backend = BTreeMap<NodeRef, Vec<u8>>;
-fn persist(agent: &Agent<String>, backend: &mut Backend) -> Vec<u8> {
+fn persist(agent: &AgentSnapshot<String>, backend: &mut Backend) -> Vec<u8> {
     // Records first; publish descriptor only after records are durable.
     for (reference, node) in agent.store.records() {
         let bytes = serde_json::to_vec(&node).unwrap();
@@ -117,8 +121,8 @@ fn persist(agent: &Agent<String>, backend: &mut Backend) -> Vec<u8> {
     }
     serde_json::to_vec(&agent.descriptor).unwrap()
 }
-fn restore(descriptor: &[u8], backend: Backend, fresh_writer: &str) -> Agent<String> {
-    Agent {
+fn restore(descriptor: &[u8], backend: Backend, fresh_writer: &str) -> AgentSnapshot<String> {
+    AgentSnapshot {
         descriptor: serde_json::from_slice(descriptor).unwrap(),
         store: RecordStore::with_loader(fresh_writer, move |reference| {
             Arc::new(serde_json::from_slice(&backend[reference]).unwrap())
@@ -129,7 +133,7 @@ fn restore(descriptor: &[u8], backend: Backend, fresh_writer: &str) -> Agent<Str
 fn main() {
     let old = investigate(&["A", "B", "D"], None, None)
         .result
-        .into_agent();
+        .into_snapshot();
     let revised = investigate(&["A"], Some(old.clone()), Some(NOTE));
     assert_eq!(revised.llms.len(), 2); // both AFTER resolving the old answer
     let messages = &revised.llms[0].messages;
@@ -143,7 +147,7 @@ fn main() {
     );
     let mut backend = Backend::new();
     let old_descriptor = persist(&old, &mut backend);
-    let descriptor = persist(revised.result.agent(), &mut backend);
+    let descriptor = persist(revised.result.snapshot(), &mut backend);
     let inherited = investigate(
         &["A", "B", "C", "D"],
         Some(restore(&descriptor, backend.clone(), "inherited-writer")),
@@ -167,7 +171,7 @@ fn main() {
             .filter(|r| r.tool_call.name == "foo")
             .all(|r| r.env_ids == ["A", "B", "C"])
     );
-    let descriptor = persist(inherited.result.agent(), &mut backend);
+    let descriptor = persist(inherited.result.snapshot(), &mut backend);
     let repeated = investigate(
         &["B"],
         Some(restore(&descriptor, backend.clone(), "repeated-writer")),
@@ -193,7 +197,7 @@ fn main() {
     assert!(old_again.tools.iter().all(|r| r.tool_call.name == "read"));
 
     // A replay miss consumes the valid result and terminates; it never generates a target.
-    let mut failed = BatchLoop::new(config(&["changed"], Some(old.clone()), Some(NOTE))).unwrap();
+    let mut failed = start(&["changed"], Some(old.clone()), Some(NOTE));
     let request = failed.next_request(RequestKind::Any).unwrap();
     assert_eq!(
         failed.complete(Completion::Tool(ToolCompletion {
@@ -205,7 +209,7 @@ fn main() {
     assert!(failed.is_done());
     assert_eq!(failed.error(), Some(&LoopError::FeedbackResolutionMiss));
     assert_eq!(failed.outstanding_count(), 0);
-    assert_eq!(failed.agent(), old);
+    assert_eq!(failed.snapshot(), old);
     println!(
         "shared feedback: A/B/C inherit; D unchanged; old snapshot reusable; replay miss explicit"
     );

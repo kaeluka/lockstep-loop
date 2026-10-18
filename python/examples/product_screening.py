@@ -12,7 +12,6 @@ from collections.abc import Mapping
 
 from lockstep_loop import (
     Agent,
-    BatchLoop,
     BatchResult,
     LlmCompletion,
     LlmRequest,
@@ -60,15 +59,8 @@ def scripted_model(request: LlmRequest[str]) -> LlmCompletion[str]:
     )
 
 
-def screen(
-    evidence: Mapping[str, str], agent: Agent[str] | None = None
-) -> tuple[BatchResult[str], int, int]:
-    loop = BatchLoop(
-        prompt=PROMPT,
-        env_ids=tuple(evidence),
-        tool_specs=(RATINGS,),
-        agent=agent,
-    )
+def screen(agent: Agent[str], evidence: Mapping[str, str]) -> tuple[BatchResult[str], int, int]:
+    loop = agent.start(tuple(evidence))
     llm_calls = tool_executions = 0
     while not loop.done:
         request = loop.next_request()
@@ -89,25 +81,27 @@ def screen(
 
 
 def main() -> None:
+    agent = Agent(prompt=PROMPT, tool_specs=[RATINGS])
     outdoor = ratings("IP65", -20, 50)
     initial, llms, reads = screen(
-        {"product-a/v1": outdoor, "product-b/v1": outdoor, "product-c/v1": ratings("IP20", 0, 40)}
+        agent,
+        {"product-a/v1": outdoor, "product-b/v1": outdoor, "product-c/v1": ratings("IP20", 0, 40)},
     )
     assert (llms, reads, len(initial.classes)) == (3, 3, 2)
-    old = initial.agent
+    old = initial.snapshot
     print(f"Initial: {llms} LLM calls, {reads} tool executions, {len(initial.classes)} classes")
 
-    matching, llms, reads = screen({"product-d/v1": outdoor}, old)
+    matching, llms, reads = screen(agent, {"product-d/v1": outdoor})
     assert (llms, reads) == (0, 1)
     assert matching.results["product-d/v1"] == "meets toy requirements"
     print(f"Matching new product: {llms} LLM calls, {reads} tool execution")
 
-    changed, llms, reads = screen({"product-a/v2": ratings("IP65", 0, 50)}, matching.agent)
+    changed, llms, reads = screen(agent, {"product-a/v2": ratings("IP65", 0, 50)})
     assert (llms, reads) == (1, 1)
     assert changed.results["product-a/v2"] == "does not meet toy requirements"
-    assert len(list(old.assets())) == 2 and len(list(changed.agent.assets())) == 3
+    assert len(list(old.assets())) == 2 and len(list(changed.snapshot.assets())) == 3
     print(f"Revised specifications: {llms} LLM call, {reads} tool execution")
-    for asset in changed.agent.assets():
+    for asset in changed.snapshot.assets():
         print(asset.env_ids, "->", asset.value)
     # Persist descriptors and shallow records with caller-owned codecs as shown
     # in history_replay.py. No product-specific types or storage live in the core.

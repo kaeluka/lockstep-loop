@@ -1,10 +1,10 @@
+
 """Structural guards, not wall-clock thresholds, for the serving hot path."""
 
 import pytest
 
 import lockstep_loop.core as core
 from lockstep_loop import (
-    BatchLoop,
     LlmCompletion,
     LlmRequest,
     SubagentTool,
@@ -12,6 +12,7 @@ from lockstep_loop import (
     ToolCompletion,
     ToolSpec,
 )
+from lockstep_loop.core import BatchLoop
 
 
 class NoTraversalList(list):
@@ -184,7 +185,7 @@ def test_callback_history_reads_never_publish_a_root_that_later_rolls_back():
     def build(args):
         if current is not None:
             published = (
-                current.history
+                current.snapshot
             )  # reentrant read; must not deadlock or publish working state
             inspected.append(published)
             assert current._recorded.descriptor.root != published.descriptor.root
@@ -196,13 +197,13 @@ def test_callback_history_reads_never_publish_a_root_that_later_rolls_back():
     specs = (ToolSpec("read", "", {}), ToolSpec("child", "", {}))
     sub = SubagentTool("child", "", {}, build, lambda _: specs)
 
-    def make(history=None, env="old"):
+    def make(snapshot=None, env="old"):
         return BatchLoop(
             prompt="parent",
             env_ids=[env],
             tool_specs=specs,
             subagent=sub,
-            history=history,
+            snapshot=snapshot,
         )
 
     original = make()
@@ -220,13 +221,13 @@ def test_callback_history_reads_never_publish_a_root_that_later_rolls_back():
     original.complete(LlmCompletion(child.request_id, "answer"))
     request = original.next_request()
     original.complete(LlmCompletion(request.request_id, "done"))
-    current = make(original.history, "new")
+    current = make(original.snapshot, "new")
     tool = current.next_request()
-    before = current.history
+    before = current.snapshot
     broken = True
     with pytest.raises(KeyError):
         current.complete(ToolCompletion(tool.request_id, (("new", "same"),)))
-    assert current.history is before
+    assert current.snapshot is before
     assert inspected == [before]
     assert current.outstanding_tool == 1 and current.error is None
     broken = False
@@ -234,14 +235,14 @@ def test_callback_history_reads_never_publish_a_root_that_later_rolls_back():
     assert current.done and current.result().results == {"new": "done"}
     assert inspected == [before, before]
     assert len(before.root.observations[0].evidence) == 1
-    assert len(current.history.root.observations[0].evidence) == 2
+    assert len(current.snapshot.root.observations[0].evidence) == 2
 
 
 def test_callback_cannot_reenter_serving_and_issue_uncommitted_requests():
     current = None
 
     def build(_):
-        assert current.history.root.assistant is None
+        assert current.snapshot.root.assistant is None
         with pytest.raises(RuntimeError, match="reenter"):
             current.next_request()
         raise KeyError("reject this completion")
@@ -251,10 +252,10 @@ def test_callback_cannot_reenter_serving_and_issue_uncommitted_requests():
         prompt="p", env_ids=["e"], tool_specs=[], subagent=sub
     )
     root = current.next_request()
-    before = current.history
+    before = current.snapshot
     with pytest.raises(KeyError):
         current.complete(LlmCompletion(root.request_id, "bad", (ToolCall("c", "child", {}),)))
-    assert current.history is before and current.outstanding_llm == 1
+    assert current.snapshot is before and current.outstanding_llm == 1
     current.complete(LlmCompletion(root.request_id, "corrected"))
     assert current.done and current.result().results == {"e": "corrected"}
 
@@ -272,13 +273,13 @@ def test_rollback_restores_child_serving_order_without_cloning_siblings():
     specs = (ToolSpec("read", "", {}), ToolSpec("child", "", {}))
     sub = SubagentTool("child", "", {}, build, lambda _: specs)
 
-    def make(history=None):
+    def make(snapshot=None):
         return BatchLoop(
             prompt="parent",
             env_ids=["a", "b"],
             tool_specs=specs,
             subagent=sub,
-            history=history,
+            snapshot=snapshot,
         )
 
     def tool_reply(request):
@@ -310,16 +311,16 @@ def test_rollback_restores_child_serving_order_without_cloning_siblings():
         elif prompt.startswith("second") and not observed:
             calls_for_turn = (ToolCall("r", "read", {"scope": prompt}),)
         original.complete(LlmCompletion(request.request_id, "done", calls_for_turn))
-    replay = make(original.history)
+    replay = make(original.snapshot)
     tool = replay.next_request()
     replay.complete(tool_reply(tool))
     order = tuple(replay._children)
-    before = replay.history
+    before = replay.snapshot
     broken = True
     with pytest.raises(KeyError):
         _ = replay.done
     assert tuple(replay._children) == order
-    assert replay.history is before and replay.error is None
+    assert replay.snapshot is before and replay.error is None
     broken = False
     calls.clear()
     assert not replay.done
