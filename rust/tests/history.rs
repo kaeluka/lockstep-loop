@@ -41,8 +41,8 @@ fn config(envs: &[&str], history: Option<History<String>>) -> LoopConfig<String>
         specs(),
     );
     match history {
-        Some(h) => config.with_replay(h, "inspect/read/exact/v1"),
-        None => config.with_recording("inspect/read/exact/v1"),
+        Some(h) => config.with_replay(h),
+        None => config.with_recording(),
     }
 }
 
@@ -352,7 +352,7 @@ fn invalid_completions_do_not_fulfill_history_and_can_be_corrected() {
 }
 
 #[test]
-fn explicit_contract_checks_final_only_replay_and_unsupported_budget() {
+fn structural_checks_final_only_replay_and_unsupported_budget() {
     let mut loop_ = BatchLoop::new(config(&["old"], None)).unwrap();
     let request = loop_.next_request(RequestKind::Any).unwrap();
     loop_
@@ -366,11 +366,8 @@ fn explicit_contract_checks_final_only_replay_and_unsupported_budget() {
     assert!(replay.is_done());
     assert!(replay.next_request(RequestKind::Any).is_none());
     assert_eq!(replay.result().unwrap().results["new"], "done");
-    let changed = config(&["new"], None).with_replay(history.clone(), "changed");
-    assert!(matches!(
-        BatchLoop::new(changed),
-        Err(LoopError::IncompatibleHistory)
-    ));
+    let replay = config(&["new"], None).with_replay(history.clone());
+    assert!(BatchLoop::new(replay).unwrap().is_done());
     let mut changed = config(&["new"], Some(history.clone()));
     changed.prompt = "changed prompt".into();
     assert!(matches!(
@@ -449,7 +446,7 @@ fn reverse_branch_completions_keep_siblings_and_never_merge() {
 #[test]
 fn opaque_bytes_and_fulfilled_assistant_snapshot_restart_tools() {
     let make_config = |env: &str| LoopConfig::new(vec![0, 255], vec![env.into()], specs());
-    let mut loop_ = BatchLoop::new(make_config("old").with_recording("bytes-v1")).unwrap();
+    let mut loop_ = BatchLoop::new(make_config("old").with_recording()).unwrap();
     let request = loop_.next_request(RequestKind::Any).unwrap();
     loop_
         .complete(Completion::Llm(LlmCompletion {
@@ -459,8 +456,7 @@ fn opaque_bytes_and_fulfilled_assistant_snapshot_restart_tools() {
         }))
         .unwrap();
     let snapshot = loop_.history().unwrap();
-    let mut replay =
-        BatchLoop::new(make_config("new").with_replay(snapshot.clone(), "bytes-v1")).unwrap();
+    let mut replay = BatchLoop::new(make_config("new").with_replay(snapshot.clone())).unwrap();
     let Request::Tool(tool) = replay.next_request(RequestKind::Any).unwrap() else {
         panic!()
     };
@@ -484,7 +480,7 @@ fn opaque_bytes_and_fulfilled_assistant_snapshot_restart_tools() {
     );
     let restored = roundtrip(&history);
     assert_eq!(restored, history);
-    let mut again = BatchLoop::new(make_config("again").with_replay(restored, "bytes-v1")).unwrap();
+    let mut again = BatchLoop::new(make_config("again").with_replay(restored)).unwrap();
     let Request::Tool(tool) = again.next_request(RequestKind::Any).unwrap() else {
         panic!()
     };

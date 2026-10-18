@@ -33,7 +33,7 @@ READ = ToolSpec("read", "read-only", {})
 
 def record():
     loop = BatchLoop(
-        prompt="inspect", env_ids=["A", "B", "D"], tool_specs=[READ], agent_contract="agents/v1"
+        prompt="inspect", env_ids=["A", "B", "D"], tool_specs=[READ], recording=True
     )
     empty = loop.agent
     initial = next(empty.assets())
@@ -68,7 +68,7 @@ def record():
 def test_assets_are_path_backed_leaves_not_values_or_environment_classes():
     agent, empty, opened = record()
     assert isinstance(agent, Agent) and Agent is History
-    assert agent.prompt == "inspect" and agent.contract == "agents/v1"
+    assert agent.prompt == "inspect"
     assets = list(agent.assets())
     assert len(assets) == 2
     assert [a.env_ids for a in assets] == [("A", "B"), ("D",)]
@@ -92,7 +92,6 @@ def test_assets_are_path_backed_leaves_not_values_or_environment_classes():
             prompt="inspect",
             env_ids=["A"],
             tool_specs=[READ],
-            agent_contract="agents/v1",
             agent=assets[0],
             feedback=Feedback("check"),
         )
@@ -106,7 +105,6 @@ def test_feedback_moves_the_leaf_but_preserves_old_assets_and_publication():
         env_ids=["A"],
         tool_specs=[READ],
         agent=old,
-        agent_contract=old.contract,
         feedback=Feedback("check /foo"),
     )
     tool = loop.next_request()
@@ -137,7 +135,6 @@ def test_feedback_moves_the_leaf_but_preserves_old_assets_and_publication():
         env_ids=["C"],
         tool_specs=[READ],
         agent=current,
-        agent_contract=current.contract,
     )
     tool = replay.next_request()
     replay.complete(ToolCompletion(tool.request_id, (("C", "shared"),)))
@@ -149,7 +146,7 @@ def test_asset_views_keep_lossy_evidence_and_real_null_values():
         prompt=b"inspect",
         env_ids=["A", "B"],
         tool_specs=[READ],
-        agent_contract="bytes/strip",
+        recording=True,
         group_by=bytes.strip,
     )
     r = loop.next_request()
@@ -191,7 +188,7 @@ def test_asset_enumeration_is_lazy_read_only_and_does_not_visit_child_agents():
     assert restored.store.records() == {}
 
 
-def test_new_names_are_aliases_and_legacy_wire_classes_and_fields_stay_stable():
+def test_new_names_are_aliases_and_legacy_wire_classes_are_retained():
     pairs = (
         ("Agent", "History"),
         ("AgentDescriptor", "HistoryDescriptor"),
@@ -217,7 +214,6 @@ def test_new_names_are_aliases_and_legacy_wire_classes_and_fields_stay_stable():
         assert reference in agent.store.records()
     for options in (
         {"agent": agent, "history": agent},
-        {"agent_contract": "v1", "history_contract": "v1"},
         {"agent_resolver": lambda _: None, "history_resolver": lambda _: None},
     ):
         with pytest.raises(ValueError, match="not both"):
@@ -231,11 +227,13 @@ def test_pre_rename_pickle_fixture_loads_replays_and_preserves_wire_names():
     assert pickle.loads(reencoded) == wire
 
     # Pickle memoization depends on string identity/interning; require stable
-    # record globals/field names and values, not incidental memo-table bytes.
+    # record globals/evidence values, excluding labels, not memo-table bytes.
     def wire_strings(data):
         return {arg for op, arg, _ in pickletools.genops(data) if op.name.endswith("UNICODE")}
 
-    assert wire_strings(reencoded) == wire_strings(encoded)
+    assert wire_strings(encoded) - wire_strings(reencoded) == {
+        "contract", "history_contract", "fixture/v1", "child/v1"
+    }
     assert isinstance(wire["descriptor"], AgentDescriptor)
     assert isinstance(wire["query"], AgentQuery)
     records = wire["records"]
@@ -265,13 +263,12 @@ def test_pre_rename_pickle_fixture_loads_replays_and_preserves_wire_names():
     assert next(agent.child(entry).assets()).value == b"child answer"
     sub = SubagentTool(
         "delegate", "child investigation", {}, lambda _: b"child", lambda _: (), subagents=()
-    ).with_agent_contract("child/v1")
+    )
     loop = BatchLoop(
         prompt=agent.prompt,
         env_ids=["C"],
         tool_specs=agent.descriptor.tools,
         agent=agent,
-        agent_contract=agent.contract,
         subagents=[sub],
         group_by=bytes.strip,
     )
@@ -294,7 +291,7 @@ def test_deep_asset_inspection_is_iterative_and_read_only():
                 observations=(Observation(outputs, (EnvObservation("A", outputs),), root),),
             )
         )
-    agent = Agent(AgentDescriptor("deep", "inspect", (READ,), False, root), store)
+    agent = Agent(AgentDescriptor("inspect", (READ,), False, root), store)
     before = len(store.records())
     asset = next(agent.assets())
     assert len(asset.observations) == 1500
@@ -304,16 +301,14 @@ def test_deep_asset_inspection_is_iterative_and_read_only():
 
 
 def test_child_agent_aliases_preserve_lookup_provenance_and_persistence():
-    tool = SubagentTool("inspect", "", {}, lambda _: "child", lambda _: ()).with_agent_contract(
-        "child/v1"
-    )
-    assert tool.agent_contract == tool.history_contract == "child/v1"
+    tool = SubagentTool("inspect", "", {}, lambda _: "child", lambda _: ())
+    assert not hasattr(tool, "agent_contract") and not hasattr(tool, "history_contract")
     loop = BatchLoop(
         prompt="parent",
         env_ids=["A"],
         tool_specs=[],
         subagents=[tool],
-        agent_contract="parent/v1",
+        recording=True,
         agent_resolver=lambda _: None,
     )
     r = loop.next_request()

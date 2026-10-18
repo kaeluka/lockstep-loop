@@ -5,11 +5,11 @@
 //! class splits only when tool results differ. The caller owns all LLM and
 //! tool execution and may complete requests in any order.
 //!
-//! An immutable [`Agent`] contains the initial prompt, compatible execution
-//! contract and accumulated trie. Its [`Asset`] views are leaf investigations
-//! backed by their complete conversations, not just published values or
-//! environment classes. [`History`] remains an alias; persistence fields stay
-//! compatible. Feedback still resolves an agent snapshot + environment by replay.
+//! An immutable [`Agent`] contains the initial prompt, structural configuration
+//! and accumulated trie. Its [`Asset`] views are leaf investigations backed by
+//! complete conversations, not just published values or environment classes.
+//! [`History`] remains an alias; legacy persisted contract labels are ignored.
+//! Feedback still resolves an agent snapshot + environment by replay.
 
 mod history;
 use history::PathStep;
@@ -257,7 +257,8 @@ impl<P> Debug for Budget<P> {
 pub struct SubagentTool<P> {
     pub spec: ToolSpec,
     pub max_depth: usize,
-    pub history_contract: Option<String>,
+    /// Record children without a recorded parent or resolver; never a cache key.
+    pub recording: bool,
     /// None preserves bounded self-recursion; Some is an explicit child allowlist.
     pub subagents: Option<Vec<SubagentTool<P>>>,
     build_prompt: Arc<PromptBuilder<P>>,
@@ -289,25 +290,17 @@ impl<P> SubagentTool<P> {
         Self {
             spec,
             max_depth,
-            history_contract: None,
+            recording: false,
             subagents: None,
             build_prompt: Arc::new(build_prompt),
             sub_tool_specs: Arc::new(sub_tool_specs),
         }
     }
 
-    pub fn with_agent_contract(mut self, contract: impl Into<String>) -> Self {
-        self.history_contract = Some(contract.into());
+    /// Enable child recording independently of its parent. Not part of identity.
+    pub fn with_recording(mut self) -> Self {
+        self.recording = true;
         self
-    }
-
-    /// Compatibility spelling of with_agent_contract.
-    pub fn with_history_contract(self, contract: impl Into<String>) -> Self {
-        self.with_agent_contract(contract)
-    }
-
-    pub fn agent_contract(&self) -> Option<&str> {
-        self.history_contract.as_deref()
     }
 
     pub fn with_subagents(mut self, subagents: Vec<SubagentTool<P>>) -> Self {
@@ -319,7 +312,6 @@ impl<P> SubagentTool<P> {
         SubagentContract {
             spec: self.spec.clone(),
             max_depth: self.max_depth,
-            history_contract: self.history_contract.clone(),
             subagents: self
                 .subagents
                 .as_ref()
@@ -331,7 +323,7 @@ impl<P> SubagentTool<P> {
         Self {
             spec: self.spec.clone(),
             max_depth,
-            history_contract: self.history_contract.clone(),
+            recording: self.recording,
             subagents: self.subagents.clone(),
             build_prompt: Arc::clone(&self.build_prompt),
             sub_tool_specs: Arc::clone(&self.sub_tool_specs),
@@ -350,7 +342,7 @@ impl<P> Debug for SubagentTool<P> {
         f.debug_struct("SubagentTool")
             .field("spec", &self.spec)
             .field("max_depth", &self.max_depth)
-            .field("history_contract", &self.history_contract)
+            .field("recording", &self.recording)
             .field("subagents", &self.subagents)
             .finish_non_exhaustive()
     }
@@ -390,10 +382,9 @@ impl<P> LoopConfig<P> {
         }
     }
 
-    /// Enable recording; the caller versions the complete reuse contract.
-    pub fn with_recording(mut self, contract: impl Into<String>) -> Self {
+    /// Enable recording for a fresh root loop.
+    pub fn with_recording(mut self) -> Self {
         self.history = Some(AgentOptions {
-            contract: contract.into(),
             previous: None,
             store: None,
             prompt_eq: None,
@@ -401,13 +392,12 @@ impl<P> LoopConfig<P> {
         self
     }
 
-    /// Reuse a snapshot under an explicitly attested compatible contract.
-    pub fn with_agent(mut self, previous: Agent<P>, contract: impl Into<String>) -> Self
+    /// Replay and record a snapshot under compatible structural configuration.
+    pub fn with_agent(mut self, previous: Agent<P>) -> Self
     where
         P: PartialEq,
     {
         self.history = Some(AgentOptions {
-            contract: contract.into(),
             previous: Some(previous),
             store: None,
             prompt_eq: Some(PartialEq::eq),
@@ -416,11 +406,11 @@ impl<P> LoopConfig<P> {
     }
 
     /// Compatibility spelling of with_agent; still resolves environments through replay.
-    pub fn with_replay(self, previous: Agent<P>, contract: impl Into<String>) -> Self
+    pub fn with_replay(self, previous: Agent<P>) -> Self
     where
         P: PartialEq,
     {
-        self.with_agent(previous, contract)
+        self.with_agent(previous)
     }
 
     /// Select the shared record resolver/writer for root and child recording.
@@ -532,8 +522,6 @@ pub enum LoopError {
     DuplicateToolName(String),
     #[error("conflicting ordinary/subagent spec for {0:?}")]
     ConflictingToolSpec(String),
-    #[error("child history_contract for {0:?} must be non-empty (required with history_resolver)")]
-    MissingChildHistoryContract(String),
     #[error("subagent {0:?} is unavailable in this child/depth")]
     UnavailableSubagent(String),
     #[error("invalid subagent arguments: {0}")]
@@ -542,7 +530,7 @@ pub enum LoopError {
     SubagentPreparation(String),
     #[error("history resolution failed: {0}")]
     HistoryResolution(String),
-    #[error("incompatible history contract, prompt, tools, grouping, subagents or record store")]
+    #[error("incompatible history prompt, tools, grouping, subagents or record store")]
     IncompatibleHistory,
     #[error("recorded history does not yet support budgets")]
     UnsupportedHistory,
@@ -630,7 +618,6 @@ struct Registration<P> {
 fn register<P>(
     specs: Vec<ToolSpec>,
     definitions: Vec<SubagentTool<P>>,
-    independent: bool,
 ) -> Result<Registration<P>, LoopError> {
     let mut by_name = HashMap::new();
     for spec in &specs {
@@ -647,11 +634,6 @@ fn register<P>(
         }
         if sub.max_depth == 0 {
             return Err(LoopError::InvalidSubagentDepth);
-        }
-        if sub.history_contract.as_deref() == Some("")
-            || (independent && sub.history_contract.is_none())
-        {
-            return Err(LoopError::MissingChildHistoryContract(sub.spec.name));
         }
         if let Some(existing) = by_name.get(&sub.spec.name) {
             if existing != &sub.spec {
@@ -777,17 +759,10 @@ where
         let definitions = config
             .subagents
             .unwrap_or_else(|| config.subagent.into_iter().collect());
-        let registry = register(
-            config.tool_specs,
-            definitions,
-            config.history_resolver.is_some(),
-        )?;
+        let registry = register(config.tool_specs, definitions)?;
         unavailable_subagents.retain(|name| !registry.subagents.contains_key(name));
-        let independent = config.history_resolver.is_some()
-            || registry
-                .subagents
-                .values()
-                .any(|s| s.history_contract.is_some());
+        let independent =
+            config.history_resolver.is_some() || registry.subagents.values().any(|s| s.recording);
         if independent && config.budget.is_some() {
             return Err(LoopError::UnsupportedHistory);
         }
@@ -816,9 +791,6 @@ where
             if config.budget.is_some() {
                 return Err(LoopError::UnsupportedHistory);
             }
-            if options.contract.is_empty() {
-                return Err(LoopError::IncompatibleHistory);
-            }
             if let Some(previous) = options.previous {
                 if config
                     .record_store
@@ -831,10 +803,9 @@ where
                 {
                     return Err(LoopError::IncompatibleHistory);
                 }
-                if previous.descriptor.contract != options.contract
-                    || !options
-                        .prompt_eq
-                        .is_some_and(|eq| eq(&previous.descriptor.prompt, &config.prompt))
+                if !options
+                    .prompt_eq
+                    .is_some_and(|eq| eq(&previous.descriptor.prompt, &config.prompt))
                     || previous.descriptor.tools != registry.specs
                     || previous.descriptor.custom_grouping != custom_grouping
                     || previous.descriptor.subagents != registry.contracts
@@ -849,7 +820,6 @@ where
                     .unwrap_or_default();
                 Some(Agent {
                     descriptor: AgentDescriptor {
-                        contract: options.contract,
                         prompt: config.prompt.clone(),
                         tools: registry.specs.clone(),
                         custom_grouping,
@@ -1512,13 +1482,10 @@ where
             .into_iter()
             .filter(|spec| !unavailable.contains(&spec.name))
             .collect();
-        let registry = register(raw_specs, nested.clone(), self.history_resolver.is_some())?;
+        let registry = register(raw_specs, nested.clone())?;
         let prompt = (subagent.build_prompt)(&call.args)?;
-        let contract = subagent.history_contract.clone().or_else(|| {
-            self.recorded
-                .as_ref()
-                .map(|h| h.descriptor.contract.clone())
-        });
+        let recording =
+            subagent.recording || self.recorded.is_some() || self.history_resolver.is_some();
         let mut previous = None;
         let mut prior_runs = Vec::new();
         if let Some(history) = &self.recorded {
@@ -1547,7 +1514,6 @@ where
             && let Some(resolver) = &self.history_resolver
         {
             let query = AgentQuery {
-                contract: contract.clone().expect("independent child has a contract"),
                 prompt: prompt.clone(),
                 tools: registry.specs.clone(),
                 custom_grouping: self.custom_grouping,
@@ -1564,8 +1530,7 @@ where
             }
         }
         let base = previous.as_ref().map(|h| h.descriptor.clone());
-        let history_options = contract.map(|contract| AgentOptions {
-            contract,
+        let history_options = (recording || previous.is_some()).then(|| AgentOptions {
             previous,
             store: self.record_store.clone(),
             prompt_eq: self.prompt_eq,

@@ -32,7 +32,7 @@ def loop_for(envs, history=None, feedback=None, **options):
         prompt=PROMPT,
         env_ids=envs,
         tool_specs=SPECS,
-        history_contract="feedback-v1",
+        recording=True,
         history=history,
         feedback=feedback,
         **options,
@@ -323,7 +323,7 @@ def test_partial_paths_and_unfinished_feedback_are_not_targets():
 
 def test_opaque_null_feedback_presence_and_constructor_limits():
     initial_loop = BatchLoop(
-        prompt=b"prompt", env_ids=["A"], tool_specs=[], history_contract="bytes"
+        prompt=b"prompt", env_ids=["A"], tool_specs=[], recording=True
     )
     request = initial_loop.next_request()
     initial_loop.complete(LlmCompletion(request.request_id, b"same"))
@@ -334,7 +334,6 @@ def test_opaque_null_feedback_presence_and_constructor_limits():
             prompt=b"prompt",
             env_ids=["A"],
             tool_specs=[],
-            history_contract="bytes",
             history=updated,
             feedback=Feedback(None),
         )
@@ -345,14 +344,13 @@ def test_opaque_null_feedback_presence_and_constructor_limits():
         assert loop.done
         updated = loop.history
     replay = BatchLoop(
-        prompt=b"prompt", env_ids=["C"], tool_specs=[], history_contract="bytes", history=updated
+        prompt=b"prompt", env_ids=["C"], tool_specs=[], history=updated
     )
     assert replay.done and replay.result().results == {"C": b"same"}
     assert not old.root.user_continuations
     for options in (
         {"history": None},
         {"env_ids": ["A", "B"]},
-        {"history_contract": "changed"},
         {"prompt": b"changed"},
         {"budget": Budget(100)},
     ):
@@ -360,7 +358,6 @@ def test_opaque_null_feedback_presence_and_constructor_limits():
             prompt=b"prompt",
             env_ids=["A"],
             tool_specs=[],
-            history_contract="bytes",
             history=old,
             feedback=Feedback(None),
         )
@@ -423,7 +420,7 @@ def nested_loop(history=None, feedback=None):
         env_ids=["A"],
         tool_specs=specs,
         subagent=SubagentTool("investigate", "", {}, lambda a: a["prompt"], lambda _: specs, 1),
-        history_contract="nested-feedback",
+        recording=True,
         history=history,
         feedback=feedback,
     )

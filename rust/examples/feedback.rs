@@ -28,9 +28,9 @@ fn config(
         specs(),
     );
     let mut config = match previous {
-        Some(agent) => config.with_agent(agent, "feedback-example/v1"),
+        Some(agent) => config.with_agent(agent),
         None => config
-            .with_recording("feedback-example/v1")
+            .with_recording()
             .with_record_store(RecordStore::new("initial-writer")),
     };
     if let Some(content) = feedback {

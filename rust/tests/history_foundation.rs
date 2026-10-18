@@ -30,8 +30,8 @@ fn nested_config(
         depth,
     ));
     match previous {
-        Some(h) => config.with_replay(h, "nested/v1"),
-        None => config.with_recording("nested/v1"),
+        Some(h) => config.with_replay(h),
+        None => config.with_recording(),
     }
 }
 struct Driven {
@@ -391,9 +391,9 @@ fn simple(envs: &[&str], previous: Option<History<String>>) -> BatchLoop<String>
         vec![specs()[0].clone()],
     );
     BatchLoop::new(match previous {
-        Some(h) => config.with_replay(h, "simple/v1"),
+        Some(h) => config.with_replay(h),
         None => config
-            .with_recording("simple/v1")
+            .with_recording()
             .with_record_store(RecordStore::new("initial-writer")),
     })
     .unwrap()

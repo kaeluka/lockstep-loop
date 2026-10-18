@@ -19,7 +19,7 @@ def investigate(env: str, observation: str, agent: Agent[str] | None = None):
         prompt="Read the revision's status.",
         env_ids=[env],
         tool_specs=[ToolSpec("status", "Read status without changing it.", {})],
-        agent_contract="status-investigation/v1;exact-grouping;provider-policy-v1",
+        recording=True,
         agent=agent,
     )
     llm_calls = 0

@@ -21,7 +21,7 @@ fn read() -> ToolSpec {
 fn status() -> ToolSpec {
     ToolSpec::new("status", "Read status", json!({}))
 }
-fn definition(name: &str, kind: &str, contract: &str) -> SubagentTool<String> {
+fn definition(name: &str, kind: &str) -> SubagentTool<String> {
     let kind = kind.to_owned();
     SubagentTool::try_new(
         ToolSpec::new(
@@ -43,13 +43,12 @@ fn definition(name: &str, kind: &str, contract: &str) -> SubagentTool<String> {
         |_| Ok(vec![read()]),
         1,
     )
-    .with_history_contract(contract)
     .with_subagents(vec![])
 }
 fn definitions() -> Vec<SubagentTool<String>> {
     vec![
-        definition("list_imports", "imports", "imports/v1"),
-        definition("count_lines", "metrics", "metrics/v1"),
+        definition("list_imports", "imports"),
+        definition("count_lines", "metrics"),
     ]
 }
 fn calls(path: &str) -> Vec<ToolCall> {
@@ -66,7 +65,7 @@ fn config(prompt: &str, envs: &[&str]) -> LoopConfig<String> {
         vec![status()],
     )
     .with_subagents(definitions())
-    .with_recording(format!("{prompt}/v1"))
+    .with_recording()
 }
 fn model(r: &LlmRequest<String>, parent_calls: &[ToolCall]) -> LlmCompletion<String> {
     let prompt = &r.messages[0].content;
@@ -254,7 +253,7 @@ fn multiple_tools_changed_parent_reuses_children_and_exposes_persistable_provena
     let mut selected = BTreeMap::new();
     for u in &old.child_histories {
         let d = publish(&u.history, &backend);
-        selected.insert((d.contract.clone(), d.prompt.clone()), d);
+        selected.insert(d.prompt.clone(), d);
         assert!(u.base.is_none());
         assert_eq!(u.env_ids, ["old"]);
     }
@@ -273,9 +272,7 @@ fn multiple_tools_changed_parent_reuses_children_and_exposes_persistable_provena
         .with_record_store(store)
         .with_history_resolver(move |q| {
             observed.lock().unwrap().push(q.clone());
-            Ok(selected_for_resolver
-                .get(&(q.contract.clone(), q.prompt.clone()))
-                .cloned())
+            Ok(selected_for_resolver.get(&q.prompt).cloned())
         });
     let mut new_calls = calls("foo.py");
     for call in &mut new_calls {
@@ -312,10 +309,7 @@ fn multiple_tools_changed_parent_reuses_children_and_exposes_persistable_provena
     assert_eq!(queries.lock().unwrap().len(), 2);
     let parent = second.result.history.as_ref().unwrap();
     for u in &second.result.child_histories {
-        let key = (
-            u.history.descriptor.contract.clone(),
-            u.history.descriptor.prompt.clone(),
-        );
+        let key = u.history.descriptor.prompt.clone();
         assert_eq!(u.base.as_ref(), selected.get(&key));
         assert_ne!(u.history.descriptor.root, u.base.as_ref().unwrap().root);
         let root = parent.root();
@@ -335,7 +329,7 @@ fn multiple_tools_changed_parent_reuses_children_and_exposes_persistable_provena
             .all(|u| u.history.root().env_ids == ["old"])
     );
     let replay_config = super_config("parent-B", &["later"])
-        .with_replay(parent.clone(), "parent-B/v1")
+        .with_replay(parent.clone())
         .with_history_resolver(|_| panic!("pinned parent must not consult mutable cache pointer"));
     let replay = drive(
         BatchLoop::new(replay_config).unwrap(),
@@ -370,10 +364,7 @@ fn changed_arguments_and_new_observations_do_not_split_parent_on_equal_answers()
     let backend = Backend::default();
     let descriptor = publish(&base, &backend);
     let resolver = HistoryResolver::new(move |q: &HistoryQuery<String>| {
-        Ok(
-            (q.prompt == descriptor.prompt && q.contract == descriptor.contract)
-                .then(|| descriptor.clone()),
-        )
+        Ok((*q == descriptor.query()).then(|| descriptor.clone()))
     });
     let mut config = config("parent-changed", &["A", "B"]).with_record_store(store(&backend));
     config.history_resolver = Some(resolver.clone());
@@ -433,21 +424,24 @@ fn changed_arguments_and_new_observations_do_not_split_parent_on_equal_answers()
         );
     }
     let mut config =
-        super_config("parent-new-contract", &["old"]).with_record_store(store(&backend));
-    config.subagents = Some(vec![definition("list_imports", "imports", "imports/v2")]);
+        super_config("parent-new-implementation", &["old"]).with_record_store(store(&backend));
+    let rebuilt = SubagentTool::new(
+        definitions()[0].spec.clone(),
+        |a| format!("imports:{}", a["file_path"].as_str().unwrap()),
+        |_| vec![read()],
+        1,
+    )
+    .with_subagents(vec![]);
+    config.subagents = Some(vec![rebuilt]);
     config.history_resolver = Some(resolver);
     let versioned = drive(
         BatchLoop::new(config).unwrap(),
         &[("old", "same")],
         &[calls("foo.py")[0].clone()],
-        3,
+        0,
     )
     .result;
-    assert!(versioned.child_histories[0].base.is_none());
-    assert_eq!(
-        versioned.child_histories[0].history.descriptor.contract,
-        "imports/v2"
-    );
+    assert!(versioned.child_histories[0].base.is_some());
 }
 
 #[test]
@@ -619,13 +613,13 @@ fn incompatible_resolver_results_and_malformed_args_leave_fresh_requests_recover
     assert!(serde_json::from_value::<HistoryDescriptor<String>>(legacy).is_err());
     let mut wrong_prompt = descriptor.clone();
     wrong_prompt.prompt = "other".into();
-    let mut wrong_contract = descriptor.clone();
-    wrong_contract.contract = "v2".into();
+    let mut wrong_nested = descriptor.clone();
+    wrong_nested.subagents = old.history.as_ref().unwrap().descriptor.subagents.clone();
     let mut wrong_tools = descriptor.clone();
     wrong_tools.tools.clear();
     let mut wrong_group = descriptor.clone();
     wrong_group.custom_grouping = true;
-    for bad in [wrong_prompt, wrong_contract, wrong_tools, wrong_group] {
+    for bad in [wrong_prompt, wrong_nested, wrong_tools, wrong_group] {
         let config = config("parent-invalid", &["old"])
             .with_record_store(store(&backend))
             .with_history_resolver(move |_| Ok(Some(bad.clone())));
@@ -725,7 +719,7 @@ fn resolver_error_after_a_prepared_hit_keeps_the_whole_turn_pending() {
         .with_record_store(store(&backend))
         .with_history_resolver(move |q| {
             seen.lock().unwrap().push(q.prompt.clone());
-            if q.contract == "imports/v1" {
+            if q.prompt.starts_with("imports:") {
                 return Ok(Some(descriptor.clone()));
             }
             if fault.load(Ordering::Relaxed) {
@@ -784,20 +778,18 @@ fn registration_legacy_advertisements_and_all_serial_driver_entries() {
         BatchLoop::new(duplicate),
         Err(LoopError::DuplicateToolName(_))
     ));
-    let mut missing = imports.clone();
-    missing.history_contract = None;
-    assert!(matches!(
-        BatchLoop::new(
-            base()
-                .with_subagents(vec![missing])
-                .with_history_resolver(|_| Ok(None))
-        ),
-        Err(LoopError::MissingChildHistoryContract(_))
-    ));
-    assert!(matches!(
+    assert!(
         BatchLoop::new(
             base()
                 .with_subagents(vec![imports.clone()])
+                .with_history_resolver(|_| Ok(None))
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        BatchLoop::new(
+            base()
+                .with_subagents(vec![imports.clone().with_recording()])
                 .with_budget(Budget::new(100, |_| "stop".into()))
         ),
         Err(LoopError::UnsupportedHistory)
@@ -815,8 +807,8 @@ fn registration_legacy_advertisements_and_all_serial_driver_entries() {
         vec!["e".into()],
         move |_| {
             vec![
-                ToolEntry::Subagent(i.clone()),
-                ToolEntry::Subagent(metrics.clone()),
+                ToolEntry::Subagent(i.clone().with_recording()),
+                ToolEntry::Subagent(metrics.clone().with_recording()),
                 ToolEntry::Callable(Arc::new(FunctionTool::new(read(), |_| "value".to_owned()))),
             ]
         },
@@ -888,7 +880,7 @@ fn registration_legacy_advertisements_and_all_serial_driver_entries() {
 
 #[test]
 fn explicit_nested_allowlists_cannot_reset_depth_or_leak_sibling_reserved_tools() {
-    let mut leaf = definition("leaf", "leaf", "leaf/v1");
+    let mut leaf = definition("leaf", "leaf");
     leaf.max_depth = 99;
     let middle = SubagentTool::new(
         ToolSpec::new("middle", "", json!({})),
@@ -896,7 +888,6 @@ fn explicit_nested_allowlists_cannot_reset_depth_or_leak_sibling_reserved_tools(
         |_| vec![read(), ToolSpec::new("outer", "", json!({}))],
         99,
     )
-    .with_history_contract("middle/v1")
     .with_subagents(vec![leaf]);
     let outer = SubagentTool::new(
         ToolSpec::new("outer", "", json!({})),
@@ -904,9 +895,8 @@ fn explicit_nested_allowlists_cannot_reset_depth_or_leak_sibling_reserved_tools(
         |_| vec![read(), ToolSpec::new("sibling", "", json!({}))],
         2,
     )
-    .with_history_contract("outer/v1")
     .with_subagents(vec![middle]);
-    let sibling = definition("sibling", "sibling", "sibling/v1");
+    let sibling = definition("sibling", "sibling");
     let mut config = config("parent-nested", &["old"]);
     config.subagents = Some(vec![outer, sibling]);
     let mut loop_ = BatchLoop::new(config).unwrap();
@@ -1014,7 +1004,7 @@ fn selected_feedback_revision_is_reused_without_automatically_updating_old_paren
             vec!["old".into()],
             child.descriptor.tools.clone(),
         )
-        .with_replay(child.clone(), child.descriptor.contract.clone())
+        .with_replay(child.clone())
         .with_feedback("Also inspect the header".into()),
     )
     .unwrap();
@@ -1075,8 +1065,7 @@ fn selected_feedback_revision_is_reused_without_automatically_updating_old_paren
     assert_eq!(new.results["new"], "improved imports");
     assert_eq!(new.child_histories[0].base.as_ref(), Some(&selected));
     let before = *queries.lock().unwrap();
-    let mut c =
-        config("parent-A", &["new"]).with_replay(old.history.clone().unwrap(), "parent-A/v1");
+    let mut c = config("parent-A", &["new"]).with_replay(old.history.clone().unwrap());
     c.history_resolver = Some(resolver);
     let replay = drive(
         BatchLoop::new(c).unwrap(),
@@ -1103,7 +1092,7 @@ fn opaque_byte_prompts_are_verified_by_value_not_lookup_keys() {
         |_| vec![],
         1,
     )
-    .with_history_contract("bytes/v1")
+    .with_recording()
     .with_subagents(vec![]);
     let mut first = BatchLoop::new(
         LoopConfig::new(b"parent-A".to_vec(), vec!["e".into()], vec![])

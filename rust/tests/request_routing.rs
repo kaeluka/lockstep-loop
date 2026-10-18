@@ -26,9 +26,9 @@ fn make_loop(recording: bool, env: &str, previous: Option<History<String>>) -> B
         ),
     );
     let config = if let Some(history) = previous {
-        config.with_replay(history, "opaque-routing/v1")
+        config.with_replay(history)
     } else if recording {
-        config.with_recording("opaque-routing/v1")
+        config.with_recording()
     } else {
         config
     };

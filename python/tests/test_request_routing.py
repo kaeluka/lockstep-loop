@@ -26,7 +26,7 @@ def make_loop(recording, env="old", history=None):
         subagent=SubagentTool(
             "investigate", "", {}, lambda args: args["prompt"], lambda _: SPECS, max_depth=2
         ),
-        history_contract="opaque-routing/v1" if recording else None,
+        recording=recording,
         history=history,
     )
 

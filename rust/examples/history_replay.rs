@@ -12,7 +12,6 @@ fn investigate(
     observation: &str,
     previous: Option<Agent<String>>,
 ) -> Result<(Agent<String>, usize, String), Box<dyn std::error::Error>> {
-    let contract = "status-investigation/v1;exact-grouping;provider-policy-v1";
     let config = LoopConfig::new(
         "Read the revision's status.".to_owned(),
         vec![env.to_owned()],
@@ -23,9 +22,9 @@ fn investigate(
         )],
     );
     let config = match previous {
-        Some(agent) => config.with_agent(agent, contract),
+        Some(agent) => config.with_agent(agent),
         None => config
-            .with_recording(contract)
+            .with_recording()
             .with_record_store(RecordStore::new("writer-1")),
     };
     let mut loop_ = BatchLoop::new(config)?;

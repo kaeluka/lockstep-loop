@@ -26,7 +26,6 @@ PROMPT = (
     "IP65 or IP67, and an operating range covering -10 to 40 degrees Celsius. "
     "Read the ratings before concluding."
 )
-CONTRACT = "product-screening/v1/ratings-v1/exact-grouping/scripted-model-v1"
 RATINGS = ToolSpec(
     "read_ratings",
     "Read the sensor's enclosure rating and minimum/maximum operating temperatures in Celsius.",
@@ -68,7 +67,7 @@ def screen(
         prompt=PROMPT,
         env_ids=tuple(evidence),
         tool_specs=(RATINGS,),
-        agent_contract=CONTRACT,
+        recording=True,
         agent=agent,
     )
     llm_calls = tool_executions = 0

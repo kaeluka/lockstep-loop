@@ -27,7 +27,7 @@ def investigate(envs, agent=None, feedback=None):
         prompt=PROMPT,
         env_ids=envs,
         tool_specs=SPECS,
-        agent_contract="feedback-example/v1",
+        recording=True,
         agent=agent,
         feedback=feedback,
     )
@@ -93,7 +93,6 @@ if __name__ == "__main__":
         prompt=PROMPT,
         env_ids=["changed"],
         tool_specs=SPECS,
-        agent_contract="feedback-example/v1",
         agent=old.agent,
         feedback=Feedback(NOTE),
     )

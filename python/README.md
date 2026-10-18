@@ -6,7 +6,7 @@ specification, a dataset release, or a repository snapshot—not necessarily a
 filesystem. [Start with the visual guide](../docs/concepts.md) or explore
 [use cases and tool designs](../docs/use-cases.md).
 
-`Agent` is the complete immutable prompt + reuse contract + accumulated trie
+`Agent` is the complete immutable prompt + structural configuration + accumulated trie
 (`History` remains an alias). `Asset` is a read-only leaf investigation backed by
 its full conversation, not just an answer or an environment class. See the
 [glossary and compatibility mapping](../docs/agent-assets.md).
@@ -104,15 +104,14 @@ options retain their behavior. Legacy `history` spellings remain aliases:
 ```python
 loop = BatchLoop(
     prompt="Assess the evidence packet.", env_ids=["packet-a/v1"], tool_specs=specs,
-    agent_contract="assessment-v1/tool-semantics-v1/exact-grouping/provider-v1",
+    recording=True,
 )
 # Drive the ordinary requests/completions as above.
 snapshot = loop.agent             # immutable agent, including fulfilled turns
 # After completion: snapshot = loop.result().agent
 next_loop = BatchLoop(
     prompt="Assess the evidence packet.", env_ids=["packet-a/v2"], tool_specs=specs,
-    agent_contract="assessment-v1/tool-semantics-v1/exact-grouping/provider-v1",
-    agent=snapshot,
+    agent=snapshot,  # implies replay + recording
 )
 ```
 
@@ -146,7 +145,7 @@ restored = Agent(decode_descriptor(published), store)
 ```
 
 `RecordStore(namespace=..., load=...)` is an in-memory append-only write set/cache,
-not a backend. `BatchLoop(record_store=store, agent_contract=...)` uses a chosen
+not a backend. `BatchLoop(record_store=store, recording=True)` uses a chosen
 store for a new recording; replay uses the store attached to `Agent`. Allocate
 a globally unique namespace per persistent writer. New records use exact
 `NodeRef(namespace, index)` addresses, never hashes. Persist only local writes;
@@ -170,12 +169,13 @@ child final answers enter the parent's result tuple. Divergent child traces with
 identical answers do not split the parent. Active child snapshots retain fulfilled
 turns, not partial tool collections.
 
-**Compatibility:** replay requires the same explicit non-empty contract, equal
-prompt, equal ordered tool specs, the same default/custom grouping mode and equal
-subagent spec/depth. Version the contract for changes to subagent callbacks,
-grouping/tool semantics or provider/adapter
-settings. Equality cannot detect a changed implementation behind an unchanged
-schema. Payloads, arguments and schemas are **borrowed immutable values**: do not
+**Compatibility:** replay checks equal prompts, ordered tool specs, default/custom
+grouping mode, and nested subagent specs/allowlists/depth. Child prompts and specs
+are checked on entry. Pure tools are always re-executed: changed implementation
+with equal observations reuses reasoning; different observations branch. No manual
+version key is needed. Provider/adapter settings and custom grouping semantics
+cannot be inferred; callers own external cache isolation and snapshot selection
+when those policies change. Payloads, arguments and schemas are **borrowed immutable values**: do not
 mutate nested contents through any alias after handing them to the loop. Convert
 mutable provider objects to stable values or make your own copies first.
 
@@ -220,12 +220,12 @@ study_design = SubagentTool(
     build_prompt=lambda args: f"Assess study design against criterion {args['criterion']!r}.",
     sub_tool_specs=lambda env: study_tool_specs,
     subagents=(),  # explicit leaf
-).with_agent_contract("study-design/template-v1/tools-v1/grouping-v1/provider-v1")
+)
 loop = BatchLoop(
     prompt="Screen the study against our review criteria.", env_ids=["study-packet/v2"],
     tool_specs=ordinary_parent_specs, subagents=[study_design, another_specialist],
-    agent_contract="parent/v2",
-    agent_resolver=lambda query: selected.get((query.contract, query.prompt)),
+    recording=True,
+    agent_resolver=lambda query: selected.get(query.prompt),  # fixed config in this sketch
     record_store=RecordStore(load=load_node),
 )
 ```
@@ -247,16 +247,15 @@ PYTHONPATH=src python examples/specialized_subagents.py
 # Changed parent: 2 fresh parent LLM calls, 0 child LLM calls, 1 child tool rerun
 ```
 
-An agent resolver receives `AgentQuery(contract, prompt, tools, custom_grouping,
-subagents)` and returns a caller-selected **AgentDescriptor**, or None for a
-miss. It is not keyed by the parent prompt, invocation/call IDs, or env membership.
-All registered definitions require explicit non-empty child agent contracts
-(`with_agent_contract`, legacy constructor field `history_contract`) when a resolver
-is configured. Without a resolver, a missing child contract
-preserves legacy parent-owned recording; an explicit contract records children
-independently even when the parent itself is not recorded. Child grouping is
-inherited from the loop: version the child contract for changes to that function
-as well as child templates, tool semantics and provider settings.
+An agent resolver receives `AgentQuery(prompt, tools, custom_grouping, subagents)`
+and returns a caller-selected **AgentDescriptor**, or None for a miss. Lookup is
+independent of parent prompt/identity, invocation/call IDs, and env membership.
+No child key is required. A recorded parent or resolver enables child recording;
+otherwise `SubagentTool(recording=True, ...)` optionally records standalone children.
+That switch is not part of structural identity. Fresh roots still require
+`BatchLoop(recording=True)`; supplying an `Agent` implies replay plus recording.
+Child grouping is inherited. External provider/grouping policy isolation belongs
+to the caller, not a core version field.
 
 The resolver only selects a revision; the existing shared `RecordStore` loads its
 nodes lazily. Its loader must resolve all selected descriptor references. For
@@ -265,7 +264,7 @@ writes first, publish child descriptors, and attach a new writer with a loader
 covering those records. Do not return a live `Agent` from the metadata callback
 or assume the descriptor carries its records. Full prompt/spec/grouping/nested
 configuration compatibility is checked even if the caller indexes only by a
-hash or `(contract, prompt)`. An incompatible hit raises, never silently falls back.
+hash or prompt. An incompatible hit raises, never silently falls back.
 
 `result.child_agents` contains `ChildAgentUpdate` records for every completed
 recorded invocation (descendants included when their containing child finishes):
@@ -305,12 +304,11 @@ be combined with recorded children. No environment remapping, dependency
 invalidation, logical asset registry, single-flight, or root-merging service is
 introduced.
 
-**Compatibility:** this naming pass preserves the existing record schema and
-pickle class paths: `AgentDescriptor` aliases `HistoryDescriptor`, and provenance
-aliases retain persisted `history`/`history_contract` fields. The earlier specialized
-subagent change introduced ordered `subagents` and `runs`; migrations from *before*
-that change are still caller-owned. No new migration is required by Agent/Asset
-naming. Old constructors/fields remain usable; see the
+**API/schema migration:** manual contract arguments, fields, and builders have
+been removed, not renamed. Legacy pickle class aliases and provenance `history`
+fields remain; old `contract`/`history_contract` labels are discarded on load and
+omitted on new writes. Immutable fixtures still load and replay. Earlier singular
+`subagent` schemas still need caller migration. See the
 [exact mapping and wire guarantees](../docs/agent-assets.md#preferred-names-and-compatibility).
 
 ### Feedback and shared-path resumption
@@ -320,7 +318,6 @@ from lockstep_loop import BatchLoop, Feedback, FeedbackResolutionError
 
 loop = BatchLoop(
     prompt="Assess the evidence packet.", env_ids=["packet-a/v1"], tool_specs=specs,
-    agent_contract="assessment-v1/tool-semantics-v1/exact-grouping/provider-v1",
     agent=snapshot,
     feedback=Feedback("Also check certificate exclusions and revise if needed."),
 )

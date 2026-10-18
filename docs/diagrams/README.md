@@ -53,4 +53,6 @@ npx -y mcp-excalidraw-server render docs/diagrams/replay.excalidraw \
 The original layout was drawn on an isolated loopback canvas. The domain-neutral
 documentation rewrite updated the saved labels, rendered both formats offline,
 and visually checked all four PNGs for clipping, overlaps, and readability.
+Contract removal relabels the agent root as “Initial prompt + tool configuration”;
+the source and both previews were regenerated locally and the PNG inspected.
 No diagram was uploaded to a public service.

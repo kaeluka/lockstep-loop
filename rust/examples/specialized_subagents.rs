@@ -9,8 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 type Backend = Arc<Mutex<BTreeMap<NodeRef, Vec<u8>>>>;
-type Cache = Arc<Mutex<BTreeMap<(String, String), AgentDescriptor<String>>>>;
-const CHILD_CONTRACT: &str = "imports/template-v1/read-semantics-v1/exact-grouping";
+type Cache = Arc<Mutex<BTreeMap<String, AgentDescriptor<String>>>>;
 fn schema() -> Value {
     json!({"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"], "additionalProperties": false})
 }
@@ -40,7 +39,6 @@ fn imports() -> SubagentTool<String> {
         |_| Ok(vec![read_spec()]),
         1,
     )
-    .with_agent_contract(CHILD_CONTRACT)
     .with_subagents(vec![])
 }
 fn investigate(
@@ -57,15 +55,11 @@ fn investigate(
     let selected = cache.clone();
     let config = LoopConfig::new(parent_prompt.into(), vec![env.into()], vec![])
         .with_subagents(vec![imports()])
-        .with_recording(format!("parent-policy:{parent_prompt}"))
+        .with_recording()
         .with_record_store(store)
         .with_agent_resolver(move |query| {
             // Fixed configuration in this example; core still checks full compatibility.
-            Ok(selected
-                .lock()
-                .unwrap()
-                .get(&(query.contract.clone(), query.prompt.clone()))
-                .cloned())
+            Ok(selected.lock().unwrap().get(&query.prompt).cloned())
         });
     let mut loop_ = BatchLoop::new(config).unwrap();
     let (mut parent_llms, mut child_llms, mut child_tools) = (0, 0, 0);
@@ -165,10 +159,10 @@ fn main() {
     assert_eq!(counts, (2, 2, 1));
     let original = first.child_agents()[0].agent();
     let selected = publish(&first, &backend);
-    cache.lock().unwrap().insert(
-        (selected.contract.clone(), selected.prompt.clone()),
-        selected.clone(),
-    );
+    cache
+        .lock()
+        .unwrap()
+        .insert(selected.prompt.clone(), selected.clone());
     let (second, counts) = investigate(
         "Parent B: a completely different parent prompt",
         "repo@commit-2",
@@ -190,6 +184,6 @@ fn main() {
     cache
         .lock()
         .unwrap()
-        .insert((updated.contract.clone(), updated.prompt.clone()), updated);
+        .insert(updated.prompt.clone(), updated);
     println!("Changed parent: 2 fresh parent LLM calls, 0 child LLM calls, 1 child tool rerun");
 }

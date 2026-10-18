@@ -27,7 +27,7 @@ def make_loop(envs=("old",), history=None, **kwargs):
         prompt="inspect",
         env_ids=envs,
         tool_specs=SPECS,
-        history_contract="inspect/read/exact/v1",
+        recording=True,
         history=history,
         **kwargs,
     )
@@ -216,8 +216,6 @@ def test_final_only_replay_and_explicit_compatibility_and_unsupported_modes():
     assert replay.next_request() is None
     assert replay.result().results == {"new": "done"}
     for kwargs in (
-        {"history_contract": None},
-        {"history_contract": "different"},
         {"prompt": "changed prompt"},
         {"tool_specs": []},
         {"group_by": str.strip},
@@ -228,7 +226,6 @@ def test_final_only_replay_and_explicit_compatibility_and_unsupported_modes():
             prompt="inspect",
             env_ids=["new"],
             tool_specs=SPECS,
-            history_contract=history.contract,
             history=history,
         )
         options.update(kwargs)

@@ -1,5 +1,5 @@
 //! cargo run -p lockstep-loop --example agent_assets
-//! An Agent is prompt + contract + accumulated trie. Assets are contextual leaf views.
+//! An Agent is prompt + structural configuration + accumulated trie. Assets are contextual leaf views.
 use lockstep_loop::{
     Agent, BatchLoop, BatchResult, Completion, LlmCompletion, LoopConfig, NodeRef, RecordStore,
     Request, RequestKind, Role, ToolCall, ToolCompletion, ToolSpec,
@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 const PROMPT: &str = "Inspect the repository";
-const CONTRACT: &str = "agent-assets/v1";
 const NOTE: &str = "Also inspect /foo";
 fn config(envs: &[&str]) -> LoopConfig<String> {
     LoopConfig::new(
@@ -99,7 +98,7 @@ fn main() {
     let recorded = serve(
         BatchLoop::new(
             config(&["A", "B", "D"])
-                .with_recording(CONTRACT)
+                .with_recording()
                 .with_record_store(RecordStore::new("initial-writer")),
         )
         .unwrap(),
@@ -113,7 +112,7 @@ fn main() {
     assert_eq!(original_assets[0].value(), original_assets[1].value());
     assert_ne!(original_assets[0].messages(), original_assets[1].messages());
     let (replayed, llms) =
-        serve(BatchLoop::new(config(&["C"]).with_agent(original.clone(), CONTRACT)).unwrap());
+        serve(BatchLoop::new(config(&["C"]).with_agent(original.clone())).unwrap());
     assert_eq!(llms, 0);
     let before = replayed.into_agent().unwrap();
     let old_asset = before.assets().next().unwrap();
@@ -125,7 +124,7 @@ fn main() {
     // No Asset ID or endpoint is supplied: replay the agent + environment again.
     let mut loop_ = BatchLoop::new(
         config(&["C"])
-            .with_agent(before.clone(), CONTRACT)
+            .with_agent(before.clone())
             .with_feedback(NOTE.into()),
     )
     .unwrap();
@@ -178,15 +177,14 @@ fn main() {
     let descriptor = persist(&revised, &mut backend);
     let loaded = restore(&descriptor, backend.clone(), "inherited-writer");
     let (inherited, _) =
-        serve(BatchLoop::new(config(&["A", "B", "C", "D"]).with_agent(loaded, CONTRACT)).unwrap());
+        serve(BatchLoop::new(config(&["A", "B", "C", "D"]).with_agent(loaded)).unwrap());
     let agent = inherited.agent().unwrap();
     let assets: Vec<_> = agent.assets().collect();
     assert_eq!(assets.len(), 3);
     assert_eq!(inherited.results["B"], "found");
     persist(agent, &mut backend);
     let old_again = restore(&original_descriptor, backend, "old-reader");
-    let (result, llms) =
-        serve(BatchLoop::new(config(&["B"]).with_agent(old_again, CONTRACT)).unwrap());
+    let (result, llms) = serve(BatchLoop::new(config(&["B"]).with_agent(old_again)).unwrap());
     assert_eq!(llms, 0);
     assert_eq!(result.results["B"], "no issues");
     println!(

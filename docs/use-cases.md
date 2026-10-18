@@ -72,8 +72,9 @@ and branching reproducible; they are not real product-certification advice.
   environments following the same path inherit that continuation.
 
 Time-dependent checks must use a pinned assessment date, not the wall clock.
-Version the reuse contract when checklist semantics change. Review findings
-support a decision; they are not a compliance guarantee.
+Express changed checklist requirements in the prompt or observed evidence. Pure
+tools rerun, so changed outputs branch without a manual version bump. Review
+findings support a decision; they are not a compliance guarantee.
 
 ## 4. Contract and policy comparison
 
@@ -89,7 +90,7 @@ support a decision; they are not a compliance guarantee.
   clause.” This concerns the investigation, not its previous answer's string value.
 
 A new document bundle is a new environment. A changed review policy is instead a
-prompt or reuse-contract change. Those are different kinds of invalidation.
+prompt/evidence change or caller-owned policy selection, not a manual cache key.
 Human review remains important for interpretations and consequential decisions.
 
 ## 5. Dataset intake and recurring reports

@@ -7,7 +7,7 @@ contract bundles, dataset releases, or repository snapshots. The core has no
 built-in subject type or evidence backend; see [use cases](../docs/use-cases.md).
 
 [Start with the visual guide](../docs/concepts.md). `Agent` contains its initial
-prompt, reuse contract, and complete accumulated investigation trie (`History`
+prompt, structural configuration, and complete accumulated investigation trie (`History`
 remains an alias). An `Asset` is a read-only leaf investigation backed by its full
 path, not an answer or environment set. See the [glossary/API mapping](../docs/agent-assets.md).
 
@@ -79,8 +79,8 @@ the caller can produce a valid value of the opaque payload type.
 
 ## Recording and replay
 
-Opt into recording through `LoopConfig::with_recording(contract)`. Restore a
-snapshot with `with_agent(agent, expected_contract)` (`with_replay` remains an alias);
+Opt into recording through `LoopConfig::with_recording()`. Restore a
+snapshot with `with_agent(agent)` (`with_replay` remains an alias);
 constructors still use
 `BatchLoop::new` (exact equality) or `BatchLoop::with_group_by` (explicit lossy
 policy). Existing loops without these options behave as before. Constructor-based
@@ -93,14 +93,14 @@ the result's `Vec`; internal branch IDs remain collision-free.
 
 ```rust
 let config = LoopConfig::new(prompt.clone(), vec!["revision-1".into()], specs.clone())
-    .with_recording("inspect-v1/tools-v1/exact-grouping/provider-v1")
+    .with_recording()
     .with_record_store(RecordStore::new("caller-reserved-writer-namespace"));
 let mut loop_ = BatchLoop::new(config)?;
 // Serve normal requests/completions.
 let snapshot = loop_.agent().unwrap(); // immutable agent, including active children
 // After completion, loop_.result()?.into_agent() moves out the updated agent.
 let replay_config = LoopConfig::new(prompt, vec!["revision-2".into()], specs)
-    .with_agent(snapshot, "inspect-v1/tools-v1/exact-grouping/provider-v1");
+    .with_agent(snapshot); // implies replay + recording
 let mut replay = BatchLoop::new(replay_config)?;
 ```
 
@@ -161,13 +161,14 @@ and folds child final answers into parent matching. Parent classes do not split
 merely because child traces differ when their answers agree. Active-child
 snapshots preserve fulfilled turns without serializing pending tool builders.
 
-**Compatibility:** contract IDs must be non-empty and equal; prompt equality,
-ordered tool specs, default/custom grouping mode and subagent spec/depth are also
-checked. Child contracts are checked on entry. The
-`with_agent` builder requires `P: PartialEq` for prompt checking (recording alone
-does not). The caller versions tool implementation semantics, custom grouping,
-subagent prompt/spec-building callbacks, and provider/adapter settings in the
-contract. Closures cannot be introspected.
+**Compatibility:** prompt equality, ordered tool specs, default/custom grouping
+mode and nested subagent specs/allowlists/depth are checked. Child prompts/specs
+are checked on entry. `with_agent` requires `P: PartialEq` for prompt checking
+(recording alone does not). Pure tools are re-executed: implementation changes
+with equal observations reuse reasoning; different observations branch, without
+any manual version key. Provider/adapter settings and custom grouping semantics
+cannot be inferred. Callers own external cache isolation and snapshot selection
+when those policies change.
 Payload `Clone` must have immutable value semantics: interior-mutable aliases must
 not change submitted facts. Grouping, equality and hashing must be deterministic;
 callback panics are not recoverable validation errors. Child prompts, specs and
@@ -227,15 +228,14 @@ let study_design = SubagentTool::try_new(
     },
     |_| Ok(study_tool_specs()),
     1,
-).with_agent_contract("study-design/template-v1/tools-v1/grouping-v1/provider-v1")
- .with_subagents(vec![]);
+).with_subagents(vec![]);
 
 let config = LoopConfig::new(parent_prompt, env_ids, ordinary_parent_specs)
     .with_subagents(vec![study_design, other_specialist])
-    .with_recording("parent/v2")
+    .with_recording()
     .with_record_store(RecordStore::with_loader(fresh_writer_namespace, load_node))
     .with_agent_resolver(move |query| {
-        Ok(selected.get(&(query.contract.clone(), query.prompt.clone())).cloned())
+        Ok(selected.get(&query.prompt).cloned()) // fixed configuration in this sketch
     });
 let mut loop_ = BatchLoop::new(config)?;
 ```
@@ -258,15 +258,16 @@ Children inherit the parent's environment set and read the same study packets.
 
 `with_agent_resolver` accepts a synchronous caller callback returning
 `Result<Option<AgentDescriptor<P>>, LoopError>` for an `AgentQuery<P>` containing
-only child prompt, child contract version, ordered tools, grouping mode and nested
-configuration. It requires `P: PartialEq`, like `with_agent`, for full compatibility
-checks. Return None for a miss; return a chosen descriptor for a hit. Index hashes
-or abbreviated keys never replace core equality checks. Each registered definition
-must have an explicit non-empty `.with_agent_contract(...)` when using a resolver.
-Child grouping is inherited: its contract must cover that function's semantics,
-child tools/templates and provider settings, independently of parent wording.
-Without a resolver, missing child contracts retain legacy parent-owned recording;
-explicit child contracts also enable recording beneath an unrecorded parent.
+only child prompt, ordered tools, grouping mode and nested configuration, never
+parent identity, invocation/call IDs or env membership. It requires `P: PartialEq`,
+like `with_agent`, for full compatibility checks. Return None for a miss; return a
+chosen descriptor for a hit. Index hashes or abbreviated keys never replace core
+equality checks. No child key is required. A recorded parent or resolver enables
+child recording; otherwise `SubagentTool::with_recording()` optionally records
+standalone children. This switch is not structural identity. Fresh roots still
+require `LoopConfig::with_recording()`; an Agent implies replay plus recording.
+Child grouping is inherited; external provider/grouping policy isolation belongs
+to the caller, not a core version field.
 
 The existing `RecordStore` is the node-loading boundary for both parent and selected
 child roots. Supply a shared in-memory store or one whose loader resolves all
@@ -315,18 +316,18 @@ arbitrary callback panics remain unrecovered. No factories are rerun at commit.
 Budgets remain unsupported wherever child recording is enabled. No environment
 binding/remapping, new system-role API, logical asset registry or scheduler is added.
 
-**Naming compatibility:** canonical names are aliases to the existing record types,
-not a second model. Serde names/fields remain unchanged, including `history` and
-`history_contract`. No storage migration is required for this rename. The earlier
-specialized-subagent change introduced ordered `subagents` and `runs`; migrations
-from before that change remain caller-owned. Existing constructors and legacy
-getters/setters stay supported. See the [exact mapping](../docs/agent-assets.md#preferred-names-and-compatibility).
+**API/schema migration:** manual contract arguments, fields and builders are removed,
+not renamed. Record type aliases and provenance `history` fields remain. Old
+`contract`/`history_contract` fields are ignored by self-describing Serde (tested
+with the unchanged JSON fixture), and omitted on new writes. Positional/binary
+codecs may require caller migration. Earlier singular `subagent` schemas still
+require migration; no general cross-version wire guarantee is made. See the [exact mapping](../docs/agent-assets.md#preferred-names-and-compatibility).
 
 ### Feedback and shared-path resumption
 
 ```rust
 let config = LoopConfig::new(prompt, vec!["revision-1".into()], specs)
-    .with_agent(snapshot, "inspect-v1/tools-v1/exact-grouping/provider-v1")
+    .with_agent(snapshot)
     .with_feedback("Also check certificate exclusions and revise if needed.".to_owned());
 let mut loop_ = BatchLoop::new(config)?;
 // Serve ordinary requests/completions. Resolution reruns tools with no fresh

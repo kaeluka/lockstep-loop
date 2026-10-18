@@ -43,7 +43,7 @@ IMPORTS = SubagentTool(
     build_prompt=imports_prompt,
     sub_tool_specs=lambda _: (READ,),
     subagents=(),
-).with_agent_contract("imports/template-v1/read-semantics-v1/exact-grouping")
+)
 
 
 def investigate(parent_prompt, env, cache, backend):
@@ -52,14 +52,14 @@ def investigate(parent_prompt, env, cache, backend):
     def resolve(query):
         # These configurations are fixed in this example. A more general index
         # may include all query fields; core verifies FULL compatibility either way.
-        return cache.get((query.contract, query.prompt))
+        return cache.get(query.prompt)
 
     loop = BatchLoop(
         prompt=parent_prompt,
         env_ids=[env],
         tool_specs=[],
         subagents=[IMPORTS],
-        agent_contract=f"parent-policy:{parent_prompt}",
+        recording=True,
         record_store=store,
         agent_resolver=resolve,
     )
@@ -107,7 +107,7 @@ if __name__ == "__main__":
     # Persist shallow records BEFORE publishing the selected child descriptor.
     # Trusted pickle only; choose your own codecs and backend in production.
     selected = pickle.loads(persist(original, backend))
-    cache[(selected.contract, selected.prompt)] = selected
+    cache[selected.prompt] = selected
 
     second, counts = investigate(
         "Parent B: a completely different parent prompt", "repo@commit-2", cache, backend
@@ -123,5 +123,5 @@ if __name__ == "__main__":
     # There is one update for this query here. Concurrent invocations would yield
     # separate entries; selecting/merging/publishing them is a caller decision.
     updated = pickle.loads(persist(update.agent, backend))
-    cache[(updated.contract, updated.prompt)] = updated
+    cache[updated.prompt] = updated
     print("Changed parent: 2 fresh parent LLM calls, 0 child LLM calls, 1 child tool rerun")

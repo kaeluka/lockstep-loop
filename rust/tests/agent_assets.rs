@@ -21,7 +21,7 @@ fn config(envs: &[&str]) -> LoopConfig<String> {
     )
 }
 fn record() -> (Agent<String>, Agent<String>, Agent<String>) {
-    let mut loop_ = BatchLoop::new(config(&["A", "B", "D"]).with_recording("agents/v1")).unwrap();
+    let mut loop_ = BatchLoop::new(config(&["A", "B", "D"]).with_recording()).unwrap();
     let empty = loop_.agent().unwrap();
     let initial = empty.assets().next().unwrap();
     assert!(!initial.is_complete() && !initial.has_value());
@@ -81,7 +81,6 @@ fn record() -> (Agent<String>, Agent<String>, Agent<String>) {
 fn assets_are_path_backed_leaves_not_values_or_environment_classes() {
     let (agent, empty, opened) = record();
     assert_eq!(agent.prompt(), "inspect");
-    assert_eq!(agent.contract(), "agents/v1");
     let assets: Vec<_> = agent.assets().collect();
     assert_eq!(assets.len(), 2);
     assert_eq!(assets[0].env_ids(), ["A", "B"]);
@@ -116,7 +115,7 @@ fn feedback_moves_the_leaf_without_mutating_old_assets_or_overwriting_values() {
     let old_asset = old.assets().next().unwrap();
     let mut loop_ = BatchLoop::new(
         config(&["A"])
-            .with_agent(old.clone(), old.contract())
+            .with_agent(old.clone())
             .with_feedback("check /foo".into()),
     )
     .unwrap();
@@ -157,7 +156,7 @@ fn feedback_moves_the_leaf_without_mutating_old_assets_or_overwriting_values() {
     assert!(!nodes[nodes.len() - 2].user_continuations.is_empty());
     assert_eq!(current.assets().count(), 2);
     assert!(!pending_agent.assets().next().unwrap().is_complete());
-    let mut replay = BatchLoop::new(config(&["C"]).with_agent(current, "agents/v1")).unwrap();
+    let mut replay = BatchLoop::new(config(&["C"]).with_agent(current)).unwrap();
     let request = replay.next_request(RequestKind::Any).unwrap();
     replay
         .complete(Completion::Tool(ToolCompletion {
@@ -176,7 +175,7 @@ fn asset_views_retain_lossy_evidence_and_real_null_publications() {
         vec!["A".into(), "B".into()],
         vec![spec()],
     )
-    .with_recording("nullable/strip");
+    .with_recording();
     let mut loop_ = BatchLoop::with_group_by(config, |p: &Option<String>| {
         p.as_deref().unwrap_or_default().trim().to_owned()
     })
@@ -262,7 +261,6 @@ fn asset_enumeration_is_lazy_read_only_and_does_not_clone_payloads() {
     });
     let opaque = Agent {
         descriptor: AgentDescriptor {
-            contract: "opaque".into(),
             prompt: NonClone("prompt"),
             tools: vec![],
             custom_grouping: false,
@@ -328,9 +326,21 @@ struct Fixture {
     records: Vec<(NodeRef, HistoryNode<String>)>,
 }
 #[test]
-fn pre_rename_fixture_loads_inspects_replays_and_keeps_wire_keys() {
+fn pre_rename_fixture_loads_inspects_replays_and_omits_legacy_labels() {
     let bytes = include_bytes!("fixtures/agent-naming-2c6d901.json");
-    let raw: Value = serde_json::from_slice(bytes).unwrap();
+    let mut raw: Value = serde_json::from_slice(bytes).unwrap();
+    fn strip_labels(value: &mut Value) {
+        match value {
+            Value::Object(fields) => {
+                fields.remove("contract");
+                fields.remove("history_contract");
+                fields.values_mut().for_each(strip_labels);
+            }
+            Value::Array(values) => values.iter_mut().for_each(strip_labels),
+            _ => {}
+        }
+    }
+    strip_labels(&mut raw);
     let fixture: Fixture = serde_json::from_slice(bytes).unwrap();
     assert_eq!(
         serde_json::to_value(&fixture.descriptor).unwrap(),
@@ -393,15 +403,13 @@ fn pre_rename_fixture_loads_inspects_replays_and_keeps_wire_keys() {
         |_| vec![],
         1,
     )
-    .with_subagents(vec![])
-    .with_agent_contract("child/v1");
-    assert_eq!(sub.agent_contract(), sub.history_contract.as_deref());
+    .with_subagents(vec![]);
     let config = LoopConfig::new(
         agent.prompt().clone(),
         vec!["C".into()],
         agent.descriptor.tools.clone(),
     )
-    .with_agent(agent.clone(), agent.contract())
+    .with_agent(agent.clone())
     .with_subagents(vec![sub.clone()]);
     let mut replay = BatchLoop::with_group_by(config, |s: &String| s.trim().to_owned()).unwrap();
     let request = replay.next_request(RequestKind::Any).unwrap();
@@ -492,7 +500,6 @@ fn deep_asset_paths_are_iterative_and_inspection_never_writes_records() {
     }
     let agent = Agent {
         descriptor: AgentDescriptor {
-            contract: "deep".into(),
             prompt: "inspect".into(),
             tools: vec![spec()],
             custom_grouping: false,

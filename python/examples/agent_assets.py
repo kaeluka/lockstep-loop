@@ -1,6 +1,6 @@
 """From python/: PYTHONPATH=src python examples/agent_assets.py
 
-Agent = prompt + compatible contract + accumulated trie.
+Agent = prompt + structural configuration + accumulated trie.
 Asset = a read-only leaf investigation, backed by its root-to-leaf conversation.
 """
 
@@ -36,7 +36,6 @@ if __name__ == "__main__":
         env_ids=["C"],
         tool_specs=SPECS,
         agent=before,
-        agent_contract=before.contract,
         feedback=Feedback(NOTE),
     )
     read = loop.next_request()

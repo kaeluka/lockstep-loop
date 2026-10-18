@@ -7,7 +7,7 @@
 
 | Term | Meaning |
 | --- | --- |
-| **Agent** | The complete recorded trie **including its initial prompt, compatible execution contract, and accumulated investigations**. Not just a recipe, tool definition, provider client, or executor. |
+| **Agent** | The complete recorded trie **including its initial prompt, structural configuration, and accumulated investigations**. Not just a recipe, tool definition, provider client, or executor. |
 | **Agent snapshot / revision** | One immutable root of that whole agent. Extending it creates another snapshot; previous roots remain valid. `Agent` already represents this, so there is no redundant `Snapshot` wrapper. |
 | **Asset** | A leaf investigation in a particular agent snapshot, backed by its entire root-to-leaf conversation. It can represent multiple environments. Neither a value nor a bare leaf reference nor an `EnvClass` is the whole asset. |
 | **Asset value** | The latest published payload on the path. **Currently this is the content of the latest no-tool assistant response**, not a designated result-tool argument. An open asset may retain that older value or have no value yet. |
@@ -15,11 +15,11 @@
 | **History node** | A shared prefix, current endpoint, or historical endpoint. It need not be a leaf. |
 | **Environment class** | A set of environments grouped by observation history. `EnvClass` and `SplitNode` are partition-only summaries, not assets or agents. |
 | **Loop / execution** | `BatchLoop`, which issues requests and accepts completions. It is not the immutable agent. |
-| **Subagent tool** | `SubagentTool`, a definition that deterministically constructs another agent's initial user prompt and contract. It is not itself the complete recorded child agent. |
+| **Subagent tool** | `SubagentTool`, a definition that deterministically constructs another agent's initial user prompt and tool configuration. It is not itself the complete recorded child agent. |
 
 The package name, replay, grouping, scheduling, request IDs, feedback scope and
-storage protocol are unchanged. This is a vocabulary/API-view change, not an
-asset publication or dependency-DAG system.
+storage protocol are unchanged. Manual contract/version plumbing has been removed;
+this is not an asset publication or dependency-DAG system.
 
 These terms are domain-neutral. A study-screening agent may have assets concluding
 “eligible” or “insufficient evidence”; a dataset-intake agent may have assets with
@@ -91,7 +91,7 @@ Legacy constructors, fields and methods remain usable where listed.
 | Previous spelling | Preferred spelling | Compatibility detail |
 | --- | --- | --- |
 | `History` | `Agent` | Exact type alias to the one immutable snapshot type. |
-| `HistoryDescriptor` | `AgentDescriptor` | Persistence envelope (prompt/contract/root reference), not an executor; exact type alias. |
+| `HistoryDescriptor` | `AgentDescriptor` | Persistence envelope (prompt/configuration/root reference), not an executor; exact type alias. |
 | `HistoryQuery` | `AgentQuery` | Lookup compatibility header; exact type alias. |
 | `HistoryResolver` | `AgentResolver` | Caller-owned agent revision selection; alias, not another loading interface. |
 | Rust `HistoryOptions` | `AgentOptions` | Configuration alias; no corresponding Python wrapper is needed. |
@@ -99,7 +99,7 @@ Legacy constructors, fields and methods remain usable where listed.
 | `ChildHistoryRun` | `ChildAgentRun` | One invocation's selected base and resulting descriptor. |
 | `ChildHistoryUpdate` | `ChildAgentUpdate` | A completed invocation update carrying the complete child agent. |
 | Python `BatchLoop(history=...)` | `BatchLoop(agent=...)` | Old keyword retained; supplying both non-None spellings is rejected. |
-| Python loop `history_contract=` | `agent_contract=` | Same version string, not a new identity. Both non-None spellings are rejected. |
+| Python loop `history_contract=` / `agent_contract=` | `recording=True` for fresh roots; `agent=snapshot` for replay | Version arguments removed; the boolean only enables recording. |
 | Python `history_resolver=` | `agent_resolver=` | Same callback and lookup policy; both non-None spellings are rejected. |
 | Rust `with_replay(...)` | `with_agent(...)` | Same replay-based initialization; both set the same configuration field. |
 | Rust `with_history_resolver(...)` | `with_agent_resolver(...)` | Same setter semantics. |
@@ -108,13 +108,15 @@ Legacy constructors, fields and methods remain usable where listed.
 | `result.child_histories` | Python `result.child_agents`; Rust `child_agents()` | Same completed invocation updates. |
 | `update.history` | Python `update.agent`; Rust `agent()` / `into_agent()` | Same complete child agent. |
 | `entry.history`, `run.history` | Python `.agent_descriptor`; Rust `agent_descriptor()` | These are descriptors; attach the store with `agent.child(entry)`. |
-| Child-definition `history_contract` / Rust `with_history_contract` | `SubagentTool.with_agent_contract(...)`, `.agent_contract` / `agent_contract()` | One version value. Python's dataclass constructor/`replace` field and persisted contract field remain `history_contract`. |
+| Child `history_contract`, `with_history_contract`, `with_agent_contract`, and contract getters | Removed | A parent recording or resolver suffices. Optional Python `recording=True` / Rust `with_recording()` enables standalone child recording, not a key. |
+| Rust `with_recording(label)` | `with_recording()` | Fresh-root opt-in, no version. |
+| Rust `with_agent(agent, label)` / `with_replay(agent, label)` | `with_agent(agent)` / `with_replay(agent)` | Supplying an Agent implies replay and recording. |
+| Descriptor/query/options `contract`, `Agent.contract` / `contract()` | Removed | Query identity is structural; no replacement namespace. |
 
-`Agent.prompt` / `prompt()` exposes the existing descriptor prompt; Rust also adds
-`contract()` for the existing version string (Python already had `contract`).
-`SubagentContract.agent_contract` / `agent_contract()` likewise reads the retained
-`history_contract` field. Rust's `Assets` is only the lazy iterator type, not another
-persisted or runtime model.
+`Agent.prompt` / `prompt()` exposes the descriptor prompt. `SubagentContract` retains
+its class name for compatibility but contains only spec, depth and nested allowlist.
+Recording switches are not part of query/descriptor identity. Rust's `Assets` is
+only the lazy iterator type, not another persisted or runtime model.
 
 Rust's public `LoopConfig.history`/`history_resolver` fields remain compatibility
 fields; prefer the canonical builder methods. Like other Rust setters, old/new
@@ -127,25 +129,35 @@ accurate operational or structural names. `RecordStore` is a node write set/load
 not a new logical-agent registry. The `history.py`/`history.rs` modules and existing
 example filenames remain valid structural names.
 
-## Persistence: no schema migration for this rename
+## Persistence and contract removal
 
-Persisted record fields and type tags stay unchanged, including **`history`** and
-**`history_contract`**. `AgentDescriptor`, `AgentQuery`, `SubagentRecord`, and
-`ChildAgentRun` alias the existing record classes/structs, so Python pickle globals
-and Serde struct/field names retain their historical spellings. Their repr/debug
-names may therefore still show a legacy record name. Do not rename stored JSON
-keys merely because application code now uses `.agent_descriptor`.
+Legacy record class aliases and provenance **`history`** fields remain. However,
+manual **`contract`** fields in descriptors/queries and **`history_contract`** in
+nested subagent configurations are removed from the API and new writes. Python
+pickle restoration discards these old fields; self-describing Rust Serde formats
+such as JSON ignore them as unknown fields. Different historical labels cannot
+poison otherwise matching structural cache entries. Do not retain those labels
+in a caller cache's matching key when importing old data.
 
-The live `Agent`/resolver is still not the persistence format. Save its descriptor
-and shallow records through caller-owned codecs, as before. Asset views are not
-persisted and add no new record tag/field. Fixtures generated using unmodified
-**2c6d901** verify old pickle/Serde data loads, inspects and replays through the new
-API; new record serialization retains the same schema and values. Pickle memo
-layout depends on object/string identity, so byte identity is not a wire promise.
-No supported source API is removed. The live snapshot's reflection/debug type name
-now says `Agent` rather than `History`; legacy persisted record names stay intact.
-This rename needs no storage version bump; it does not undo earlier prototype
-schema migrations or promise general future cross-version compatibility.
+The unchanged **2c6d901** pickle/JSON fixtures still load, inspect and replay,
+including child histories, feedback and full evidence. Re-encoding intentionally
+omits the deprecated labels, so this is not byte/schema identity with old output.
+Positional/binary Serde formats and custom codecs may need caller migration; older
+readers that require contract fields are not promised to read new writes. Earlier
+singular `subagent` schemas still require explicit migration. There is no general
+cross-language or cross-version wire guarantee.
+
+`AgentDescriptor`, `AgentQuery`, `SubagentRecord`, and `ChildAgentRun` still alias
+legacy record classes/structs. Do not rename provenance keys merely because the
+API uses `.agent_descriptor`. Persist descriptors and shallow records, not live
+Agent/resolver objects or Asset views. No second model or core I/O is added.
+
+Compatibility checks cover prompt equality, ordered tool specs, default/custom
+grouping mode and nested subagent specs/allowlists/depth. Actual child prompts and
+specs are checked on entry. Tools are re-executed: changed implementations with
+unchanged observations reuse; changed observations branch. External provider,
+adapter and custom grouping policies remain caller-owned, including cache isolation
+and snapshot selection. No manual version or namespace replaces the removed key.
 
 ## End-to-end examples
 

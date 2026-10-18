@@ -27,8 +27,8 @@ fn config(
         specs(),
     );
     let mut c = match history {
-        Some(h) => c.with_replay(h, "feedback-v1"),
-        None => c.with_recording("feedback-v1"),
+        Some(h) => c.with_replay(h),
+        None => c.with_recording(),
     };
     if let Some(content) = feedback {
         c = c.with_feedback(content.into());
@@ -574,7 +574,7 @@ fn partial_paths_and_unfinished_feedback_are_not_targets() {
 #[test]
 fn opaque_null_feedback_presence_and_constructor_limits() {
     let base = || LoopConfig::new(Some(vec![0_u8, 255]), vec!["A".into()], vec![]);
-    let mut initial_loop = BatchLoop::new(base().with_recording("bytes")).unwrap();
+    let mut initial_loop = BatchLoop::new(base().with_recording()).unwrap();
     let request = initial_loop.next_request(RequestKind::Any).unwrap();
     initial_loop
         .complete(Completion::Llm(LlmCompletion::final_answer(
@@ -585,8 +585,7 @@ fn opaque_null_feedback_presence_and_constructor_limits() {
     let old = initial_loop.history().unwrap();
     let mut updated = old.clone();
     for _ in 0..3 {
-        let mut loop_ =
-            BatchLoop::new(base().with_replay(updated, "bytes").with_feedback(None)).unwrap();
+        let mut loop_ = BatchLoop::new(base().with_replay(updated).with_feedback(None)).unwrap();
         let Request::Llm(request) = loop_.next_request(RequestKind::Any).unwrap() else {
             panic!()
         };
@@ -605,7 +604,7 @@ fn opaque_null_feedback_presence_and_constructor_limits() {
         assert!(loop_.is_done());
         updated = loop_.history().unwrap();
     }
-    let mut replay_config = base().with_replay(updated, "bytes");
+    let mut replay_config = base().with_replay(updated);
     replay_config.env_ids = vec!["C".into()];
     let mut replay = BatchLoop::new(replay_config).unwrap();
     assert!(replay.is_done());
@@ -615,24 +614,22 @@ fn opaque_null_feedback_presence_and_constructor_limits() {
         BatchLoop::new(base().with_feedback(None)),
         Err(LoopError::InvalidFeedback)
     ));
-    let mut multiple = base().with_replay(old.clone(), "bytes").with_feedback(None);
+    let mut multiple = base().with_replay(old.clone()).with_feedback(None);
     multiple.env_ids.push("B".into());
     assert!(matches!(
         BatchLoop::new(multiple),
         Err(LoopError::InvalidFeedback)
     ));
+    let mut changed = base().with_replay(old.clone()).with_feedback(None);
+    changed.prompt = Some(vec![99]);
     assert!(matches!(
-        BatchLoop::new(
-            base()
-                .with_replay(old.clone(), "changed")
-                .with_feedback(None)
-        ),
+        BatchLoop::new(changed),
         Err(LoopError::IncompatibleHistory)
     ));
     assert!(matches!(
         BatchLoop::new(
             base()
-                .with_replay(old, "bytes")
+                .with_replay(old)
                 .with_feedback(None)
                 .with_budget(Budget::new(100, |_| None))
         ),
@@ -760,8 +757,8 @@ fn nested_config(previous: Option<History<String>>, feedback: Option<&str>) -> L
         ),
     );
     let mut config = match previous {
-        Some(h) => config.with_replay(h, "nested-feedback"),
-        None => config.with_recording("nested-feedback"),
+        Some(h) => config.with_replay(h),
+        None => config.with_recording(),
     };
     if let Some(f) = feedback {
         config = config.with_feedback(f.into());

@@ -28,7 +28,7 @@ def nested_loop(envs, history=None, depth=2):
         prompt="main",
         env_ids=envs,
         tool_specs=SPECS,
-        history_contract="nested/v1",
+        recording=True,
         history=history,
         subagent=SubagentTool(
             "investigate", "", {}, lambda args: args["question"], lambda _: SPECS, depth
@@ -226,7 +226,7 @@ def simple_loop(envs, history=None, store=None):
         prompt="inspect",
         env_ids=envs,
         tool_specs=SPECS[:1],
-        history_contract="simple/v1",
+        recording=True,
         history=history,
         record_store=store,
     )

@@ -30,7 +30,7 @@ def make_loop(sub, *, recording=True, history=None, env="old"):
         env_ids=[env],
         tool_specs=SPECS,
         subagent=sub,
-        history_contract="prepare/v1" if recording else None,
+        recording=recording,
         history=history,
     )
 
@@ -170,7 +170,7 @@ def test_failed_child_preparation_after_feedback_does_not_reinject_or_poison_his
         env_ids=["old"],
         tool_specs=SPECS,
         subagent=sub,
-        history_contract="prepare/v1",
+        recording=True,
         history=original.history,
         feedback=Feedback("check again"),
     )

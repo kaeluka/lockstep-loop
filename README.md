@@ -33,7 +33,7 @@ for what can be shared, what causes branching, and when this is a poor fit.
 
 ## The model
 
-- An **Agent** is its prompt, reuse contract, and accumulated investigation trie.
+- An **Agent** is its prompt, structural configuration, and accumulated investigation trie.
 - An **Asset** is a leaf investigation backed by its complete conversation—not
   merely its answer. Several environments can share an asset.
 - **Replay** re-executes tools and reuses recorded assistant turns until an
@@ -73,8 +73,12 @@ environments, and immutable payloads. Environment IDs are caller-side routing
 metadata, not model-visible context. Snapshot live sources before using them;
 recording does not make a changing web page or database query pure.
 
-Opt into recording on `BatchLoop`, then persist `Agent` descriptors and full
-records using your own codecs and storage. This is observation-based reuse, not
+Opt into fresh-root recording with Python `recording=True` or Rust
+`with_recording()`; supplying an `Agent` implies replay and recording. Persist
+Agent descriptors and full records with your own codecs and storage. No manual
+version key is needed: pure tools are rerun, so implementation changes either
+preserve observations (reuse) or change them (branch). External provider/grouping
+policy and cache isolation remain caller responsibilities. This is observation-based reuse, not
 semantic similarity search, model training, or a guarantee of exhaustive research.
 
 ## Go deeper

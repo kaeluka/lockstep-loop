@@ -24,10 +24,10 @@ stable evidence by the caller first.
 
 ## An agent is a recipe *and* its experience
 
-![Product-check agent: the initial prompt and reuse contract are inside the trie. A/B/C share enclosure and temperature observations; D follows a different path. Checking limitations splits A/B from C. A/B share one asset. A blue root-to-leaf path is one conversation.](diagrams/agent-trie.svg)
+![Product-check agent: the initial prompt and tool configuration are inside the trie. A/B/C share enclosure and temperature observations; D follows a different path. Checking limitations splits A/B from C. A/B share one asset. A blue root-to-leaf path is one conversation.](diagrams/agent-trie.svg)
 
-**Agent** means the whole trie: its initial prompt/investigation recipe, compatible
-reuse contract, and accumulated experience. Not just a prompt, and not the executor
+**Agent** means the whole trie: its initial prompt/investigation recipe, structural
+configuration, and accumulated experience. Not just a prompt, and not the executor
 running it. A trie is a tree whose paths share their common beginnings.
 
 **Conversation** means one root-to-endpoint path: the prompt, assistant messages,
@@ -77,7 +77,7 @@ Consider a dataset-intake agent that has already checked schemas, column
 statistics, and units. Next month's release is a **new environment**, not
 necessarily a new investigation from scratch.
 
-Reuse the agent under the same prompt and compatible tool/grouping contract.
+Reuse the agent under the same prompt and compatible tool/grouping configuration.
 Rerun its recorded tools, follow matching observations, and reuse assistant turns.
 A fully matching completed path needs **zero new LLM requests**. At the first
 unseen observation—for example a different unit definition—ask for new reasoning.
@@ -86,8 +86,11 @@ diverge. Reuse also works for a different dataset with the same observed propert
 
 Extending experience creates a **new immutable agent snapshot**. Both paths stay
 reusable; the old snapshot stays unchanged. Your application persists descriptors
-and records using its own storage. Changing the prompt or tool semantics requires
-compatible history selection or a fresh investigation; this is not fuzzy caching.
+and records using its own storage. Changed prompts or tool specs require compatible
+history selection or a fresh investigation. Pure tool implementation changes need
+no version bump: tools rerun, matching outputs reuse, different outputs branch.
+External provider and custom grouping policy isolation remains caller-owned;
+this is not fuzzy caching.
 
 The cache validates only what was observed. If units matter but no tool checked
 them, replay cannot discover that omission. That is where evaluation and feedback

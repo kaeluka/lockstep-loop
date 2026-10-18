@@ -6,14 +6,17 @@ This is the technical contract for the current Python and Rust implementations.
 It applies to any supported read-only evidence domain: documents, specifications,
 datasets, source code, and others. For concrete environment/tool designs, see
 [use cases](use-cases.md); tools and evidence ingestion remain caller-owned.
-`Agent` is the complete immutable snapshot: initial prompt, reuse contract, and
+`Agent` is the complete immutable snapshot: initial prompt, structural configuration, and
 accumulated trie. `Asset` is a read-only leaf investigation backed by its full path.
 See the [glossary, inspection API and exact compatibility mapping](agent-assets.md).
-Legacy `History` names remain aliases; storage wire names do not change.
+Legacy `History` names remain aliases; deprecated contract labels are ignored on
+import and omitted on new writes. See the migration notes in the glossary.
 
 ## Immutable recorded history and incremental replay
 
-Both implementations now offer **opt-in recording on `BatchLoop`**. Keep a
+Both implementations offer **opt-in recording on `BatchLoop`**: Python
+`recording=True`, Rust `LoopConfig::with_recording()` (no argument). Supplying an
+`Agent` implies replay plus recording. Keep an
 `Agent` snapshot, then start a new loop with that snapshot and new environment
 IDs. The core reuses recorded assistant turns, emits their tool requests again,
 and follows the matching **ordered tuple of observations**. Only an unseen
@@ -22,8 +25,8 @@ the original environment class. Old snapshots and old paths remain reusable.
 
 The history model is the replay engine's model, not a lossy export:
 
-- `Agent` pairs a small `AgentDescriptor` (prompt, tool specifications, reuse
-  contract and root reference) with a `RecordStore` resolver.
+- `Agent` pairs a small `AgentDescriptor` (prompt, ordered tool specifications,
+  grouping mode, nested configuration and root reference) with a `RecordStore` resolver.
 - `HistoryNode` stores the full assistant message (including tool calls/arguments)
   and the environment visits that used it. An absent assistant is an unfulfilled
   continuation, not a terminal answer.
@@ -72,11 +75,8 @@ them; the core never uses fuzzy/semantic prompt matching. The same pattern works
 for `list_imports(file_path="foo.py")` in code analysis. All children inherit the
 parent's environment IDs unchanged. Resolve mutable evidence sources outside the core.
 
-Give each independently cached definition an explicit non-empty agent contract
-using `.with_agent_contract(...)` (legacy constructor/wire field `history_contract`), versioning its template/tool,
-inherited grouping, and provider/adapter semantics independently of the parent.
-Configure `agent_resolver` / `.with_agent_resolver(...)` to receive an
-`AgentQuery`: child prompt, child contract version, ordered effective tool specs,
+No caller-supplied child key is needed. Configure `agent_resolver` /
+`.with_agent_resolver(...)` to receive an `AgentQuery`: child prompt, ordered effective tool specs,
 grouping mode, and nested subagent configuration. It contains **no parent prompt,
 branch/invocation ID, tool-call ID, or environment membership**. The caller returns
 a chosen `AgentDescriptor`, or None for a miss (Rust wraps this in `Result`).
@@ -128,10 +128,11 @@ callers, an exactly matching `ToolSpec` is accepted as a redundant advertisement
 of a reserved subagent, not as another executor. Serial drivers register **all**
 subagent entries and reject actual callable/subagent name collisions even when
 specs match. Subagent specs are automatically advertised, so callers need not
-repeat them. Without a resolver, legacy definitions lacking their own contract
-retain parent-owned recording behavior. With an agent resolver, all registered
-definitions must supply explicit independent child contracts; no parent contract
-is guessed. A tool definition is not the persisted child agent itself.
+repeat them. A recorded parent or resolver enables child recording. Without either,
+Python `SubagentTool(recording=True, ...)` or Rust `SubagentTool::with_recording()`
+optionally enables standalone child recording. This is only a switch, never a
+lookup key or structural compatibility field. A resolver does not enable recording
+of a fresh root. A tool definition is not the persisted child agent itself.
 
 Each definition may declare its own child `subagents` allowlist. Empty means leaf;
 None preserves legacy **self** recursion, never all parent siblings. At each spawn,
@@ -156,17 +157,18 @@ invalidation/scheduling is included.
 
 ### Compatibility and ownership
 
-Replay requires an explicit, non-empty caller-managed **contract version**. The
-core rejects a changed contract, unequal prompt, changed ordered tool specs, or
-a switch between default and custom grouping, or changed subagent registration,
-contract version, nesting allowlist or depth.
-Child prompt/spec contracts are checked when the child is entered. The caller
-must also change the contract when tool implementation **semantics**, subagent
-prompt/spec-building callbacks, grouping semantics, provider
-settings, or adapter behavior change: these cannot be inferred from closures or
-specs. A revised document bundle, dataset release, or repository commit is an
-environment change, not a tool semantic change. Custom grouping must be pure, deterministic, and use stable equality/
-hashing. It deliberately permits lossy reuse. Never use environment IDs in the
+There is no manual contract/version key. The core rejects unequal prompts, changed
+ordered tool specs, a switch between default and custom grouping, or changed
+subagent registration, nesting allowlist or depth. Child prompts/specs are checked
+when entered, including the actual outputs of prompt/spec-building callbacks.
+Pure tools are re-executed: changing their implementation either changes the
+observations (branch at divergence) or does not (reuse). No manual bump is needed.
+Provider/adapter settings and the semantics of custom grouping are external policy,
+not inferred from closures or specs. Callers choose compatible snapshots and isolate
+external caches when those policies require different reasoning; the core adds no
+namespace/version field. Independent child queries depend on child structural
+configuration, never parent identity. Custom grouping must be pure, deterministic,
+and use stable equality/hashing. It deliberately permits lossy reuse. Never use environment IDs in the
 model-visible prompt, arguments, schemas or tool responses.
 
 **Payload ownership is part of the API contract.** Python borrows payloads,
@@ -357,8 +359,8 @@ call factories again after a failure. Callbacks must not mutate borrowed payload
 Recording/replay still explicitly rejects **budgets**: a synthetic exhaustion
 answer must not silently become reusable reasoning. Non-recording budgets work
 as before. Root agent recording/replay is enabled on direct `BatchLoop`. Serial
-convenience drivers also expose child-agent updates when child contracts enable
-recording; resolver-driven serving uses the direct loop.
+convenience drivers also expose child-agent updates when the child recording switch
+is enabled; resolver-driven serving uses the direct loop.
 Partial tool collections and request queues are builders, not persisted state;
 replay restarts tools, including child tools. This is **not crash recovery**.
 Validation errors (wrong kind, duplicate call IDs, invalid environment result
@@ -405,9 +407,10 @@ See the [Python API/example](../python/README.md#recording-and-replay) and
   `Asset` is an inspection-only, path-backed leaf view, not `EnvClass` or its value.
   Current values are terminal assistant replies, not result-tool arguments. There
   are no public asset/session/endpoint shortcuts for replay or feedback.
-- Persisted record tags/fields retain their previous names (including `history`
-  and `history_contract`). This naming change adds aliases/views, not a second
-  model or a wire-schema migration; see [the mapping and fixture tests](agent-assets.md#persistence-no-schema-migration-for-this-rename).
+- Persisted record tags and provenance `history` fields retain their names.
+  Manual `contract`/`history_contract` fields are removed: old pickle labels and
+  self-describing Serde fields are ignored, never used in matching. New writes omit
+  them. See [API/schema migration and unchanged fixtures](agent-assets.md#persistence-and-contract-removal).
 - Dependency-DAG scheduling and push updates remain future work
   ([issue #1](https://github.com/kaeluka/lockstep-loop/issues/1)). Updated child
   histories do not automatically revise completed parents.

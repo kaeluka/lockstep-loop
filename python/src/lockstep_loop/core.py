@@ -10,8 +10,8 @@ environments, sharing LLM work while observation paths remain equivalent:
 3. Tool results are compared and the class is refined: one sub-conversation
    per distinct result.  Branches then continue independently.
 4. The process repeats per branch until the loop finishes. With recording,
-   the immutable Agent includes prompt, contract, and accumulated conversation
-   trie; its Asset views expose leaf investigations and their complete paths.
+   the immutable Agent includes prompt, structural configuration, and accumulated
+   conversation trie; its Asset views expose leaf investigations and their complete paths.
    EnvClass and SplitNode remain partition-only summaries, not assets or agents.
 
 LLM work is shared by observation path; tools still execute per environment.
@@ -239,32 +239,22 @@ class SubagentTool(Generic[P]):
     """Spec provider for the child loop's tools (one env id -> all specs)."""
     max_depth: int = 1
     """Total spawn depth below this call site; nested definitions are clamped to the remainder."""
-    history_contract: str | None = None
-    """Explicit independent child contract. Required when using a history_resolver."""
+    recording: bool = False
+    """Record children even without a recorded parent or resolver; not a cache key."""
     subagents: tuple[SubagentTool[P], ...] | None = None
     """Child allowlist. None preserves bounded self-recursion; () makes this a leaf."""
-
-    @property
-    def agent_contract(self) -> str | None:
-        """Child agent's compatibility version, not an agent or asset ID."""
-        return self.history_contract
-
-    def with_agent_contract(self, contract: str) -> SubagentTool[P]:
-        """Return this definition with a child-agent contract (legacy field: history_contract)."""
-        return replace(self, history_contract=contract)
 
 
 def _subagent_contract(sub: SubagentTool[P]) -> SubagentContract:
     return SubagentContract(
         ToolSpec(sub.name, sub.description, sub.parameters),
         sub.max_depth,
-        sub.history_contract,
         None if sub.subagents is None else tuple(_subagent_contract(s) for s in sub.subagents),
     )
 
 
 def _registration(
-    specs: Sequence[ToolSpec], definitions: Sequence[SubagentTool[P]], *, independent: bool
+    specs: Sequence[ToolSpec], definitions: Sequence[SubagentTool[P]]
 ) -> tuple[tuple[ToolSpec, ...], dict[str, SubagentTool[P]], tuple[SubagentContract, ...]]:
     advertised = list(specs)
     by_name: dict[str, ToolSpec] = {}
@@ -278,10 +268,6 @@ def _registration(
             raise ValueError(f"duplicate subagent name {sub.name!r}")
         if sub.max_depth < 1:
             raise ValueError("subagent.max_depth must be >= 1")
-        if sub.history_contract == "" or (independent and sub.history_contract is None):
-            raise ValueError(
-                "child history_contract must be non-empty and is required with history_resolver"
-            )
         spec = ToolSpec(sub.name, sub.description, sub.parameters)
         if sub.name in by_name:
             if by_name[sub.name] != spec:
@@ -546,6 +532,11 @@ class BatchLoop(Generic[P]):
     their raw payloads differ (the conversation then records a
     representative's payload).
 
+    Recording: fresh roots opt in with ``recording=True``; supplying an ``Agent``
+    implies replay and recording. A recorded parent or resolver records children;
+    otherwise a child definition's ``recording=True`` is an optional switch, not
+    part of cache identity. External provider/grouping policy is caller-owned.
+
     Invariants:
         * No token is generated twice for environments that remain in the
           same equivalence class.
@@ -563,11 +554,10 @@ class BatchLoop(Generic[P]):
         history_resolver: AgentResolver[P] | None = None,
         group_by: Callable[[P], Hashable] | None = None,
         budget: Budget | None = None,
-        history_contract: str | None = None,
+        recording: bool = False,
         history: Agent[P] | None = None,
         record_store: RecordStore[P] | None = None,
         agent: Agent[P] | None = None,
-        agent_contract: str | None = None,
         agent_resolver: AgentResolver[P] | None = None,
         feedback: Feedback[P] | None = None,
         _id_prefix: str = "",
@@ -575,16 +565,12 @@ class BatchLoop(Generic[P]):
         _defer_failure: bool = False,
         _unavailable_subagents: frozenset[str] = frozenset(),
     ) -> None:
-        # Aliases converge immediately to one state/contract/resolver. Never guess
+        # Aliases converge immediately to one state/resolver. Never guess
         # between two supplied snapshots or maintain parallel representations.
         if agent is not None:
             if history is not None:
                 raise ValueError("use agent or history, not both")
             history = agent
-        if agent_contract is not None:
-            if history_contract is not None:
-                raise ValueError("use agent_contract or history_contract, not both")
-            history_contract = agent_contract
         if agent_resolver is not None:
             if history_resolver is not None:
                 raise ValueError("use agent_resolver or history_resolver, not both")
@@ -601,47 +587,37 @@ class BatchLoop(Generic[P]):
         definitions = (
             tuple(subagents) if subagents is not None else ((subagent,) if subagent else ())
         )
-        self._specs, self._subagents, sub_contracts = _registration(
-            tool_specs, definitions, independent=history_resolver is not None
-        )
+        self._specs, self._subagents, sub_contracts = _registration(tool_specs, definitions)
         self._history_resolver = history_resolver
         self._unavailable_subagents = _unavailable_subagents - self._subagents.keys()
-        independent = history_resolver is not None or any(
-            s.history_contract is not None for s in definitions
-        )
+        independent = history_resolver is not None or any(s.recording for s in definitions)
         if independent and budget is not None:
             raise ValueError("recorded child histories do not support budgets")
         if feedback is not None and not isinstance(feedback, Feedback):
             raise TypeError("feedback must be Feedback(content), or None for no intervention")
         if feedback is not None and (history is None or len(envs) != 1):
             raise ValueError("feedback requires a supplied history and exactly one environment")
-        if history is not None and history_contract is None:
-            raise ValueError("replay requires an explicit history_contract")
         if history is not None and "subagents" not in vars(history.descriptor):
             # Old pickles bypass __init__: do not let the new empty-tuple class
             # default silently erase their former singular registration.
             raise ValueError("migrate legacy history descriptor from subagent to subagents")
-        if history_contract is not None:
-            if not history_contract:
-                raise ValueError("history_contract must be non-empty")
+        if recording or history is not None:
             if budget is not None:
                 raise ValueError("recorded history does not yet support budgets")
             if history is not None and (
-                history.contract != history_contract
-                or history.descriptor.prompt != prompt
+                history.descriptor.prompt != prompt
                 or history.descriptor.tools != self._specs
                 or history.descriptor.custom_grouping != (group_by is not None)
                 or history.descriptor.subagents != sub_contracts
             ):
                 raise ValueError(
-                    "incompatible history contract, prompt, tools, grouping "
+                    "incompatible history prompt, tools, grouping "
                     "or subagent configuration"
                 )
             if history is None:
                 store = record_store if record_store is not None else RecordStore[P]()
                 history = Agent(
                     AgentDescriptor(
-                        history_contract,
                         prompt,
                         self._specs,
                         group_by is not None,
@@ -1180,12 +1156,9 @@ class BatchLoop(Generic[P]):
         child_specs, _, child_contracts = _registration(
             tuple(s for s in sub.sub_tool_specs(branch.env_ids[0]) if s.name not in unavailable),
             nested,
-            independent=self._history_resolver is not None,
         )
-        contract = (
-            sub.history_contract
-            if sub.history_contract is not None
-            else (self._recorded.contract if self._recorded else None)
+        recording = (
+            sub.recording or self._recorded is not None or self._history_resolver is not None
         )
         previous = None
         prior_runs: tuple[ChildAgentRun[P], ...] = ()
@@ -1200,9 +1173,9 @@ class BatchLoop(Generic[P]):
         if self._resolve_only and previous is None:
             return FeedbackResolutionError("no recorded subagent conversation")
         if previous is None and self._history_resolver is not None:
-            assert contract is not None and self._record_store is not None
+            assert self._record_store is not None
             selected = self._history_resolver(
-                AgentQuery(contract, prompt, child_specs, self._custom_grouping, child_contracts)
+                AgentQuery(prompt, child_specs, self._custom_grouping, child_contracts)
             )
             if selected is not None:
                 if not isinstance(selected, AgentDescriptor):
@@ -1218,7 +1191,7 @@ class BatchLoop(Generic[P]):
             history_resolver=self._history_resolver,
             group_by=self._group_by if self._custom_grouping else None,
             budget=self._budget,
-            history_contract=contract,
+            recording=recording,
             history=previous,
             record_store=self._record_store,
             _id_prefix=f"{self._id_prefix}{child_key}",

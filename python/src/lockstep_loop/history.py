@@ -57,48 +57,60 @@ class UserContinuation(Generic[P]):
 
 @dataclass(frozen=True)
 class SubagentContract:
+    """Structural subagent configuration; legacy class name, no caller version key."""
+
     spec: ToolSpec
     max_depth: int
-    history_contract: str | None = None
     # None preserves bounded self-recursion; a tuple is an explicit child allowlist.
     subagents: tuple[SubagentContract, ...] | None = None
 
-    @property
-    def agent_contract(self) -> str | None:
-        """Domain spelling; the persisted field stays history_contract."""
-        return self.history_contract
+    def __setstate__(self, state: dict[str, object]) -> None:
+        # Old pickle labels are metadata, never structural identity.
+        for name, value in state.items():
+            if name != "history_contract":
+                object.__setattr__(self, name, value)
 
 
 @dataclass(frozen=True)
 class HistoryQuery(Generic[P]):
-    """AgentQuery compatibility header; legacy class path retained for persisted codecs."""
+    """Child structural configuration, independent of parent/invocation identity.
 
-    contract: str
+    External provider/grouping policy isolation is caller-owned. The legacy class
+    path is retained for persisted codecs; old pickle contract labels are ignored.
+    """
+
     prompt: P
     tools: tuple[ToolSpec, ...]
     custom_grouping: bool
     subagents: tuple[SubagentContract, ...] = ()
 
+    def __setstate__(self, state: dict[str, object]) -> None:
+        for name, value in state.items():
+            if name != "contract":
+                object.__setattr__(self, name, value)
+
 
 @dataclass(frozen=True)
 class HistoryDescriptor(Generic[P]):
-    """AgentDescriptor persistence envelope; legacy pickle name and fields are stable.
+    """AgentDescriptor persistence envelope; legacy pickle class name is retained.
 
     Serialize this AND each new shallow record; a descriptor needs a RecordStore
     to inspect its full agent. AgentDescriptor is an alias, not another model.
     """
 
-    contract: str
     prompt: P
     tools: tuple[ToolSpec, ...]
     custom_grouping: bool
     root: NodeRef
     subagents: tuple[SubagentContract, ...] = ()
 
+    def __setstate__(self, state: dict[str, object]) -> None:
+        for name, value in state.items():
+            if name != "contract":
+                object.__setattr__(self, name, value)
+
     def query(self) -> AgentQuery[P]:
-        return AgentQuery(
-            self.contract, self.prompt, self.tools, self.custom_grouping, self.subagents
-        )
+        return AgentQuery(self.prompt, self.tools, self.custom_grouping, self.subagents)
 
     @property
     def subagent(self) -> SubagentContract | None:
@@ -215,7 +227,7 @@ class RecordStore(Generic[P]):
 
 @dataclass(frozen=True)
 class Agent(Generic[P]):
-    """Complete immutable agent: initial prompt, contract and accumulated trie.
+    """Complete immutable agent: initial prompt, structural configuration and accumulated trie.
 
     The descriptor selects a snapshot; the store resolves its immutable records.
     This is neither a tool definition nor a running BatchLoop. History is the
@@ -232,10 +244,6 @@ class Agent(Generic[P]):
     @property
     def prompt(self) -> P:
         return self.descriptor.prompt
-
-    @property
-    def contract(self) -> str:
-        return self.descriptor.contract
 
     def load(self, ref: NodeRef) -> HistoryNode[P]:
         return self.store.load(ref)
@@ -425,8 +433,8 @@ class Asset(Generic[P]):
         return tuple(dict.fromkeys((*evidence, *(e for group in reversed(visits) for e in group))))
 
 
-# One implementation/model. Persisted class names and fields deliberately retain
-# their historical spellings, so existing pickle and custom codec tags stay valid.
+# One implementation/model. Legacy class names remain valid pickle/codec tags.
+# Deprecated contract labels are discarded on pickle load.
 History = Agent
 AgentDescriptor = HistoryDescriptor
 AgentQuery = HistoryQuery

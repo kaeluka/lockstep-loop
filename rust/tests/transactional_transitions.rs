@@ -64,9 +64,9 @@ fn config(
 ) -> LoopConfig<String> {
     let config = LoopConfig::new("parent".into(), vec![env.into()], specs()).with_subagent(sub);
     if let Some(history) = history {
-        config.with_replay(history, "prepare/v1")
+        config.with_replay(history)
     } else if recording {
-        config.with_recording("prepare/v1")
+        config.with_recording()
     } else {
         config
     }

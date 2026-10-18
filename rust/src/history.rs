@@ -44,20 +44,20 @@ pub struct UserContinuation<P> {
     pub resolved_env_id: Option<String>,
 }
 
+/// Structural subagent configuration; legacy type name, no caller version key.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SubagentContract {
     pub spec: ToolSpec,
     pub max_depth: usize,
-    pub history_contract: Option<String>,
     /// None means bounded self-recursion; Some is the explicit child allowlist.
     pub subagents: Option<Vec<SubagentContract>>,
 }
 
-/// AgentQuery: exact child compatibility header, without invocation/environment IDs.
-/// The legacy struct name is retained for persistence codecs.
+/// AgentQuery: child structural configuration, without parent/invocation/environment IDs.
+/// External provider/grouping policy isolation is caller-owned. The legacy struct
+/// name is retained; self-describing Serde ignores old contract labels.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HistoryQuery<P> {
-    pub contract: String,
     pub prompt: P,
     pub tools: Vec<ToolSpec>,
     pub custom_grouping: bool,
@@ -100,10 +100,9 @@ impl<P> fmt::Debug for HistoryResolver<P> {
 }
 
 /// AgentDescriptor: small persistence envelope; publish AFTER its referenced records.
-/// The legacy struct name and fields stay stable for Serde/custom codecs.
+/// Legacy struct name retained; self-describing Serde ignores old contract labels.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HistoryDescriptor<P> {
-    pub contract: String,
     pub prompt: P,
     pub tools: Vec<ToolSpec>,
     pub custom_grouping: bool,
@@ -273,7 +272,7 @@ impl<P> RecordStore<P> {
     }
 }
 
-/// Complete immutable agent: initial prompt, contract and accumulated trie.
+/// Complete immutable agent: prompt, structural configuration and accumulated trie.
 /// This is not a tool definition or a running BatchLoop. Persist its descriptor
 /// and records, not a live resolver or asset view. History is a compatibility alias.
 #[derive(Clone, Debug)]
@@ -295,9 +294,6 @@ pub(crate) enum PathStep {
 impl<P> Agent<P> {
     pub fn prompt(&self) -> &P {
         &self.descriptor.prompt
-    }
-    pub fn contract(&self) -> &str {
-        &self.descriptor.contract
     }
     pub fn root(&self) -> Arc<HistoryNode<P>> {
         self.load(&self.descriptor.root)
@@ -329,7 +325,6 @@ impl<P> Agent<P> {
 impl<P: Clone> HistoryDescriptor<P> {
     pub fn query(&self) -> AgentQuery<P> {
         AgentQuery {
-            contract: self.contract.clone(),
             prompt: self.prompt.clone(),
             tools: self.tools.clone(),
             custom_grouping: self.custom_grouping,
@@ -373,18 +368,11 @@ impl<P: Clone> Agent<P> {
 /// AgentOptions: recording/replay configuration, not a second agent snapshot model.
 #[derive(Clone, Debug)]
 pub struct HistoryOptions<P> {
-    pub contract: String,
     pub previous: Option<Agent<P>>,
     pub store: Option<RecordStore<P>>,
     pub(crate) prompt_eq: Option<fn(&P, &P) -> bool>,
 }
 
-impl SubagentContract {
-    /// Domain spelling; the persisted field remains history_contract.
-    pub fn agent_contract(&self) -> Option<&str> {
-        self.history_contract.as_deref()
-    }
-}
 impl<P> SubagentHistory<P> {
     pub fn agent_descriptor(&self) -> &AgentDescriptor<P> {
         &self.history
@@ -578,7 +566,7 @@ impl<P: Clone> Asset<'_, P> {
     }
 }
 
-// One model. Record type/field names remain unchanged for Serde/custom codecs.
+// One model. Legacy type names retained; manual contract fields removed.
 // These aliases are the preferred domain vocabulary, not duplicate wrappers.
 pub use Agent as History;
 pub use ChildHistoryRun as ChildAgentRun;

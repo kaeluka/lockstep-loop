@@ -27,7 +27,7 @@ SCHEMA = {
 }
 
 
-def definition(name="list_imports", kind="imports", contract="imports/v1"):
+def definition(name="list_imports", kind="imports"):
     def prompt(args):
         if set(args) != {"file_path"} or not isinstance(args["file_path"], str):
             raise ValueError("expected exactly one string file_path")
@@ -39,13 +39,12 @@ def definition(name="list_imports", kind="imports", contract="imports/v1"):
         SCHEMA,
         prompt,
         lambda _: (READ,),
-        history_contract=contract,
         subagents=(),
     )
 
 
 def definitions():
-    return (definition(), definition("count_lines", "metrics", "metrics/v1"))
+    return (definition(), definition("count_lines", "metrics"))
 
 
 def calls(path="foo.py"):
@@ -72,7 +71,7 @@ def make(
         env_ids=envs,
         tool_specs=(STATUS,),
         subagents=definitions() if registered is None else registered,
-        history_contract=f"{prompt}/v1" if recording else None,
+        recording=recording,
         history=history,
         history_resolver=resolver,
         record_store=store,
@@ -157,7 +156,7 @@ def test_multiple_tools_changed_parent_reuses_independent_children_and_persists_
     assert old.results == {"old": "imports:done|metrics:done|ok"}
     backend, selected = {}, {}
     for update in old.child_histories:
-        selected[(update.history.contract, update.history.descriptor.prompt)] = publish(
+        selected[update.history.descriptor.prompt] = publish(
             update.history, backend
         )
         assert update.base is None and update.env_ids == ("old",)
@@ -167,7 +166,7 @@ def test_multiple_tools_changed_parent_reuses_independent_children_and_persists_
     def resolve(query):
         lookups.append(query)
         assert not hasattr(query, "env_ids") and not hasattr(query, "branch_id")
-        return selected.get((query.contract, query.prompt))
+        return selected.get(query.prompt)
 
     loaded = []
 
@@ -189,7 +188,7 @@ def test_multiple_tools_changed_parent_reuses_independent_children_and_persists_
     assert second.results["tomorrow"] == old.results["old"]
     assert len(second.child_histories) == 2
     for update in second.child_histories:
-        key = (update.history.contract, update.history.descriptor.prompt)
+        key = update.history.descriptor.prompt
         assert update.base == selected[key]
         assert update.history.descriptor.root != update.base.root
         assert update.tool_call.id.startswith("opaque/")
@@ -229,7 +228,7 @@ def test_changed_file_and_changed_observation_branch_without_parent_splits():
         queries.append(query)
         return (
             descriptor
-            if (query.prompt, query.contract) == (descriptor.prompt, descriptor.contract)
+            if query == descriptor.query()
             else None
         )
 
@@ -261,27 +260,26 @@ def test_changed_file_and_changed_observation_branch_without_parent_splits():
         assert update.base is None
         assert update.history.descriptor.prompt == f"imports:{path}"
         assert all(r.tool_call.args["path"] == path for r in tools)
-    new_definition = replace(definition(), history_contract="imports/v2")
+    new_definition = replace(definition(), build_prompt=lambda a: f"imports:{a['file_path']}")
     versioned, _, _ = drive(
         make(
-            "parent-new-contract",
+            "parent-new-implementation",
             registered=(new_definition,),
             resolver=resolve,
             store=loader(backend),
         ),
         {"old": "same"},
         (calls()[0],),
-        expect_child_llms=3,
+        expect_child_llms=0,
     )
-    assert versioned.child_histories[0].base is None
-    assert versioned.child_histories[0].history.contract == "imports/v2"
+    assert versioned.child_histories[0].base == descriptor
 
 
 def test_concurrent_cache_hits_are_independent_roots_not_single_flight_or_last_writer():
     old, _, _ = drive(make(), {"old": "same"})
     base = old.child_histories[0].history
     # Completion ordering puts metrics first in this driver's update list.
-    name = "count_lines" if base.contract == "metrics/v1" else "list_imports"
+    name = "count_lines" if base.prompt.startswith("metrics:") else "list_imports"
     backend = {}
     descriptor = publish(base, backend)
     invocations = (
@@ -368,7 +366,7 @@ def test_resolver_compatibility_failures_and_argument_errors_are_transactional()
     assert legacy_loop.outstanding_llm == 1 and legacy_loop.history.root.assistant is None
     for bad in (
         replace(descriptor, prompt="other prompt"),
-        replace(descriptor, contract="v2"),
+        replace(descriptor, subagents=(old.history.descriptor.subagents[0],)),
         replace(descriptor, tools=()),
         replace(descriptor, custom_grouping=True),
     ):
@@ -417,7 +415,7 @@ def test_resolver_failure_after_a_prepared_hit_keeps_the_whole_turn_pending():
 
     def resolve(query):
         queried.append(query.prompt)
-        if query.contract == "imports/v1":
+        if query.prompt.startswith("imports:"):
             return descriptor
         if broken:
             raise OSError("cache unavailable")
@@ -454,8 +452,7 @@ def test_registration_rules_legacy_advertisements_and_serial_driver():
         )
     with pytest.raises(ValueError, match="duplicate tool"):
         BatchLoop(prompt="p", env_ids=["e"], tool_specs=[READ, READ])
-    with pytest.raises(ValueError, match="history_contract"):
-        make(registered=(replace(imports, history_contract=None),), resolver=lambda _: None)
+    assert make(registered=(imports,), resolver=lambda _: None).agent is not None
     with pytest.raises(ValueError, match="budget"):
         make(resolver=lambda _: None, budget=Budget(100))
     legacy = BatchLoop(
@@ -478,7 +475,9 @@ def test_registration_rules_legacy_advertisements_and_serial_driver():
     result = run_to_completion(
         prompt="parent-driver",
         env_ids=["e"],
-        tools=lambda _: [imports, metrics, Local()],
+        tools=lambda _: [
+            replace(imports, recording=True), replace(metrics, recording=True), Local()
+        ],
         complete_llm=lambda r: model(r, calls()[:2]),
     )
     assert result.results == {"e": "imports:done|metrics:done"}
@@ -510,9 +509,9 @@ def test_registration_rules_legacy_advertisements_and_serial_driver():
 
 
 def test_nested_allowlists_and_ancestor_depth_cap_do_not_leak_reserved_tools():
-    leaf = replace(definition("leaf", "leaf", "leaf/v1"), max_depth=99)
+    leaf = replace(definition("leaf", "leaf"), max_depth=99)
     middle = replace(
-        definition("middle", "middle", "middle/v1"),
+        definition("middle", "middle"),
         max_depth=99,
         subagents=(leaf,),
         sub_tool_specs=lambda _: (READ, ToolSpec("outer", "", {})),
@@ -524,10 +523,9 @@ def test_nested_allowlists_and_ancestor_depth_cap_do_not_leak_reserved_tools():
         lambda a: "outer:" + a["file_path"],
         lambda _: (READ, ToolSpec("sibling", "", {})),
         max_depth=2,
-        history_contract="outer/v1",
         subagents=(middle,),
     )
-    sibling = definition("sibling", "sibling", "sibling/v1")
+    sibling = definition("sibling", "sibling")
     loop = make(registered=(outer, sibling))
     root = loop.next_request()
     loop.complete(
@@ -572,7 +570,6 @@ def test_caller_selected_child_feedback_revision_does_not_rewrite_old_parent():
         prompt=child.descriptor.prompt,
         env_ids=["old"],
         tool_specs=child.descriptor.tools,
-        history_contract=child.contract,
         history=child,
         feedback=Feedback("Also inspect the header"),
     )
@@ -639,7 +636,7 @@ def test_opaque_prompts_and_hash_collisions_are_verified_by_value():
         {},
         lambda a: Blob(a["value"]),
         lambda _: (),
-        history_contract="opaque/v1",
+        recording=True,
         subagents=(),
     )
 

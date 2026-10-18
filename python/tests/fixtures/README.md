@@ -10,7 +10,10 @@ It contains a descriptor/query and five individually addressed records: a lossy
 multi-tool observation (A and B have distinct actual outputs), a prior answer,
 user feedback, a new answer, and old/new child revisions with provenance. The
 Agent/Asset tests load it, inspect contextual assets, replay it with the new API,
-and assert stable legacy wire globals/field names and record values. Pickle memo
-layout can differ with string interning; byte identity is not a format guarantee.
+and assert stable legacy class globals and evidence values. Contract removal tests
+also import different legacy labels and verify structural cache matching. Old
+`contract`/`history_contract` metadata is discarded during unpickling and omitted
+on new writes; the fixture binary is unchanged. Pickle memo layout can also differ
+with string interning; byte/schema identity with old output is not promised.
 It is not a pickled executor, live store, or independently persisted asset. The Rust fixture uses the same record shape
 with string payloads and the pre-rename Rust Serde codec.

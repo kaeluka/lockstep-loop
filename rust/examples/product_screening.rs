@@ -12,7 +12,6 @@ use std::collections::BTreeMap;
 const PROMPT: &str = "Check this sensor against our toy outdoor requirements: enclosure rating \
     IP65 or IP67, and an operating range covering -10 to 40 degrees Celsius. \
     Read the ratings before concluding.";
-const CONTRACT: &str = "product-screening/v1/ratings-v1/exact-grouping/scripted-model-v1";
 
 fn ratings(enclosure: &str, min_c: i64, max_c: i64) -> String {
     // Full relevant evidence in a stable representation, not an output hash.
@@ -59,9 +58,9 @@ fn screen(
         )],
     );
     config = if let Some(previous) = agent {
-        config.with_agent(previous, CONTRACT)
+        config.with_agent(previous)
     } else {
-        config.with_recording(CONTRACT)
+        config.with_recording()
     };
     // Default record namespaces suffice for this single-process, in-memory demo.
     // Durable callers reserve namespaces and persist records as in history_replay.rs.

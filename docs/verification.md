@@ -11,7 +11,7 @@ are caller-defined environments—not built-in integrations. The
 
 The documentation preserves these boundaries:
 
-- An `Agent` contains its prompt, compatible execution contract, and recorded trie.
+- An `Agent` contains its prompt, structural configuration, and recorded trie.
   An `Asset` is a read-only leaf view backed by its path, not merely its value.
 - Sharing follows equal observed outputs, not topical similarity or equivalent
   outcomes. Tools still run per environment; split classes do not remerge.
@@ -35,12 +35,13 @@ The documentation preserves these boundaries:
 | Feedback resolution and shared-path inheritance | [Python feedback](../python/tests/test_feedback.py), [Rust feedback](../rust/tests/feedback.rs) |
 | Specialized registries, independent children, pinned revisions, concurrent updates | [Python specialists](../python/tests/test_specialized_subagents.py), [Rust specialists](../rust/tests/specialized_subagents.rs) |
 | Completion recovery and serving costs | [Python transactions](../python/tests/test_transactional_transitions.py), [cost guards](../python/tests/test_transition_cost.py), [Rust transactions](../rust/tests/transactional_transitions.rs) |
-| Naming aliases preserve old persisted records | [Pickle fixture](../python/tests/fixtures/README.md), [Serde fixture](../rust/tests/fixtures/README.md), both asset suites |
+| Naming aliases and legacy contract imports preserve full evidence | [Pickle fixture](../python/tests/fixtures/README.md), [Serde fixture](../rust/tests/fixtures/README.md), both asset suites |
+| No keys needed; implementation changes reuse or branch; external policy is caller-owned | [Python structural reuse](../python/tests/test_structural_reuse.py), [Rust structural reuse](../rust/tests/structural_reuse.rs), specialist suites |
 
-## Checks for the domain-neutral documentation rewrite
+## Checks for contract removal
 
-- Python: **96 tests**, strict mypy on the core and new product example, Ruff lint.
-- Rust: **61 integration tests**, Clippy with warnings denied, formatting checks.
+- Python: **100 tests**, strict mypy on the core, Ruff lint.
+- Rust: **65 integration tests**, Clippy with warnings denied, formatting checks.
 - All **ten provider-free examples**: `product_screening`, `agent_assets`,
   `history_replay`, `feedback`, and `specialized_subagents` in both languages.
 - The new product examples assert **3 LLM calls for 3 initial products in 2
@@ -48,15 +49,16 @@ The documentation preserves these boundaries:
   changed ratings**. They count tool executions separately and verify old assets
   survive extension. Their assessment rules and model replies are toy fixtures.
 - Relative Markdown links and heading anchors; `git diff --check`.
-- All four editable diagrams were relabeled for varied domains, rendered to SVG
-  and PNG from saved sources, and visually inspected for clipping, overlaps,
-  arrow routing, and consistency with their surrounding text. No public upload
-  or shared-canvas mutation was needed.
+- The agent diagram now says tool configuration, not reuse contract; source and
+  previews are kept in sync. No public upload or shared-canvas mutation is needed.
 
-The existing file-inspection demos are retained as protocol examples, not treated
-as the library's only application. No core behavior or persistence format changed
-in this documentation rewrite. The earlier Agent/Asset naming migration likewise
-preserves the record schema described in [the compatibility guide](agent-assets.md).
+The file-inspection demos remain protocol examples, not the library's only
+application. Contract removal changes the source API and omits old labels from
+new wire output. Unchanged legacy fixtures still load and replay; see
+[API/schema compatibility and limitations](agent-assets.md#persistence-and-contract-removal).
+Transactional preparation, full opaque records, immutable snapshots, feedback,
+asset views, request routing, arbitrary completion order and structural cost guards
+remain covered by their existing suites.
 
 ## What fixture tests do not establish
 
