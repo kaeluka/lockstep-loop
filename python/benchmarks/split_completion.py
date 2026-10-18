@@ -2,7 +2,7 @@
 
 From python/: PYTHONPATH=src python benchmarks/split_completion.py --repeats 3
 Timing includes construction, fan-out, and the plain done/pull/complete loop;
-result validation is outside the timed region. Includes AgentSnapshot snapshot; no subagents.
+result validation is outside the timed region. Includes history recording; no subagents.
 """
 
 import argparse

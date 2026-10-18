@@ -1,4 +1,4 @@
-//! Immutable AgentSnapshot snapshots, contextual Asset views, and shallow snapshot records.
+//! Immutable AgentSnapshot values, contextual Asset views, and shallow history records.
 //! Payload clones must have immutable value semantics. No core storage I/O.
 
 use crate::{LoopError, Message, Role, ToolCall, ToolSpec};
@@ -394,7 +394,7 @@ impl<P> Clone for AssetStep<P> {
 }
 
 /// Read-only leaf investigation, in its snapshot/path context. No IDs, serialization
-/// or resume operation: feedback still resolves snapshot snapshot + environment.
+/// or resume operation: feedback still requires a snapshot and environment replay.
 /// Asset equality is not defined by the published value.
 pub struct Asset<'a, P> {
     snapshot: &'a AgentSnapshot<P>,

@@ -1,4 +1,4 @@
-"""Immutable AgentSnapshot snapshots, contextual Asset views, and shallow snapshot records.
+"""Immutable AgentSnapshot values, contextual Asset views, and shallow history records.
 
 Payloads, schemas and arguments are borrowed immutable values. NodeRef is a
 storage address, never a public conversation/session identity. No core I/O.
@@ -303,11 +303,11 @@ class _AssetStep(Generic[P]):
 
 @dataclass(frozen=True, eq=False, init=False)
 class Asset(Generic[P]):
-    """Read-only leaf investigation in one AgentSnapshot snapshot, backed by its path.
+    """Read-only leaf investigation in one AgentSnapshot, backed by its path.
 
     Values do not identify assets. An open continuation may retain an earlier
     published message, or have no value yet. No ID, persistence or resume API is
-    provided: feedback still requires snapshot snapshot + environment replay.
+    provided: feedback still requires a snapshot and environment replay.
     """
 
     snapshot: AgentSnapshot[P] = field(repr=False)
