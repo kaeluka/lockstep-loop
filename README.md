@@ -79,7 +79,11 @@ Recording is unconditional, including children. Start with `Agent`, drive
 `agent.start(environments)`, and save `agent.snapshot()`. Restore with
 `Agent.from_snapshot(snapshot, ...runtime callbacks...)`, without repeating prompt
 or tool specs. Successful completion automatically advances the handle exactly once.
-Persist snapshot descriptors and full records with your own codecs and storage. No manual
+Python supports `pickle.dump(agent.snapshot(), file)` and restoring the loaded
+snapshot directly; only load trusted pickle data. Export eagerly includes all
+reachable history and requires pickleable payloads, not runtime callbacks. The
+lower-level descriptor/record API remains available for lazy/incremental storage
+and Rust. All persistence I/O stays caller-owned. No manual
 version key is needed: pure tools are rerun, so implementation changes either
 preserve observations (reuse) or change them (branch). The current grouping function
 compares fresh outputs and recorded representatives; default/custom mode and

@@ -66,7 +66,14 @@ The existing final partition trie alone is insufficient for replay.
 
 - The caller chooses storage and payload codecs. Core code performs no filesystem,
   database, or network persistence.
-- Expose the immutable records/root needed to save and restore history.
+- Python AgentSnapshot supports direct trusted pickle save/load as the easy path.
+  Eagerly bundle only the complete reachable graph, including child invocation
+  bases/results, iteratively deduplicated by address. Preserve full pickleable
+  payloads and sharing; exclude locks/loaders/runtime callbacks. Each load gets a
+  fresh writer namespace. Surface missing-record and unpickleable-payload errors.
+- Keep the lower-level immutable descriptor/record API for lazy/incremental
+  persistence in both languages. Decomposition is optional for Python callers;
+  direct pickle is history persistence, never callback persistence/crash recovery.
 - Design references/loading so history can be traversed lazily, loading only a new
   environment's relevant path, without making the caller implement replay logic.
 - Check prompt equality, ordered tool specs and nested subagent specs/allowlists/depth;

@@ -89,8 +89,9 @@ Extending experience creates a **new immutable AgentSnapshot**. Successful runs
 publish automatically, so sequential starts accumulate experience. **Warning:**
 overlapping runs capture independent roots and do not merge; the last completion
 wins. Retain each run's snapshot to preserve independent work. Both paths within
-a snapshot stay reusable; old snapshots stay unchanged. Your application persists descriptors
-and records using its own storage. Changed prompts or tool specs require compatible
+a snapshot stay reusable; old snapshots stay unchanged. Your application can pickle
+Python snapshots directly, or persist descriptors/records for lazy or incremental
+storage. Changed prompts or tool specs require compatible
 history selection or a fresh investigation. Pure tool implementation changes need
 no version bump: tools rerun, matching outputs reuse, different outputs branch.
 External provider and custom grouping policy isolation remains caller-owned;

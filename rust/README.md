@@ -59,7 +59,9 @@ branch at the first unseen tuple, including formerly non-splitting checkpoints.
 Old snapshots stay unchanged. `run.snapshot()` captures validated historical facts,
 not pending requests or in-flight crash recovery.
 
-Caller-owned storage uses shallow records and descriptors:
+Caller-owned Rust storage uses shallow records and descriptors. Python also supports
+self-contained AgentSnapshot pickle transport; this is a Python-only convenience,
+not a new Rust snapshot serialization framework or a cross-language wire format:
 
 ```rust,ignore
 let snapshot = agent.snapshot();

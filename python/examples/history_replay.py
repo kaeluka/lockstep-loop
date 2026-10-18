@@ -1,10 +1,14 @@
-"""Run: PYTHONPATH=src python examples/history_replay.py (from python/)."""
+"""Advanced lazy/incremental persistence with caller-owned descriptors and records.
+
+Run: PYTHONPATH=src python examples/history_replay.py (from python/).
+For the easy self-contained Python pickle path, see snapshot_pickle.py.
+"""
 
 import pickle
 
 from lockstep_loop import (
-    AgentSnapshot,
     Agent,
+    AgentSnapshot,
     LlmCompletion,
     LlmRequest,
     RecordStore,

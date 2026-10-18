@@ -201,12 +201,44 @@ class AgentSnapshot(Generic[P]):
     """Immutable prompt, structural configuration and accumulated conversation trie.
 
     The descriptor selects a root; the store resolves immutable records lazily.
-    Persist the descriptor and records, not mutable Agent/AgentRun handles or views.
+    Pickling bundles the entire reachable history, eagerly loading lazy records.
+    Only load trusted pickle data; all payloads must themselves be pickleable.
+    For lazy/incremental storage, persist the descriptor and shallow records instead.
+    Neither path persists runtime callbacks or pending requests for crash recovery.
     Payloads, arguments and schemas are immutable by caller contract.
     """
 
     descriptor: AgentDescriptor[P]
     store: RecordStore[P] = field(compare=False, repr=False)
+
+    def __reduce__(
+        self,
+    ) -> tuple[
+        Callable[..., AgentSnapshot[P]],
+        tuple[AgentDescriptor[P], dict[NodeRef, HistoryNode[P]]],
+    ]:
+        # Follow addresses, not the store's write set: it can contain unrelated
+        # runs or aborted writes. Shallow records keep pickle's recursion depth
+        # independent of conversation depth; pickle itself preserves payload sharing.
+        records: dict[NodeRef, HistoryNode[P]] = {}
+        pending = [self.descriptor.root]
+        while pending:
+            reference = pending.pop()
+            if reference in records:
+                continue
+            node = self.load(reference)
+            if not isinstance(node, HistoryNode):
+                raise TypeError(f"expected HistoryNode at {reference!r}")
+            records[reference] = node
+            pending.extend(edge.continuation for edge in node.observations)
+            pending.extend(edge.continuation for edge in node.user_continuations)
+            for child in node.subagents:
+                pending.append(child.snapshot.root)
+                for run in child.runs:
+                    pending.append(run.snapshot.root)
+                    if run.base is not None:
+                        pending.append(run.base.root)
+        return _restore_snapshot, (self.descriptor, records)
 
     @property
     def root(self) -> HistoryNode[P]:
@@ -295,6 +327,14 @@ class AgentSnapshot(Generic[P]):
         return replace(self, descriptor=replace(self.descriptor, root=ref))
 
 
+def _restore_snapshot(
+    descriptor: AgentDescriptor[P], records: dict[NodeRef, HistoryNode[P]]
+) -> AgentSnapshot[P]:
+    # Keep original addresses readable, but allocate a fresh writer for each load.
+    # This loader is created locally, never transported from the original store.
+    return AgentSnapshot(descriptor, RecordStore(load=records.__getitem__))
+
+
 @dataclass(frozen=True, eq=False)
 class _AssetStep(Generic[P]):
     node: HistoryNode[P]
@@ -326,7 +366,7 @@ class Asset(Generic[P]):
         return view
 
     def __reduce__(self) -> NoReturn:
-        raise TypeError("persist the snapshot descriptor and records; assets are contextual views")
+        raise TypeError("persist the snapshot; assets are contextual views")
 
     @property
     def node(self) -> HistoryNode[P]:

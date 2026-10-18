@@ -148,9 +148,38 @@ value semantics; shared interior mutability must not change recorded facts.
 The caller owns copying/codecs for provider objects. Key functions must accept
 historical outputs, be deterministic, and use stable equality/hashing.
 
+### Direct Python snapshot pickle
+
+Python supports `pickle.dump(agent.snapshot(), file)` and
+`Agent.from_snapshot(pickle.load(file), ...runtime dependencies...)` directly.
+The bundle is self-contained for the complete reachable history: every observation
+and feedback branch, nested children, and all invocation base/result descriptors.
+An iterative address walk deduplicates shared records without recursively walking
+conversation paths. Full payloads and sharing are preserved; hashes/debug strings
+are not identities. Unrelated runs and orphan writes in a shared store are omitted.
+
+This export **eagerly loads the entire reachable graph** via the existing caller
+loader, not just the last replay path. It never serializes that loader, store locks
+or runtime Agent/AgentRun state. Loading creates a fresh writer namespace while
+keeping original references readable from the bundle, so independently loaded
+forks can extend and coexist. Re-pickling after extension includes both bundled
+and new reachable records, without an external backend. Captured roots and records
+are not mutated; cache warming is allowed. Missing/corrupt-record or payload-pickle
+errors surface rather than producing a partial/lossy bundle.
+
+**Only load trusted pickle data.** Generic payloads, arguments and schemas must be
+pickleable; their own nesting/codec limits still apply. Executable subagent factories,
+resolvers and comparison functions must be reattached as needed. This is history
+persistence, not callback persistence or crash recovery. Caller code owns file I/O
+and atomic publication. See the [Python example](../python/examples/snapshot_pickle.py).
+Rust retains caller-owned descriptor/record Serde transport; no direct snapshot
+serialization framework is added there.
+
 ### Individually addressable records and lazy persistence
 
-The core performs no filesystem, database or network persistence I/O.
+For large, lazy or incremental storage, the existing lower-level API remains
+available in both languages. The core performs no filesystem, database or network
+persistence I/O:
 
 1. Allocate a fresh writer namespace in the caller's storage domain. Exact
    `NodeRef(namespace, index)` addresses are monotonic per writer, not content hashes
@@ -174,7 +203,8 @@ Existing tests round-trip 256 tool turns over two paths with default JSON limits
 then load only the selected 257 nodes. Asset traversal is iterative and does not
 load child tries unless explicitly inspected. Payload codecs still need to support
 the payload's own nesting/size. Rust descriptors/records derive Serde when supported
-by P; Python examples pickle trusted records individually, never live handles.
+by P; the advanced Python example pickles trusted records individually, never live
+handles. This protocol does not eagerly bundle reachable records like direct pickle.
 
 Loaders are synchronous, non-reentrant and expected to resolve valid records.
 Missing/corrupt records and loader failures are infrastructure failures; restart

@@ -59,7 +59,43 @@ Matching observations require zero fresh LLM requests; changed observations bran
 at their first divergence, including formerly non-splitting checkpoints.
 Old snapshots remain unchanged and reusable.
 
-Restore without repeating the prompt or tool specs:
+### Easy persistence: pickle the snapshot
+
+Save and restore the snapshot directly, without repeating prompt/specs or collecting
+records yourself:
+
+```python
+import pickle
+
+with open("agent-snapshot.pickle", "wb") as file:
+    pickle.dump(agent.snapshot(), file)
+with open("agent-snapshot.pickle", "rb") as file:
+    snapshot = pickle.load(file)  # ONLY trusted pickle data
+agent = Agent.from_snapshot(snapshot)
+run = agent.start(["packet-a/v2"])
+```
+
+The pickle is self-contained for the **entire reachable history**, including full
+payloads, every observation branch, feedback and nested child provenance (including
+invocation base/result revisions). Export eagerly loads lazy records through the
+existing caller loader, visits each address once, and omits unrelated runs/orphan
+writes in the same store. It does not add history records or mutate captured roots.
+Each load preserves original references and allocates a fresh unique writer, so
+independent loads can safely extend history. Save/load/extend/save needs no external
+backend or manual merging. Save independent run snapshots separately if needed.
+
+All generic payloads, schemas and arguments must be pickleable; errors propagate
+rather than discarding evidence. **Only load trusted pickle data.** Store locks,
+loaders, Agent/AgentRun handles and runtime callbacks are not transported. Supply
+subagent factories/resolvers and comparison functions again to `from_snapshot`
+where needed. This persists history, not pending requests or crash recovery.
+For durable files, the caller can write a temporary file and atomically replace
+the final path; the core still performs no persistence I/O.
+
+Run the [direct pickle example](examples/snapshot_pickle.py). For large histories,
+lazy access or incremental writes, retain the lower-level API below.
+
+### Advanced lazy/incremental persistence
 
 ```python
 from lockstep_loop import AgentSnapshot, RecordStore
@@ -169,14 +205,15 @@ Inspect children separately with `snapshot.child(entry).assets()`.
 From this directory, no paid APIs or credentials required:
 
 ```sh
-for example in product_screening history_replay feedback specialized_subagents agent_assets; do
+for example in product_screening snapshot_pickle history_replay feedback specialized_subagents agent_assets; do
     PYTHONPATH=src python examples/$example.py
 done
 ```
 
 [Product screening](examples/product_screening.py) reuses one mutable handle across
-sequential runs. [History replay](examples/history_replay.py) demonstrates caller
-storage; [feedback](examples/feedback.py), [children](examples/specialized_subagents.py)
+sequential runs. [Snapshot pickle](examples/snapshot_pickle.py) is the easy persistence
+path; [history replay](examples/history_replay.py) demonstrates advanced lazy/incremental
+storage. [Feedback](examples/feedback.py), [children](examples/specialized_subagents.py)
 and [assets](examples/agent_assets.py) cover the other boundaries.
 
 The one-shot `run_batch(prompt=..., env_ids=..., tool_specs=..., ...)` generator and

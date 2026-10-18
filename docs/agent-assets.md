@@ -68,8 +68,8 @@ the snapshot binding alive while borrowing views; owned messages require P: Clon
 while inspection/value access does not.
 
 Assets have no public IDs, standalone persistence, resume method or endpoint lookup.
-Persist the snapshot descriptor and shallow records and reconstruct views by
-traversal. Feedback still locates its target through environment tool replay; a
+Persist the snapshot (direct pickle in Python, or descriptors/shallow records)
+and reconstruct views by traversal. Feedback still locates its target through environment tool replay; a
 bare node or answer value cannot substitute for that resolution.
 
 ## Persistence values and API scope
@@ -81,11 +81,18 @@ or migration scaffolding are retained. `BatchResult.snapshot` and
 fields hold descriptors, with `agent_descriptor` accessors for inspection.
 `result.child_updates` exposes independent completed invocations.
 
-Save descriptors and individual shallow records, not live Agent/AgentRun handles,
-callbacks or Assets. Restore using an AgentSnapshot and a RecordStore loader, then
-reattach matching subagent factories/resolvers through from_snapshot. Prompt and
-ordered tool specs come from the descriptor. No general cross-version or
-cross-language wire compatibility is promised; choose caller-owned payload codecs.
+Python snapshots support direct `pickle.dump`/`pickle.load`: export eagerly bundles
+all reachable records, including child invocation bases/results, but no unrelated
+store records, loaders or runtime callbacks. Payloads must be pickleable; only load
+trusted pickle data. Each load creates an independent writer with original history
+references intact. This is history persistence, not crash recovery.
+
+For advanced lazy/incremental storage (and Rust), save descriptors and individual
+shallow records and attach a RecordStore loader. In either case restore with
+from_snapshot, reattaching runtime factories/resolvers/comparison functions as
+needed. Prompt and ordered tool specs come from the snapshot. Do not persist live
+Agent/AgentRun handles or Asset views. No general cross-version/cross-language
+wire compatibility is promised; codecs and persistence I/O remain caller-owned.
 
 The internal BatchLoop executes the same immutable history model; there is no
 separate export trie. Runtime callback identity, provider policy and comparison

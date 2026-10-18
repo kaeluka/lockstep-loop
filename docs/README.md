@@ -21,7 +21,8 @@ involved. They demonstrate the orchestration contract, not the quality of an LLM
 | Example | What it demonstrates | Python | Rust |
 | --- | --- | --- | --- |
 | `product_screening` | Product ratings, shared batch work, replay on new specifications | [source](../python/examples/product_screening.py) | [source](../rust/examples/product_screening.rs) |
-| `history_replay` | Shallow-record persistence, lazy loads, unchanged and changed paths | [source](../python/examples/history_replay.py) | [source](../rust/examples/history_replay.rs) |
+| `snapshot_pickle` | Easy self-contained Python snapshot save/load; no manual record bundles | [source](../python/examples/snapshot_pickle.py) | Python-only pickle API |
+| `history_replay` | Advanced shallow-record persistence, lazy loads, unchanged and changed paths | [source](../python/examples/history_replay.py) | [source](../rust/examples/history_replay.rs) |
 | `feedback` | Shared-path continuation, unchanged answers, explicit resolution misses | [source](../python/examples/feedback.py) | [source](../rust/examples/feedback.rs) |
 | `specialized_subagents` | Reuse a child's investigation after changing the parent's prompt | [source](../python/examples/specialized_subagents.py) | [source](../rust/examples/specialized_subagents.rs) |
 | `agent_assets` | Inspect conversations and evidence; preserve old, open, and revised snapshots | [source](../python/examples/agent_assets.py) | [source](../rust/examples/agent_assets.rs) |
