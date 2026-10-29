@@ -159,8 +159,40 @@ impl<P> Default for HistoryNode<P> {
     }
 }
 
+/// Opaque, in-process watermark for one actual [`RecordStore`] writer.
+///
+/// Clones of that store accept this cursor; independent stores never do, even
+/// with the same namespace. Cursors are reusable and remain valid after appends.
+/// They are not serialized checkpoints and retain no records or store handle.
+#[derive(Clone, Debug)]
+pub struct WriteCursor {
+    writer: Arc<()>,
+    next_index: u64,
+}
+
+/// Local writes and their atomically captured watermark, in allocation order.
+///
+/// This is not a reachable snapshot graph: orphan writes, path-copy ancestors,
+/// and writes from other runs sharing the store are included. Loaded historical
+/// records are excluded. Exporting shares immutable records without cloning P.
+#[derive(Debug)]
+pub struct RecordBatch<P> {
+    pub records: Vec<(NodeRef, Arc<HistoryNode<P>>)>,
+    pub next_cursor: WriteCursor,
+}
+
+/// An invalid cursor supplied to [`RecordStore::changes_since`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CursorError {
+    #[error("write cursor belongs to a different record store")]
+    ForeignStore,
+}
+
 type Loader<P> = dyn Fn(&NodeRef) -> Arc<HistoryNode<P>> + Send + Sync;
 struct Records<P> {
+    // A separate identity token lets cursors outlive the writer without retaining
+    // its records, and prevents pointer reuse from accepting an old cursor.
+    writer: Arc<()>,
     writes: BTreeMap<NodeRef, Arc<HistoryNode<P>>>,
     cache: BTreeMap<NodeRef, Arc<HistoryNode<P>>>,
 }
@@ -209,6 +241,7 @@ impl<P> RecordStore<P> {
         Self {
             namespace,
             records: Arc::new(Mutex::new(Records {
+                writer: Arc::new(()),
                 writes: BTreeMap::new(),
                 cache: BTreeMap::new(),
             })),
@@ -259,7 +292,66 @@ impl<P> RecordStore<P> {
         records.cache.insert(reference.clone(), node.clone());
         node
     }
+    /// Non-destructively export local writes since a previous batch watermark.
+    ///
+    /// `None` returns all local writes, never loaded historical records. The
+    /// records and next cursor are captured together under the store lock; later
+    /// writes appear in the next batch. An empty batch also returns a usable
+    /// cursor. Reads/retries do not consume records or invalidate older cursors.
+    /// This uses a range lookup: O(log N + K) work for N local writes and K returned
+    /// records, without scanning or cloning the prefix or cloning payloads.
+    ///
+    /// Capture the snapshot FIRST (run snapshot capture can allocate records),
+    /// then collect its store's batch. Persist records BEFORE publishing the
+    /// captured descriptor, and advance your cursor only after successful
+    /// persistence. Cold-loaded base records must already be durable/imported;
+    /// each fresh writable store starts with `None`. Batches include unrelated
+    /// runs and unreachable allocations, not just the captured snapshot's graph.
+    /// No I/O, serialization protocol, or crash recovery is provided.
+    ///
+    /// # Errors
+    /// Returns [`CursorError::ForeignStore`] for a cursor from any independent
+    /// store, even one reusing this store's namespace. Store clones are accepted.
+    ///
+    /// ```
+    /// use lockstep_loop::{HistoryNode, RecordStore};
+    /// let store = RecordStore::<String>::new("reserved-writer");
+    /// let initial = store.changes_since(None)?;
+    /// let reference = store.put(HistoryNode::default());
+    /// let batch = store.changes_since(Some(&initial.next_cursor))?;
+    /// assert_eq!(batch.records[0].0, reference);
+    /// assert!(store.changes_since(Some(&batch.next_cursor))?.records.is_empty());
+    /// # Ok::<(), lockstep_loop::CursorError>(())
+    /// ```
+    pub fn changes_since(
+        &self,
+        cursor: Option<&WriteCursor>,
+    ) -> Result<RecordBatch<P>, CursorError> {
+        let records = self.records.lock().expect("record store poisoned");
+        if let Some(cursor) = cursor
+            && !Arc::ptr_eq(&cursor.writer, &records.writer)
+        {
+            return Err(CursorError::ForeignStore);
+        }
+        let start = NodeRef {
+            namespace: self.namespace.clone(),
+            index: cursor.map_or(0, |cursor| cursor.next_index),
+        };
+        Ok(RecordBatch {
+            records: records
+                .writes
+                .range(start..)
+                .map(|(reference, node)| (reference.clone(), Arc::clone(node)))
+                .collect(),
+            next_cursor: WriteCursor {
+                writer: Arc::clone(&records.writer),
+                next_index: records.writes.len() as u64,
+            },
+        })
+    }
+
     /// Local writes only. Persist these before publishing any new descriptor.
+    /// Returns the full write set; use [`Self::changes_since`] for incremental reads.
     pub fn records(&self) -> BTreeMap<NodeRef, Arc<HistoryNode<P>>> {
         self.records
             .lock()

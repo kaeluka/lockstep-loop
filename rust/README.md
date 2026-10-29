@@ -64,11 +64,16 @@ self-contained AgentSnapshot pickle transport; this is a Python-only convenience
 not a new Rust snapshot serialization framework or a cross-language wire format:
 
 ```rust,ignore
-let snapshot = agent.snapshot();
-for (reference, record) in snapshot.store.records() {
-    backend.insert_immutable(reference, encode_node(&record));
+let mut cursor = None; // retain per live writable store across successful saves
+let snapshot = agent.snapshot(); // capture FIRST; run.snapshot() may allocate records
+let batch = snapshot.store.changes_since(cursor.as_ref())?;
+for (reference, record) in &batch.records {
+    backend.insert_immutable(reference, encode_node(record))?;
 }
-let published = serde_json::to_vec(&snapshot.descriptor)?; // AFTER records are durable
+backend.flush_records()?; // caller's durability protocol
+let published = serde_json::to_vec(&snapshot.descriptor)?;
+backend.publish_descriptor(&published)?; // only AFTER records are durable
+cursor = Some(batch.next_cursor); // advance only after successful persistence
 
 let snapshot = AgentSnapshot {
     descriptor: serde_json::from_slice(&published)?,
@@ -88,6 +93,34 @@ namespace is invalid. Save local writes before descriptors, retain referenced ol
 records, and reject collisions. The core traverses only relevant paths and performs
 no persistence I/O. Descriptors/records derive Serde when `P` supports it. No stable
 cross-language/version wire format or migration aliases are promised.
+
+### Incremental local record writes (Rust only)
+
+`RecordStore::changes_since(Option<&WriteCursor>) -> Result<RecordBatch<P>, CursorError>`
+returns `records: Vec<(NodeRef, Arc<HistoryNode<P>>)>` and `next_cursor: WriteCursor`.
+`None` exports all **local writes**, excluding loaded historical records. Subsequent
+reads use a range lookup (O(log N + K) for N local writes and K returned records),
+without scanning/cloning the full write map or requiring `P: Clone`.
+`records()` remains the full local-write-map export.
+
+Capture the snapshot **first**, then its batch; make all records durable **before**
+publishing that captured descriptor. Advance the cursor only after successful
+persistence. On failure, retain the cursor and retry; insert-only persistence must
+accept identical retries and reject conflicting contents. Cold-loaded base records
+are never exported by this API: they must already be durable or separately imported
+into the descriptor's destination storage.
+
+Records and watermark are captured atomically under the store lock. Concurrent
+later writes belong to later batches. A batch includes orphan writes, superseded
+path-copy ancestors and other runs' writes in that store; it is **not a reachable
+snapshot graph**, nor an Agent head publication or a completed-run transaction.
+Reads are non-destructive; old cursors and empty-batch cursors remain usable.
+
+`WriteCursor` is opaque, cloneable, in-process progress, not a serialized checkpoint.
+Store clones accept it; independent stores return `CursorError::ForeignStore`,
+even if they incorrectly reuse the same namespace. Fresh writable stores start at
+`None`; never restore a cursor from a previous writer. The API adds no persistence
+I/O, serialization protocol, GC or crash recovery, and has no Python counterpart.
 
 ### Runtime configuration and grouping
 

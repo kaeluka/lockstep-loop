@@ -197,8 +197,10 @@ persistence I/O:
    `NodeRef(namespace, index)` addresses are monotonic per writer, not content hashes
    or public conversation identities. Python defaults to UUIDs; Rust defaults are
    process-local, so durable Rust writers must explicitly reserve namespaces.
-2. Persist `snapshot.store.records()` using caller-owned codecs and insert-only
-   semantics. Reject collisions instead of overwriting records. Retain all old
+2. Capture the snapshot **first**, then collect its store's local writes. Persist
+   `snapshot.store.records()` (or Rust's incremental `changes_since`, below) using
+   caller-owned codecs and insert-only semantics. Reject conflicting collisions
+   instead of overwriting records; identical retries may succeed. Retain all old
    referenced records, including child roots and independent run snapshots.
 3. Only after records are durable, publish `snapshot.descriptor` atomically using
    the caller's storage protocol. Failures can leave orphan records.
@@ -224,6 +226,49 @@ from a saved descriptor with a healthy loader. Arbitrary imported graphs are not
 fully validated. There is no cross-language/version wire guarantee or legacy
 migration layer. Stores retain writes and cached loads, with no GC/eviction.
 Deep path copying may cause quadratic write volume; observation lookup is linear.
+
+#### Rust incremental local-write cursors
+
+Rust additionally exports `WriteCursor`, `RecordBatch<P>` and `CursorError`:
+
+```rust,ignore
+// Retain cursor per live writable store; initialize to None for a fresh writer.
+let snapshot = run.snapshot(); // FIRST: capture can allocate path-copy records
+let batch = snapshot.store.changes_since(cursor.as_ref())?;
+// Caller persists batch.records, makes them durable, then publishes snapshot.descriptor.
+// Only after successful persistence:
+cursor = Some(batch.next_cursor);
+```
+
+`RecordStore::changes_since(&self, Option<&WriteCursor>)` returns
+`Result<RecordBatch<P>, CursorError>`. Its public fields are
+`records: Vec<(NodeRef, Arc<HistoryNode<P>>)>` and `next_cursor: WriteCursor`.
+`None` returns all local writes; a cursor returns only subsequent local writes,
+ordered by allocation index. The records and watermark are captured atomically
+under the store lock, so concurrent later writes appear in later batches. Range
+lookup costs O(log N + K), for N local writes and K returned records, rather than
+scanning/cloning the full map; only addresses and Arcs are cloned, with no `P: Clone`
+bound. `records()` retains its existing full-local-write-map behavior.
+
+This is a **store write log, not a snapshot reachability export**. It includes
+allocated path-copy ancestors, orphan writes and writes from other runs sharing
+that writer, regardless of completion/publication. It excludes all loaded historical
+records, even cached ones. Cold-loaded base records must already be durable in the
+descriptor's destination storage, or the caller must import them separately.
+
+Reads are non-destructive. Keep the old cursor on persistence failure and retry;
+older cursors remain valid after appends, and empty batches yield usable cursors.
+Each cursor is opaque, cloneable and scoped to the actual in-process store writer:
+cloned store handles accept it, independent stores reject it with
+`CursorError::ForeignStore`, even if they reuse the same namespace. Namespace
+uniqueness remains a separate caller responsibility for durable addresses.
+Cursors retain no history records and are not serialized/resumable checkpoints.
+A fresh writable store always begins with `None`, including after a cold load.
+
+This incremental cursor API is **Rust-only**; Python retains its existing APIs.
+No backend I/O, destructive drain, serialization protocol, snapshot graph change
+or in-flight crash recovery is introduced. See the [Rust guide](../rust/README.md#incremental-local-record-writes-rust-only)
+for the caller-owned persistence ordering.
 
 ### Feedback: shared-path inheritance in the new snapshot
 

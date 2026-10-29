@@ -18,8 +18,8 @@ mod history;
 use history::PathStep;
 pub use history::{
     AgentDescriptor, AgentQuery, AgentResolver, AgentSnapshot, Asset, Assets, ChildAgentRun,
-    ChildAgentUpdate, EnvObservation, HistoryNode, NodeRef, Observation, OutputRecord, RecordStore,
-    SubagentContract, SubagentRecord, UserContinuation,
+    ChildAgentUpdate, CursorError, EnvObservation, HistoryNode, NodeRef, Observation, OutputRecord,
+    RecordBatch, RecordStore, SubagentContract, SubagentRecord, UserContinuation, WriteCursor,
 };
 
 use indexmap::IndexMap;
