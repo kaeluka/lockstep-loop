@@ -16,6 +16,14 @@ the library records full evidence, not these diagram summaries. Blue denotes
 shared reasoning, green completed values, orange new work/feedback, and purple
 child investigations. Text labels convey the meaning without relying on color.
 
+The saved drawings predate the conversation/asset API refactor. Their leaf label
+“asset” marks where an answer value is obtained; the current API exposes a
+`Conversation` path and separate value accessors, not an `Asset` wrapper. Likewise,
+“Initial prompt” now means a nonempty ordered initial-message sequence, including
+system/user context. The [guide](../concepts.md) and
+[inspection reference](../agent-assets.md) use current terminology. The previews
+have not been regenerated for this API-only documentation update.
+
 ## Edit and render locally
 
 Open a source in a local Excalidraw canvas. Do not use the public share/upload

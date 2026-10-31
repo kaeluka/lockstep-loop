@@ -2,16 +2,37 @@
 
 [Visual guide](concepts.md) · [Documentation](README.md) · [Repository](../README.md)
 
+This reference describes the current APIs and their
+[domain model](../AGENTS.md#domain-concepts-and-operations). `Conversation` is a
+snapshot-backed path view; an asset is a value extracted from that conversation.
+
+## Storage responsibilities
+
+The library owns the stored history's structure and semantics: immutable records,
+exact references, snapshot structure, and traversal/loading requirements. It
+exposes records and resolves references through caller-provided loaders, keeping
+replay logic inside the library.
+
+The caller owns persistence infrastructure—filesystem, cloud blob storage,
+database—and payload codecs, durable record writes, and descriptor publication.
+Storage hooks may perform I/O; core code implements no backend I/O. Python's
+direct snapshot pickle is a convenient bundling/serialization path, not a
+filesystem backend. Rust and Python also expose shallow records for caller-owned
+lazy or incremental persistence.
+
 ## Agent and run lifecycle
 
 `Agent` is the primary mutable handle: a current immutable `AgentSnapshot` plus
 caller-owned runtime callbacks. `AgentRun` is a mutable wrapper around immutable
 history and transient request/completion builders. Python uses
-`Agent(prompt=..., tool_specs=..., ...).start(environments, feedback=..., budget=...)`;
-Rust uses `Agent::new(AgentConfig::new(prompt, specs))?.start(environments, options)`.
+`Agent(initial_messages=..., tool_specs=..., ...).start(environments, feedback=..., budget=...)`;
+Rust uses `Agent::new(AgentConfig::new(initial_messages, specs))?.start(environments, options)`.
+Initial input is a nonempty ordered sequence of `MessageEnvelope` values, including
+system/user messages or caller-supplied assistant/tool context. Roles and call
+metadata belong to the envelope; content remains opaque to the core.
 `Agent.from_snapshot` / `Agent::from_snapshot` restores an independent handle from
-snapshot prompt/specs and explicitly supplied runtime dependencies, without
-repeating structural configuration or eagerly loading records.
+snapshot initial messages/specifications and explicitly supplied runtime
+dependencies, without repeating configuration or eagerly loading records.
 
 Every start captures the **current** head. The run independently extends that root.
 At successful completion it automatically publishes its final snapshot to its
@@ -44,7 +65,7 @@ run-local; the caller must retain the originating run when routing responses.
 Recording is unconditional in all runs, children and convenience drivers. There
 is no recording flag. Tools must be pure/read-only over stable environments and
 have identical specifications across environments. Environment identities stay
-outside model-visible prompts, arguments, schemas and outputs.
+outside model-visible message contents, arguments, schemas and outputs.
 
 Recorded assistant turns are reused and their tools are re-executed. The complete,
 ordered tuple of outputs determines continuation, regardless of completion order.
@@ -54,8 +75,8 @@ an execution. Equal final answers do not merge previously distinct paths.
 
 The one history model serves both replay and inspection/persistence:
 
-- `AgentSnapshot` pairs `AgentDescriptor` (prompt, ordered tools, nested
-  configuration and root reference) with a `RecordStore`.
+- `AgentSnapshot` pairs `AgentDescriptor` (ordered initial envelopes, ordered
+  tools, nested configuration and root reference) with a `RecordStore`.
 - `HistoryNode` retains the full assistant message, calls/arguments and environment
   visits. No assistant means an open continuation, not a fabricated answer.
 - `Observation` retains representative `OutputRecord(tool_output=...)` tuples,
@@ -66,7 +87,9 @@ The one history model serves both replay and inspection/persistence:
   descriptor. Their `snapshot` fields are descriptors, not mutable handles.
 - `BatchResult.snapshot` is the final immutable snapshot. `child_updates` contains
   `ChildAgentUpdate` records whose `snapshot` fields are complete child snapshots.
-  `tree`, `SplitNode` and `EnvClass` remain per-run partition summaries, not assets.
+  Flat `classes` (`EnvClass`) and `results` describe this execution. There is no
+  second partition tree or `BatchResult.tree`; accumulated history membership is
+  not the current execution's grouping.
 
 Python frozen dataclasses/tuples and Rust shared immutable Arc records implement
 path-copying updates. Previously captured roots and untouched edges stay valid.
@@ -74,19 +97,23 @@ Rust owned snapshot/descriptor clones can be edited into different values, but
 never mutate records reachable from other captures. Payload ownership remains an
 explicit contract, not a consequence of frozen wrappers or Arc.
 
-`AgentSnapshot.assets()` lazily inspects structural leaves as contextual, path-backed
-investigations. It neither executes work nor invents asset identities. Views remain
-anchored in their snapshot across later head publications. See the
-[inspection contract](agent-assets.md#inspecting-assets).
+`AgentSnapshot.conversations()` lazily inspects structural leaves as snapshot-backed
+`Conversation` paths. It neither executes work nor invents asset identities. Views
+remain anchored across later head publications. Conversation accessors select the
+latest model answer or named final-tool input as caller-chosen asset values. See
+[conversation inspection](agent-assets.md#inspecting-conversations) and
+[asset extraction](agent-assets.md#extracting-assets).
 
 ### Specialized tools and independently reusable child histories
 
 Python Agent takes `subagents=[...]`; Rust `AgentConfig`/`AgentRuntime` contain
 subagent definitions. Each `SubagentTool` supplies an advertised spec, deterministic
-`build_prompt(args)` and child spec factory. The prompt is an initial **user**
-message. Schemas are advertisements, not built-in argument validation; validate in
-the factory (Rust `try_new` supports fallible factories). There is no provider
-adapter, system-role API, fuzzy prompt normalization or callback registry.
+`build_initial_messages(args)` and child spec factory. The initial-message factory
+returns a nonempty ordered sequence of envelopes, including system messages when
+wanted. Schemas are advertisements, not built-in argument validation; validate in
+the factory (Rust `try_new` supports fallible factories). Empty child sequences
+are rejected during preparation without consuming a fresh parent request. There
+is no provider adapter, fuzzy content normalization, or callback registry.
 
 Children inherit the parent's environments. Their traces can diverge without
 splitting parents when their folded answers agree. Ordinary and subagent calls
@@ -98,11 +125,11 @@ not sent to ordinary execution. Duplicate/conflicting registrations are rejected
 matching redundant spec advertisements are allowed. Serial local-tool drivers
 reject actual callable/subagent name collisions even if specs match.
 
-`agent_resolver` receives `AgentQuery(prompt, tools, subagents)` and returns a
+`agent_resolver` receives `AgentQuery(initial_messages, tools, subagents)` and returns a
 chosen `AgentDescriptor` or None (Rust wraps this in Result). Queries have no parent,
 invocation, environment, grouping-mode or function identity. The core verifies
 full structural equality; an incompatible hit is an error, not a silent miss.
-Changed parent prompts can therefore reuse independently selected children.
+Changed parent initial messages can therefore reuse independently selected children.
 The resolver selects metadata; the shared RecordStore must resolve every selected
 address. Returning a descriptor does not import a foreign store.
 
@@ -123,14 +150,17 @@ old roots. `snapshot.child(entry)` attaches the same record resolver for inspect
 An independent child descriptor needs no parent descriptor to replay.
 
 Restoration requires matching runtime subagent definitions, but never serialized
-callbacks. Actual child prompt/spec factory outputs are checked on entry.
+callbacks. Actual child initial-message/spec factory outputs are checked on entry.
 
 ### Compatibility and ownership
 
 No manual contract/version/namespace key is used for reasoning compatibility.
-Prompt equality, ordered specs and nested subagent specs/allowlists/depth are
-checked. Pure tool implementations can change: equal observations reuse; different
-observations branch. Provider/adapter settings and grouping semantics are external
+The complete ordered initial-envelope sequence—including roles, contents, tool
+calls and tool-call IDs—must match, along with ordered specs and nested subagent
+specs/allowlists/depth. Reordering, adding, removing, or changing an initial
+message is a structural change. Empty initialization is rejected on construction,
+restoration, and child entry. Pure tool implementations can change: equal
+observations reuse; different observations branch. Provider/adapter settings and grouping semantics are external
 policy. Callers choose compatible snapshots and isolate external caches as needed.
 
 Default grouping is identity. The **current** comparison function is applied to
@@ -142,9 +172,12 @@ merge or rewrite edges. Replay preserves representative conversation context and
 appends full exact new evidence. Neither hashes, debug strings, callback identity
 nor default/custom mode replace equality verification.
 
-Python payloads, schemas and argument mappings are borrowed immutable values,
-including their reachable contents and aliases. Rust Clone must preserve immutable
-value semantics; shared interior mutability must not change recorded facts.
+Python message contents, schemas and tool arguments are borrowed immutable values,
+including their reachable contents and aliases. Tool arguments need not be
+mappings: a caller-defined structured input can include a real null value. The
+caller interprets and validates it against the advertised tool contract; the core
+does not impose an object-only schema. Rust Clone must preserve immutable value
+semantics; shared interior mutability must not change recorded facts.
 The caller owns copying/codecs for provider objects. Key functions must accept
 historical outputs, be deterministic, and use stable equality/hashing.
 
@@ -157,8 +190,8 @@ require pickleable payloads. Opaque payloads use their normal Python representat
 without an imposed depth/length limit. The dump may be large or contain sensitive
 provider/tool content. It loads lazy records, but does not change history or include
 unrelated store records, pending requests or other transient execution state.
-`repr(snapshot)` stays lightweight and never loads records. Use Asset views for
-conversation-oriented inspection rather than a record-level dump.
+`repr(snapshot)` stays lightweight and never loads records. Use Conversation views
+for path-oriented inspection rather than a record-level dump.
 
 ### Direct Python snapshot pickle
 
@@ -214,7 +247,7 @@ persistence I/O:
 
 Records are shallow: successors are addresses, not recursively encoded nodes.
 Existing tests round-trip 256 tool turns over two paths with default JSON limits,
-then load only the selected 257 nodes. Asset traversal is iterative and does not
+then load only the selected 257 nodes. Conversation traversal is iterative and does not
 load child tries unless explicitly inspected. Payload codecs still need to support
 the payload's own nesting/size. Rust descriptors/records derive Serde when supported
 by P; the advanced Python example pickles trusted records individually, never live
@@ -295,27 +328,40 @@ user edges are rejected on traversal rather than implicitly merged.
 An unseen/unfulfilled target, including an open previous feedback continuation,
 fails explicitly. Ordinary replay can extend open paths without new feedback.
 
-A root failure may raise/return Err from start; later resolution failures surface
-from completion or terminal state. `done`/`is_done()` becomes true, queued/pending
-work is logically cancelled, and `error`/`result()` expose the stored error, not a
-partial result. The run never publishes failure to its owner. Invalid completions
-instead leave pending work recoverable. Callers own stopping/ignoring executor work.
-Feedback is once per live operation, not crash-safe exactly-once persistence.
+A root failure may raise/return Err from start; later errors surface from
+completion or terminal state. When a terminal failure status is stored,
+`done`/`is_done()` becomes true, queued/pending work is logically cancelled, and
+`error`/`result()` expose the stored error, not a partial result. Such failed runs
+never publish to their owners. Not every raised exception stores a terminal
+failure: Python can roll back callback errors and detected child compatibility
+mismatches during replay, leaving the advancing completion correctable as described
+below. Invalid completions likewise leave pending work recoverable. Callers own
+stopping/ignoring executor work. Feedback is once per live operation, not crash-safe
+exactly-once persistence.
 
 ### Transactional child preparation and callback failures
 
-Both engines prepare all child prompts, materialized specs and constructors before
+Both engines prepare all child initial messages, materialized specs and constructors before
 fulfilling a fresh assistant turn or issuing its ordinary tool requests. Prepared
 children are used directly, without rerunning factories at commit.
 
 Python journals only touched builders/entries across completions, nested routing,
 parent rollup and replay. It does not clone siblings or historical message lists.
-Callback exceptions restore pending requests, roots, queues/routes and counters;
-retry with corrected inputs/callbacks. Explicit stored terminal failures commit
-cancellation instead. Reentrant snapshot inspection sees only the pre-transition
-committed root; reentrant advancement is rejected. AgentRun settles cached children
-inside the completion journal before publishing. Polling can also advance cached
-work. Structural cost tests guard against unrelated traversal on serving hot paths.
+Callback exceptions restore pending requests, roots, queues/routes and counters.
+A detected child structural mismatch during replay can also raise a recoverable
+`ValueError`: the advancing completion is rolled back and remains pending. Correct
+the inputs/callbacks to produce compatible child configuration, then retry. The
+mismatched history is rejected—not accepted or silently treated as compatible.
+`test_last_tool_completion_prepares_replayed_children_before_consumption` in the
+[Python transactional suite](../python/tests/test_transactional_transitions.py)
+explicitly covers this compatibility retry. Only stored terminal failure statuses
+commit cancellation and bar publication; a rolled-back attempt does not publish,
+but a corrected investigation can later complete successfully.
+
+Reentrant snapshot inspection sees only the pre-transition committed root;
+reentrant advancement is rejected. AgentRun settles cached children inside the
+completion journal before publishing. Polling can also advance cached work.
+Structural cost tests guard against unrelated traversal on serving hot paths.
 
 Rust fallible fresh preparation returns structured errors and leaves requests
 correctable. Errors while replaying already-recorded turns are terminal; valid
@@ -323,7 +369,7 @@ earlier tool evidence may remain in the run snapshot. Rust does not implement
 Python's undo journal or callback panic recovery: discard runs after arbitrary
 panics. Rust run snapshot inspection may assemble active-child roots and allocate
 path-copy records, while still preserving old facts and never publishing the owner.
-Asset traversal itself is read-only and does not clone payloads.
+Conversation traversal itself is read-only and does not clone message contents.
 
 Neither language rolls back caller side effects, warmed caches or unreachable
 append-only allocations. Only committed immutable roots define historical facts.
@@ -336,6 +382,9 @@ run fallback, not a synthetic assistant record. Later runs can resume the real
 checkpoint; smaller replay budgets never truncate stored facts. Child fallbacks
 are actual parent tool outputs while child histories stay at real checkpoints.
 Budget exhaustion during strict feedback resolution fails without publication.
+Initial envelopes do not consume accepted-turn budget. An accessor may find an
+answer in initial assistant context, but budget completion is not an accepted
+terminal response and cannot authorize a user continuation.
 
 Partial tuples and pending queues are not persisted. Replay restarts tools; this
 is completed/validated-history reuse, **not crash recovery**. Python's fallback is
@@ -346,6 +395,11 @@ for exact signatures and executable examples.
 
 No UI, DAG scheduling, feedback routing, environment remapping, single-flight,
 automatic history merging or designated result-tool publication is implemented.
-Assets currently publish terminal no-tool assistant payloads. Changed child values
-do not automatically update completed parents; dependency push updates remain
-[future work](https://github.com/kaeluka/lockstep-loop/issues/1).
+`get_last_answer_asset()` selects the latest no-tool assistant content;
+`get_final_tool_input_asset(name)` selects recorded arguments of the latest
+matching call, including a pending accepted call. Both can inspect initial
+assistant context. These are read-only accessors, not tool-termination or
+publication policies. Python raises `LookupError` for absence, while real `None`
+remains a value; Rust uses `Option` to distinguish absence from null content.
+Changed child values do not automatically update completed parents; dependency
+push updates remain [future work](https://github.com/kaeluka/lockstep-loop/issues/1).

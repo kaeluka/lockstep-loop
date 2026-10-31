@@ -13,10 +13,11 @@ Your application chooses the model, executes the tools, and stores the records.
 
 ## What is an environment?
 
-A stable subject plus the evidence its tools can read. It could be one study's
-archived documents, one product's versioned specifications, one contract bundle,
-one dataset release, or one repository commit. It is **not** necessarily a
-filesystem, sandbox, or machine.
+A caller-owned handle identifying a stable subject and the evidence its tools can
+read—for example, `owner/repo@commit`, not the repository itself. Other handles
+can identify archived study documents, versioned product specifications, contract
+bundles, or dataset releases. An environment is **not** necessarily a filesystem,
+sandbox, or machine.
 
 | Same investigation | Different environments |
 | --- | --- |
@@ -34,15 +35,19 @@ for what can be shared, what causes branching, and when this is a poor fit.
 ## The model
 
 - An **Agent** is a mutable handle for starting investigations and accumulating experience.
-- An **AgentSnapshot** is its immutable prompt, structural configuration and recorded trie.
-- An **AgentRun** captures the current snapshot, serves requests, and publishes on completion.
-- An **Asset** is a leaf investigation backed by its complete conversation—not
-  merely its answer. Several environments can share an asset.
+- An **AgentSnapshot** captures ordered initial messages, structural configuration,
+  and one immutable **history trie** sharing common conversation prefixes.
+- An **AgentRun** is the execution handle: it captures the current snapshot, serves
+  requests, and publishes on completion. Investigating is an operation on an agent.
+- A **Conversation** is one path through the history trie, exposed as a
+  snapshot-anchored view with messages and exact tool-result evidence.
+- An **asset** is the value the caller extracts from a conversation: for example,
+  its latest model answer or the input to a typed `submitFinalAnswer` tool.
 - **Replay** re-executes tools and reuses recorded assistant turns until an
   observation differs. A fully matching completed path needs no new LLM calls.
 - **Feedback** extends a resolved investigation in a new immutable snapshot.
 - **Subagents** contain divergent investigations behind their returned findings;
-  independently cached specialists can survive a parent prompt change.
+  independently cached specialists can survive changes to parent initial messages.
 
 **[Take the visual tour →](docs/concepts.md)**
 
@@ -70,21 +75,27 @@ executes them, and returns completions. Independent requests may finish in any
 order; refinement waits for each turn's **complete, ordered tuple** of results.
 Classes split, never remerge within an execution.
 
+Initial input is a nonempty ordered sequence of `MessageEnvelope` values—for
+example, a system message followed by several user messages. The library owns
+role/call structure but treats the message contents as opaque, including nontext
+or multimodal values.
+
 Supply pure/read-only tools over stable snapshots, identical tool specs across
-environments, and immutable payloads. Environment IDs are caller-side routing
+environments, and immutable message contents. Environment IDs are caller-side routing
 metadata, not model-visible context. Snapshot live sources before using them;
 recording does not make a changing web page or database query pure.
 
 Recording is unconditional, including children. Start with `Agent`, drive
 `agent.start(environments)`, and save `agent.snapshot()`. Restore with
-`Agent.from_snapshot(snapshot, ...runtime callbacks...)`, without repeating prompt
-or tool specs. Successful completion automatically advances the handle exactly once.
+`Agent.from_snapshot(snapshot, ...runtime callbacks...)`, without repeating initial
+messages or tool specs. Successful completion automatically advances the handle exactly once.
 Python supports `pickle.dump(agent.snapshot(), file)` and restoring the loaded
 snapshot directly; only load trusted pickle data. Export eagerly includes all
 reachable history and requires pickleable payloads, not runtime callbacks. The
 lower-level descriptor/record API remains available for lazy/incremental storage
-and Rust. All persistence I/O stays caller-owned. No manual
-version key is needed: pure tools are rerun, so implementation changes either
+and Rust. The library owns immutable records, references, snapshots, and traversal;
+the caller owns codecs, filesystem/blob/database backends, and durable publication.
+The core performs no backend I/O. No manual version key is needed: pure tools are rerun, so implementation changes either
 preserve observations (reuse) or change them (branch). The current grouping function
 compares fresh outputs and recorded representatives; default/custom mode and
 function identity are not cache keys. Coarser keys select the first matching stored
@@ -102,7 +113,7 @@ an old run never republishes it. Failed/abandoned runs do not advance the handle
 
 - [Documentation map and runnable examples](docs/README.md)
 - [Use cases, environment boundaries, and sharing opportunities](docs/use-cases.md)
-- [Agent/Asset glossary and inspection](docs/agent-assets.md)
+- [Agents, conversations, and asset accessors](docs/agent-assets.md)
 - [Replay, feedback, persistence, and compatibility reference](docs/history-reference.md)
 - [Specialized subagents and independent child caches](docs/history-reference.md#specialized-tools-and-independently-reusable-child-histories)
 - [Verification](docs/verification.md) · [Editable diagrams](docs/diagrams/README.md)

@@ -9,43 +9,51 @@ lockstep-loop records and reuses that shared work. It has no built-in domain,
 model, or storage backend. The examples below use **product checks, dataset
 releases, supplier review, and research screening** to explain the same machinery.
 
-## An environment is a stable subject and its evidence
+## An environment is a handle to stable evidence
 
-For product checks, an environment might be a device's versioned datasheet. For
-research screening, it might be a paper and its supplements. The caller binds
-tools to each subject; `read_ratings()` or `read_section("methods")` has the same
-interface everywhere but reads that environment's evidence.
+For product checks, an environment handle might identify a device's versioned
+datasheet. For research screening, it might identify an archived paper and its
+supplements. The caller binds tools to each handle; `read_ratings()` or
+`read_section("methods")` has the same interface everywhere but reads the
+identified environment's evidence.
 
-The core uses environment IDs to route requests. They are not model-visible
-instructions. All environments in one investigation must have the same prompt
-and tool specifications. Inputs must be stable, and tools must be pure/read-only.
+The core uses these handles to route requests. They are not model-visible
+instructions. All environments in one investigation share the same ordered
+initial messages and tool specifications. Inputs must be stable, and tools must be pure/read-only.
 A live website, mutable database, or `HEAD` reference needs to be resolved into
 stable evidence by the caller first.
 
 ## An agent is a recipe *and* its experience
 
-![Product-check agent: the initial prompt and tool configuration are inside the trie. A/B/C share enclosure and temperature observations; D follows a different path. Checking limitations splits A/B from C. A/B share one asset. A blue root-to-leaf path is one conversation.](diagrams/agent-trie.svg)
+![Product-check agent: initial context and tool configuration accompany the history trie. A/B/C share enclosure and temperature observations; D follows a different path. Checking limitations splits A/B from C. A blue root-to-leaf path is one conversation; its answer is an asset value.](diagrams/agent-trie.svg)
 
-An **Agent** owns its current experience and starts investigations. Its immutable
-**AgentSnapshot** contains the initial prompt/investigation recipe, structural
-configuration, and accumulated trie. A trie is a tree whose paths share their
-common beginnings. **AgentRun** serves one investigation and publishes a new
-snapshot to the owning Agent on successful completion.
+The illustrations predate the API terminology change: their leaf labels “asset”
+mark where a value is obtained, not a separate conversation-wrapper type, and
+“initial prompt” now means one or more initial messages.
 
-**Conversation** means one root-to-endpoint path: the prompt, assistant messages,
-tool calls and observations, and any later user feedback.
+An **Agent** owns its current experience and offers the operation **investigate
+environments**. Its immutable **AgentSnapshot** contains ordered initial messages,
+structural configuration, and a **history trie**. The trie efficiently stores many
+similar conversations by sharing their common prefixes. **AgentRun** holds the
+operation's execution state and publishes a new snapshot on successful completion.
 
-**Asset** means a leaf investigation state backed by that full conversation and
-its published value. The value alone is not the asset: A/B and D above both say
-“meets needs” but arrived there through different evidence. One leaf can represent
-several environments. An open continuation need not have a new completed value yet.
+A **Conversation** is one root-to-endpoint path: initial messages, model responses,
+tool calls and results, and any user follow-ups. Initial context can include a
+system message and several user messages. `MessageEnvelope` carries role/call
+structure; its content can be text, audio, images, or another opaque caller value.
 
-> **Today's API:** `agent.snapshot().assets()` exposes read-only, path-backed
-> Asset views anchored in that immutable snapshot, not independent endpoint
-> handles. Values are terminal assistant replies **with no tool calls**, not
-> designated result-tool arguments. An open asset can retain an older value.
+An **asset** is the value the caller cares about, derived from that conversation.
+It can be the latest model answer or the input to a typed final-answer tool such
+as `submitFinalAnswer`. A/B and D above can produce equal “meets needs” assets while
+retaining distinct conversations and evidence. Equal values do not merge paths.
+
+> **API:** `agent.snapshot().conversations()` exposes snapshot-anchored
+> `Conversation` views. Call `get_last_answer_asset()` or
+> `get_final_tool_input_asset(tool_name)` to extract a value. The latter reads
+> recorded arguments; it does not make a tool call terminal. An open conversation
+> can still supply an earlier answer, or have no answer yet.
 >
-> [Inspect agents, runs, snapshots and Assets →](agent-assets.md)
+> [Inspect conversations and extract assets →](agent-assets.md)
 
 ## Subdivide only when evidence requires it
 
@@ -78,7 +86,7 @@ Consider a dataset-intake agent that has already checked schemas, column
 statistics, and units. Next month's release is a **new environment**, not
 necessarily a new investigation from scratch.
 
-Reuse the agent under the same prompt and compatible tool/nested configuration.
+Reuse the agent under the same initial messages and compatible tool/nested configuration.
 Rerun its recorded tools, follow matching observations, and reuse assistant turns.
 A fully matching completed path needs **zero new LLM requests**. At the first
 unseen observation—for example a different unit definition—ask for new reasoning.
@@ -91,7 +99,7 @@ overlapping runs capture independent roots and do not merge; the last completion
 wins. Retain each run's snapshot to preserve independent work. Both paths within
 a snapshot stay reusable; old snapshots stay unchanged. Your application can pickle
 Python snapshots directly, or persist descriptors/records for lazy or incremental
-storage. Changed prompts or tool specs require compatible
+storage. Changed initial-message sequences or tool specs require compatible
 history selection or a fresh investigation. Pure tool implementation changes need
 no version bump: tools rerun, matching outputs reuse, different outputs branch.
 External provider and custom grouping policy isolation remains caller-owned;
@@ -109,7 +117,7 @@ come in.
 A supplier-review agent read a questionnaire and certificate, then answered
 “evidence complete”. On review, you notice it never checked the exclusions.
 
-![The old supplier-review snapshot ends at a shared A/B asset. In a new snapshot, replay locates the path, retains its old answer, appends “Check exclusions”, and opens a continuation. All environments reaching that path inherit the note; other paths and the old snapshot remain unchanged.](diagrams/feedback.svg)
+![The old supplier-review snapshot contains a shared A/B conversation and its answer asset. In a new snapshot, replay locates the path, retains its old answer, appends “Check exclusions”, and opens a continuation. All environments reaching that path inherit the note; other paths and the old snapshot remain unchanged.](diagrams/feedback.svg)
 
 Provide **agent snapshot + one stable environment + explicit feedback**. The core
 replays tools to locate the existing completed endpoint, then appends your user
@@ -143,18 +151,20 @@ tuples still split normally. This is **containment, not remerging**.
 
 There is a second payoff: **contain invalidation**. Expose a structured tool such
 as `assess_design(criterion="randomized")`; application code deterministically
-builds its child prompt. A changed parent screening prompt needn't discard the
-unchanged specialist's recorded experience. Different criteria intentionally
-produce different child prompts/tries—not fuzzy matches between paraphrases.
+builds its child's initial messages. Changed parent screening instructions needn't
+discard the unchanged specialist's recorded experience. Different criteria
+intentionally produce different child initial messages and histories—not fuzzy
+matches between paraphrases.
 
 Subagents cost work too. Measure the child's investigation plus the parent's
 continuation; fewer parent branches alone do not establish a saving. Preserve
 supporting evidence and uncertainty rather than forcing every child into the
 same answer for cache efficiency.
 
-**Supported now:** multiple named `SubagentTool` definitions, deterministic prompt
-construction, bounded child allowlists, nested replay, and independent child-agent
-lookup. The initial prompt is a user message, not a separate system-role API.
+**Supported now:** multiple named `SubagentTool` definitions, deterministic
+initial-message construction, bounded child allowlists, nested replay, and
+independent child-agent lookup. The factory returns a nonempty ordered envelope
+sequence, including system messages when needed.
 Children inherit the parent's environments. A resolver selects a compatible child
 revision for a new invocation; recorded parent invocations remain pinned to their
 recorded revision. Concurrent updates are not silently merged.
@@ -179,4 +189,4 @@ update an already completed parent.
 
 **Next:** [Runnable examples](README.md#runnable-examples) ·
 [Python API](../python/README.md) · [Rust API](../rust/README.md) ·
-[Asset inspection](agent-assets.md) · [Technical reference](history-reference.md)
+[Conversation inspection and asset extraction](agent-assets.md) · [Technical reference](history-reference.md)

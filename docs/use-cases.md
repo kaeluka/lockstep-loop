@@ -3,24 +3,25 @@
 [Documentation](README.md) · [Visual guide](concepts.md)
 
 lockstep-loop is useful when many subjects can be investigated through the **same
-prompt and tool interface**. Subjects may arrive together or one at a time: a
+initial messages and tool interface**. Subjects may arrive together or one at a time: a
 recorded agent can reuse an investigation from an earlier run.
 
-An environment is the caller's binding between a subject, a stable evidence
-snapshot, and its tool implementations. The core only sees opaque environment
-IDs for routing. A tool such as `read_section("methods")` operates on the current
+An environment is a caller-owned handle identifying a stable evidence context;
+the caller binds that handle to the subject and tool implementations. The core
+tracks handles for routing, not the evidence source itself. A tool such as `read_section("methods")` operates on the current
 environment's evidence; the model need not name the study, database, or storage
 bucket that holds it.
 
 The following are application designs, not built-in integrations. Tools, document
-extraction, model adapters, evaluation criteria, and persistence are caller-owned.
+extraction, model adapters, evaluation criteria, codecs, and persistence backends
+are caller-owned; the library owns history structure and traversal.
 
 ## 1. Research-paper screening
 
 **Question:** “Does this study satisfy our review's inclusion criteria? Identify
 missing evidence before deciding.”
 
-- **Environment:** an archived study bundle: paper, supplements, and corrections.
+- **Environment:** a handle to an archived study bundle: paper, supplements, and corrections.
 - **Tools:** `study_metadata()`, `read_section(section)`, `read_supplement(name)`.
 - **Shared work:** studies with identical metadata observations can share early
   reasoning about eligibility. The agent requests detailed methods only where
@@ -39,7 +40,7 @@ remain subject to the review's validation process.
 
 **Question:** “Does this device meet our outdoor operating requirements?”
 
-- **Environment:** one product's versioned datasheet and certification evidence.
+- **Environment:** a handle to one product's versioned datasheet and certification evidence.
 - **Tools:** `read_ratings()`, `read_test_report(test)`, `read_limitations()`.
 - **Shared work:** products with the same relevant ratings share an assessment;
   a temperature limit or enclosure rating difference opens another path.
@@ -58,8 +59,8 @@ and branching reproducible; they are not real product-certification advice.
 
 **Question:** “Is the submitted evidence sufficient for our assessment checklist?”
 
-- **Environment:** a frozen supplier packet containing questionnaires, certificates,
-  and audit documents, together with any fixed assessment inputs such as an as-of date.
+- **Environment:** a handle to a frozen supplier packet containing questionnaires,
+  certificates, and audit documents, with fixed inputs such as an as-of date.
 - **Tools:** `read_checklist_answers()`, `list_evidence()`, `read_document(kind)`.
 - **Shared work:** identical checklist observations can share a path. A missing
   document or different exception opens another. Reading every full document at
@@ -72,7 +73,7 @@ and branching reproducible; they are not real product-certification advice.
   environments following the same path inherit that continuation.
 
 Time-dependent checks must use a pinned assessment date, not the wall clock.
-Express changed checklist requirements in the prompt or observed evidence. Pure
+Express changed checklist requirements in initial messages or observed evidence. Pure
 tools rerun, so changed outputs branch without a manual version bump. Review
 findings support a decision; they are not a compliance guarantee.
 
@@ -80,7 +81,7 @@ findings support a decision; they are not a compliance guarantee.
 
 **Question:** “Flag renewal terms that differ from our review policy.”
 
-- **Environment:** one signed contract, its incorporated schedules, and amendments.
+- **Environment:** a handle to one signed contract, its incorporated schedules, and amendments.
 - **Tools:** `read_clause(topic)`, `list_amendments()`, `read_amendment(section)`.
 - **Shared work:** identical template clauses support common reasoning. Negotiated
   language causes a split; it should not be erased merely to improve cache hits.
@@ -90,7 +91,7 @@ findings support a decision; they are not a compliance guarantee.
   clause.” This concerns the investigation, not its previous answer's string value.
 
 A new document bundle is a new environment. A changed review policy is instead a
-prompt/evidence change or caller-owned policy selection, not a manual cache key.
+change to initial messages/evidence or caller-owned policy selection, not a manual cache key.
 Human review remains important for interpretations and consequential decisions.
 
 ## 5. Dataset intake and recurring reports
@@ -98,7 +99,7 @@ Human review remains important for interpretations and consequential decisions.
 **Question:** “Is this dataset release suitable for our reporting pipeline, and
 what caveats must accompany it?”
 
-- **Environment:** an immutable dataset release plus its schema and data dictionary.
+- **Environment:** a handle to an immutable dataset release, its schema, and data dictionary.
 - **Tools:** `read_schema()`, `column_statistics(column)`, `read_dictionary(field)`.
 - **Shared work:** releases with matching schemas and statistics can share an
   investigation, even if their underlying rows are different. Equality is about
@@ -117,12 +118,12 @@ in a column the investigation never queried.
 
 **Question:** “Identify unsafe path handling in this package.”
 
-- **Environment:** a repository at a resolved commit, with any relevant configuration.
+- **Environment:** a reference such as `owner/repo@commit`, with relevant configuration pinned.
 - **Tools:** `list_files(directory)`, `read_file(path)`, `find_references(symbol)`.
 - **Shared work:** unchanged files and configuration preserve common observations
   across forks or revisions. Changes to observed code cause branches.
-- **Specialist:** `list_imports(file_path="foo.py")` builds a deterministic child
-  prompt, so parent prompt edits need not discard the child's investigation.
+- **Specialist:** `list_imports(file_path="foo.py")` builds deterministic child
+  initial messages, so parent message edits need not discard the child's investigation.
 - **Coverage:** caller code can enumerate files and require one investigation per
   file, rather than trusting a model to decide what to explore.
 
@@ -133,9 +134,9 @@ outside the core.
 ## Designing for useful sharing
 
 1. **Keep the task stable.** Put subject selection in the environment, not an
-   environment-specific sentence in every initial prompt. Structured subagent
-   arguments can deterministically parameterize a task: a different criterion or
-   file path then intentionally creates a different child prompt/trie.
+   environment-specific sentence in every initial message sequence. Structured
+   subagent arguments can deterministically parameterize a task: a different
+   criterion or file path intentionally creates different child context/history.
 2. **Ask for relevant evidence first.** A structured factual query can avoid
    reading a whole document unnecessarily. Detailed evidence is still available
    when needed. Avoid timestamps, random ordering, and storage-location noise.

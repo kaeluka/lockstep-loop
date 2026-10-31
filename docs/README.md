@@ -8,7 +8,7 @@ contain divergence. These are applications of the same domain-neutral loop.
 
 - **Choose a workload:** [use cases and environment/tool designs](use-cases.md).
   Includes documents, studies, products, datasets, suppliers, and source code.
-- **Name and inspect the model:** [Agent, run, snapshot and Asset glossary](agent-assets.md).
+- **Name and inspect the model:** [Agents, conversations, and asset accessors](agent-assets.md).
 - **Serve requests:** [Python](../python/README.md) · [Rust](../rust/README.md).
 - **Record, replay, and persist:** [technical reference](history-reference.md).
 
@@ -24,8 +24,8 @@ involved. They demonstrate the orchestration contract, not the quality of an LLM
 | `snapshot_pickle` | Easy self-contained Python snapshot save/load; no manual record bundles | [source](../python/examples/snapshot_pickle.py) | Python-only pickle API |
 | `history_replay` | Advanced shallow-record persistence, lazy loads, unchanged and changed paths | [source](../python/examples/history_replay.py) | [source](../rust/examples/history_replay.rs) |
 | `feedback` | Shared-path continuation, unchanged answers, explicit resolution misses | [source](../python/examples/feedback.py) | [source](../rust/examples/feedback.rs) |
-| `specialized_subagents` | Reuse a child's investigation after changing the parent's prompt | [source](../python/examples/specialized_subagents.py) | [source](../rust/examples/specialized_subagents.rs) |
-| `agent_assets` | Inspect conversations and evidence; preserve old, open, and revised snapshots | [source](../python/examples/agent_assets.py) | [source](../rust/examples/agent_assets.rs) |
+| `specialized_subagents` | Reuse a child's investigation after changing parent initial messages | [source](../python/examples/specialized_subagents.py) | [source](../rust/examples/specialized_subagents.rs) |
+| `agent_conversations` | Inspect conversations and extract assets; preserve old, open, and revised snapshots | [source](../python/examples/agent_conversations.py) | [source](../rust/examples/agent_conversations.rs) |
 
 ```sh
 (cd python && PYTHONPATH=src python3 examples/product_screening.py)
@@ -40,7 +40,7 @@ how to bind tools to other evidence sources.
 
 ## Reference and maintenance
 
-- [Agent lifecycle and snapshot-backed Asset inspection](agent-assets.md)
+- [Agent lifecycle, snapshot-backed conversations, and asset accessors](agent-assets.md)
 - [Persistence, feedback, child caching, and limitations](history-reference.md)
 - [Diagram sources and previews](diagrams/README.md)
 - [Documentation verification](verification.md)

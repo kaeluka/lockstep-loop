@@ -343,15 +343,20 @@ the answer or final-tool input the caller wants.
 
 **User-facing operation:** access the desired value from a recorded conversation.
 
-This is the intended domain distinction; the current code's Asset type instead
-provides a snapshot-anchored conversation view. The accessor names above describe
-the intended API, not a claim that it is already implemented.
+`Conversation` is the snapshot-anchored path view; there is no separate asset
+wrapper. Both accessors include caller-supplied initial assistant context and
+recorded responses, including earlier answers before an open follow-up. The
+final-tool accessor selects the latest matching call input in conversation/call
+order, even before that tool completes; it neither executes the call nor makes it
+terminal. Missing values raise `LookupError` in Python and return `None` in Rust;
+actual null values remain distinguishable. Inspecting an initial answer does not
+make a budget-limited investigation a completed model answer.
 
 ## Scope and development
 
-The domain definitions describe the intended design; current API differences are
-documented explicitly. Keep canonical names without deprecated aliases or legacy
-migration scaffolding. Leave room for continuing conversations and downstream use
+The domain definitions describe the design; language-specific APIs and remaining
+limitations are documented explicitly. Keep canonical names without deprecated
+aliases or legacy migration scaffolding. Leave room for continuing conversations and downstream use
 of assets, but do not add DAG scheduling, dependency updates, feedback routing,
 asset-publication machinery, or a UI as part of this work.
 
