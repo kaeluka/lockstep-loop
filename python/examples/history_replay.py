@@ -11,6 +11,7 @@ from lockstep_loop import (
     AgentSnapshot,
     LlmCompletion,
     LlmRequest,
+    MessageEnvelope,
     RecordStore,
     ToolCall,
     ToolCompletion,
@@ -23,7 +24,7 @@ def investigate(env: str, observation: str, snapshot: AgentSnapshot[str] | None 
         Agent.from_snapshot(snapshot)
         if snapshot is not None
         else Agent(
-            prompt="Read the revision's status.",
+            initial_messages=(MessageEnvelope(role="user", content="Read the revision's status."),),
             tool_specs=[ToolSpec("status", "Read status without changing it.", {})],
         )
     )

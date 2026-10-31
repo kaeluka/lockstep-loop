@@ -8,6 +8,7 @@ from lockstep_loop import (
     Feedback,
     LlmCompletion,
     LlmRequest,
+    MessageEnvelope,
     RecordStore,
     SubagentTool,
     ToolCall,
@@ -37,7 +38,7 @@ def definition(name="list_imports", kind="imports"):
         name,
         f"Run {kind}",
         SCHEMA,
-        prompt,
+        lambda args: (MessageEnvelope(role="user", content=prompt(args)),),
         lambda _: (READ,),
         subagents=(),
     )
@@ -66,7 +67,7 @@ def make(
     **options,
 ):
     return BatchLoop(
-        prompt=prompt,
+        initial_messages=(MessageEnvelope(role="user", content=prompt),),
         env_ids=envs,
         tool_specs=(STATUS,),
         subagents=definitions() if registered is None else registered,
@@ -154,7 +155,7 @@ def test_multiple_tools_changed_parent_reuses_independent_children_and_persists_
     assert old.results == {"old": "imports:done|metrics:done|ok"}
     backend, selected = {}, {}
     for update in old.child_updates:
-        selected[update.snapshot.descriptor.prompt] = publish(
+        selected[update.snapshot.descriptor.initial_messages[0].content] = publish(
             update.snapshot, backend
         )
         assert update.base is None and update.env_ids == ("old",)
@@ -164,7 +165,7 @@ def test_multiple_tools_changed_parent_reuses_independent_children_and_persists_
     def resolve(query):
         lookups.append(query)
         assert not hasattr(query, "env_ids") and not hasattr(query, "branch_id")
-        return selected.get(query.prompt)
+        return selected.get(query.initial_messages[0].content)
 
     loaded = []
 
@@ -182,11 +183,11 @@ def test_multiple_tools_changed_parent_reuses_independent_children_and_persists_
     assert len(requests) == 2 and all(r.messages[0].content == "parent-B" for r in requests)
     assert old.snapshot.descriptor.root not in loaded  # no parent snapshot dependency
     assert len([r for r in tools if r.tool_call.name == "read_file"]) == 4
-    assert {q.prompt for q in lookups} == {"imports:foo.py", "metrics:foo.py"}
+    assert {q.initial_messages[0].content for q in lookups} == {"imports:foo.py", "metrics:foo.py"}
     assert second.results["tomorrow"] == old.results["old"]
     assert len(second.child_updates) == 2
     for update in second.child_updates:
-        key = update.snapshot.descriptor.prompt
+        key = update.snapshot.descriptor.initial_messages[0].content
         assert update.base == selected[key]
         assert update.snapshot.descriptor.root != update.base.root
         assert update.tool_call.id.startswith("opaque/")
@@ -224,11 +225,7 @@ def test_changed_file_and_changed_observation_branch_without_parent_splits():
 
     def resolve(query):
         queries.append(query)
-        return (
-            descriptor
-            if query == descriptor.query()
-            else None
-        )
+        return descriptor if query == descriptor.query() else None
 
     selected_calls = (calls()[0], calls()[2])
     changed, llms, _ = drive(
@@ -256,9 +253,14 @@ def test_changed_file_and_changed_observation_branch_without_parent_splits():
         )
         update = result.child_updates[0]
         assert update.base is None
-        assert update.snapshot.descriptor.prompt == f"imports:{path}"
+        assert update.snapshot.descriptor.initial_messages[0].content == f"imports:{path}"
         assert all(r.tool_call.args["path"] == path for r in tools)
-    new_definition = replace(definition(), build_prompt=lambda a: f"imports:{a['file_path']}")
+    new_definition = replace(
+        definition(),
+        build_initial_messages=lambda a: (
+            MessageEnvelope(role="user", content=f"imports:{a['file_path']}"),
+        ),
+    )
     versioned, _, _ = drive(
         make(
             "parent-new-implementation",
@@ -277,7 +279,9 @@ def test_concurrent_cache_hits_are_independent_roots_not_single_flight_or_last_w
     old, _, _ = drive(make(), {"old": "same"})
     base = old.child_updates[0].snapshot
     # Completion ordering puts metrics first in this driver's update list.
-    name = "count_lines" if base.prompt.startswith("metrics:") else "list_imports"
+    name = (
+        "count_lines" if base.initial_messages[0].content.startswith("metrics:") else "list_imports"
+    )
     backend = {}
     descriptor = publish(base, backend)
     invocations = (
@@ -307,7 +311,9 @@ def test_concurrent_cache_hits_are_independent_roots_not_single_flight_or_last_w
     assert len(base.load(base.root.observations[0].continuation).observations) == 1
     for update in updates:
         assert (
-            len(update.snapshot.load(update.snapshot.root.observations[0].continuation).observations)
+            len(
+                update.snapshot.load(update.snapshot.root.observations[0].continuation).observations
+            )
             == 2
         )
         publish(update.snapshot, backend)  # both remain publishable; caller chooses future pointer
@@ -356,7 +362,9 @@ def test_resolver_compatibility_failures_and_argument_errors_are_transactional()
     backend = {}
     descriptor = publish(base, backend)
     for bad in (
-        replace(descriptor, prompt="other prompt"),
+        replace(
+            descriptor, initial_messages=(MessageEnvelope(role="user", content="other prompt"),)
+        ),
         replace(descriptor, subagents=(old.snapshot.descriptor.subagents[0],)),
         replace(descriptor, tools=()),
     ):
@@ -404,8 +412,8 @@ def test_resolver_failure_after_a_prepared_hit_keeps_the_whole_turn_pending():
     queried = []
 
     def resolve(query):
-        queried.append(query.prompt)
-        if query.prompt.startswith("imports:"):
+        queried.append(query.initial_messages[0].content)
+        if query.initial_messages[0].content.startswith("imports:"):
             return descriptor
         if broken:
             raise OSError("cache unavailable")
@@ -430,22 +438,32 @@ def test_resolver_failure_after_a_prepared_hit_keeps_the_whole_turn_pending():
 def test_registration_rules_legacy_advertisements_and_serial_driver():
     imports, metrics = definitions()
     with pytest.raises(ValueError, match="not both"):
-        BatchLoop(prompt="p", env_ids=["e"], tool_specs=[], subagent=imports, subagents=[])
+        BatchLoop(
+            initial_messages=(MessageEnvelope(role="user", content="p"),),
+            env_ids=["e"],
+            tool_specs=[],
+            subagent=imports,
+            subagents=[],
+        )
     with pytest.raises(ValueError, match="duplicate subagent"):
         make(registered=(imports, imports))
     with pytest.raises(ValueError, match="conflicting"):
         BatchLoop(
-            prompt="p",
+            initial_messages=(MessageEnvelope(role="user", content="p"),),
             env_ids=["e"],
             tool_specs=[ToolSpec(imports.name, "wrong", {})],
             subagents=(imports,),
         )
     with pytest.raises(ValueError, match="duplicate tool"):
-        BatchLoop(prompt="p", env_ids=["e"], tool_specs=[READ, READ])
+        BatchLoop(
+            initial_messages=(MessageEnvelope(role="user", content="p"),),
+            env_ids=["e"],
+            tool_specs=[READ, READ],
+        )
     assert make(registered=(imports,), resolver=lambda _: None).snapshot.root.assistant is None
     assert make(resolver=lambda _: None, budget=Budget(100)).snapshot.root.assistant is None
     legacy = BatchLoop(
-        prompt="parent",
+        initial_messages=(MessageEnvelope(role="user", content="parent"),),
         env_ids=["e"],
         tool_specs=[ToolSpec(imports.name, imports.description, imports.parameters)],
         subagent=imports,
@@ -462,7 +480,7 @@ def test_registration_rules_legacy_advertisements_and_serial_driver():
             return "value"
 
     result = run_to_completion(
-        prompt="parent-driver",
+        initial_messages=(MessageEnvelope(role="user", content="parent-driver"),),
         env_ids=["e"],
         tools=lambda _: [imports, metrics, Local()],
         complete_llm=lambda r: model(r, calls()[:2]),
@@ -473,7 +491,7 @@ def test_registration_rules_legacy_advertisements_and_serial_driver():
     assert all(not hasattr(u.snapshot.descriptor, "custom_grouping") for u in result.child_updates)
     with pytest.raises(ValueError, match="duplicate tool implementation"):
         run_to_completion(
-            prompt="parent-driver",
+            initial_messages=(MessageEnvelope(role="user", content="parent-driver"),),
             env_ids=["a", "b"],
             tools=lambda env: [imports, Local()] + ([Local()] if env == "b" else []),
             complete_llm=lambda r: model(r, calls()[:1]),
@@ -482,14 +500,14 @@ def test_registration_rules_legacy_advertisements_and_serial_driver():
     ordinary.parameters = imports.parameters
     with pytest.raises(ValueError, match="duplicate tool implementation"):
         run_to_completion(
-            prompt="p",
+            initial_messages=(MessageEnvelope(role="user", content="p"),),
             env_ids=["e"],
             tools=lambda _: [imports, ordinary],
             complete_llm=lambda r: LlmCompletion(r.request_id, "done"),
         )
     with pytest.raises(ValueError, match="duplicate tool implementation"):
         run_to_completion(
-            prompt="p",
+            initial_messages=(MessageEnvelope(role="user", content="p"),),
             env_ids=["e"],
             tools=lambda _: [imports, imports],
             complete_llm=lambda r: LlmCompletion(r.request_id, "done"),
@@ -508,7 +526,7 @@ def test_nested_allowlists_and_ancestor_depth_cap_do_not_leak_reserved_tools():
         "outer",
         "",
         SCHEMA,
-        lambda a: "outer:" + a["file_path"],
+        lambda a: (MessageEnvelope(role="user", content="outer:" + a["file_path"]),),
         lambda _: (READ, ToolSpec("sibling", "", {})),
         max_depth=2,
         subagents=(middle,),
@@ -555,7 +573,9 @@ def test_caller_selected_child_feedback_revision_does_not_rewrite_old_parent():
     old, _, _ = drive(make(), {"old": "same"}, (calls()[0],))
     child = old.child_updates[0].snapshot
     feedback = BatchLoop(
-        prompt=child.descriptor.prompt,
+        initial_messages=(
+            MessageEnvelope(role="user", content=child.descriptor.initial_messages[0].content),
+        ),
         env_ids=["old"],
         tool_specs=child.descriptor.tools,
         snapshot=child,
@@ -625,14 +645,14 @@ def test_opaque_prompts_and_hash_collisions_are_verified_by_value():
         "opaque",
         "",
         {},
-        lambda a: Blob(a["value"]),
+        lambda a: (MessageEnvelope(role="user", content=Blob(a["value"])),),
         lambda _: (),
         subagents=(),
     )
 
     def make_opaque(parent, resolver=None, store=None):
         return BatchLoop(
-            prompt=Blob(parent),
+            initial_messages=(MessageEnvelope(role="user", content=Blob(parent)),),
             env_ids=["e"],
             tool_specs=[],
             subagents=(tool,),

@@ -1,4 +1,3 @@
-
 """Fallible child preparation must never fulfill a pending assistant turn."""
 
 import pickle
@@ -14,6 +13,7 @@ from lockstep_loop import (
     InvalidHistoryError,
     LlmCompletion,
     LlmRequest,
+    MessageEnvelope,
     RecordStore,
     SubagentTool,
     ToolCall,
@@ -27,7 +27,7 @@ SPECS = (ToolSpec("probe", "", {}), ToolSpec("investigate", "", {}))
 
 def make_loop(sub, *, snapshot=None, env="old"):
     return BatchLoop(
-        prompt="parent",
+        initial_messages=(MessageEnvelope(role="user", content="parent"),),
         env_ids=[env],
         tool_specs=SPECS,
         subagent=sub,
@@ -53,10 +53,11 @@ def state(loop):
                 b.steps,
                 tuple(b.messages),
                 b.history_path,
+                b.finish_reason,
                 b.turn_calls,
                 tuple((call, tuple(values.items())) for call, values in b.turn_results.items()),
             )
-            for b in loop._partition
+            for b in (*loop._branches.values(), *loop._finals)
         ),
         tuple((key, state(link.child)) for key, link in loop._children.items()),
         tuple((key, link.child._id_prefix) for key, link in loop._child_ids.items()),
@@ -111,9 +112,7 @@ def persisted(snapshot):
 
 @pytest.mark.parametrize("failure", ["prompt", "specs"])
 @pytest.mark.parametrize("corrected_tools", [False, True])
-def test_failed_mixed_turn_is_unfulfilled_and_retry_agrees_with_snapshot(
-    failure, corrected_tools
-):
+def test_failed_mixed_turn_is_unfulfilled_and_retry_agrees_with_snapshot(failure, corrected_tools):
     prompts, specs = [], []
 
     def build(args):
@@ -126,7 +125,13 @@ def test_failed_mixed_turn_is_unfulfilled_and_retry_agrees_with_snapshot(
         if failure == "specs" and len(specs) == 2:
             raise RuntimeError("spec iterator failed after yielding")
 
-    sub = SubagentTool("investigate", "", {}, build, tool_specs)
+    sub = SubagentTool(
+        "investigate",
+        "",
+        {},
+        lambda args: (MessageEnvelope(role="user", content=build(args)),),
+        tool_specs,
+    )
     loop = make_loop(sub)
     request = loop.next_request()
     before = state(loop)
@@ -149,7 +154,7 @@ def test_failed_mixed_turn_is_unfulfilled_and_retry_agrees_with_snapshot(
     expected = "ordinary|child-good|child-fixed" if corrected_tools else "corrected"
     result = serve(loop)
     assert result.results == {"old": expected}
-    assert loop._partition[0].steps == (2 if corrected_tools else 1)
+    assert loop._finals[0].steps == (2 if corrected_tools else 1)
     assert before[0].root.assistant is None
     assert result.snapshot.root.assistant.content == "corrected"
     assert result.snapshot.root.assistant.tool_calls == calls
@@ -158,12 +163,18 @@ def test_failed_mixed_turn_is_unfulfilled_and_retry_agrees_with_snapshot(
 
 
 def test_failed_child_preparation_after_feedback_does_not_reinject_or_poison_history():
-    sub = SubagentTool("investigate", "", {}, lambda a: a["required"], lambda _: SPECS)
+    sub = SubagentTool(
+        "investigate",
+        "",
+        {},
+        lambda a: (MessageEnvelope(role="user", content=a["required"]),),
+        lambda _: SPECS,
+    )
     original = make_loop(sub)
     request = original.next_request()
     original.complete(LlmCompletion(request.request_id, "old answer"))
     loop = BatchLoop(
-        prompt="parent",
+        initial_messages=(MessageEnvelope(role="user", content="parent"),),
         env_ids=["old"],
         tool_specs=SPECS,
         subagent=sub,
@@ -190,7 +201,13 @@ def test_failed_child_preparation_after_feedback_does_not_reinject_or_poison_his
 
 
 def test_staged_commit_preserves_the_serving_lock_and_concurrent_routes():
-    sub = SubagentTool("investigate", "", {}, lambda a: "child-" + a["required"], lambda _: SPECS)
+    sub = SubagentTool(
+        "investigate",
+        "",
+        {},
+        lambda a: (MessageEnvelope(role="user", content="child-" + a["required"]),),
+        lambda _: SPECS,
+    )
     loop = make_loop(sub)
     lock = loop._lock
     request = loop.next_request()
@@ -224,7 +241,13 @@ def test_callback_exception_type_alone_does_not_commit_a_terminal_failure(error_
     def build(_):
         raise error_type("caller callback, not a detected loop failure")
 
-    sub = SubagentTool("investigate", "", {}, build, lambda _: SPECS)
+    sub = SubagentTool(
+        "investigate",
+        "",
+        {},
+        lambda args: (MessageEnvelope(role="user", content=build(args)),),
+        lambda _: SPECS,
+    )
     loop = make_loop(sub)
     request = loop.next_request()
     before = state(loop)
@@ -237,7 +260,14 @@ def test_callback_exception_type_alone_does_not_commit_a_terminal_failure(error_
 
 
 def test_callback_failure_in_nested_completion_preserves_parent_routes():
-    sub = SubagentTool("investigate", "", {}, lambda a: a["required"], lambda _: SPECS, 2)
+    sub = SubagentTool(
+        "investigate",
+        "",
+        {},
+        lambda a: (MessageEnvelope(role="user", content=a["required"]),),
+        lambda _: SPECS,
+        2,
+    )
     loop = make_loop(sub)
     parent = loop.next_request()
     loop.complete(
@@ -270,7 +300,13 @@ def test_parent_callback_failure_after_child_completion_restores_child_pending_r
             raise KeyError("second child unavailable")
         return args["required"]
 
-    sub = SubagentTool("investigate", "", {}, build, lambda _: SPECS)
+    sub = SubagentTool(
+        "investigate",
+        "",
+        {},
+        lambda args: (MessageEnvelope(role="user", content=build(args)),),
+        lambda _: SPECS,
+    )
     original = make_loop(sub)
     request = original.next_request()
     original.complete(
@@ -323,7 +359,13 @@ def test_callback_failure_while_polling_cached_child_rollup_is_atomic(poll):
             raise KeyError("unavailable second prompt")
         return args["required"]
 
-    sub = SubagentTool("investigate", "", {}, build, lambda _: SPECS)
+    sub = SubagentTool(
+        "investigate",
+        "",
+        {},
+        lambda args: (MessageEnvelope(role="user", content=build(args)),),
+        lambda _: SPECS,
+    )
     original = make_loop(sub)
     for name in ("first", "second"):
         request = original.next_request()
@@ -369,7 +411,13 @@ def test_last_tool_completion_prepares_replayed_children_before_consumption(fail
         if broken and failure == "specs":
             raise RuntimeError("temporarily unavailable specs")
 
-    sub = SubagentTool("investigate", "", {}, build, specs)
+    sub = SubagentTool(
+        "investigate",
+        "",
+        {},
+        lambda args: (MessageEnvelope(role="user", content=build(args)),),
+        specs,
+    )
     original = make_loop(sub)
     first = original.next_request()
     original.complete(LlmCompletion(first.request_id, "read first", (ToolCall("p", "probe", {}),)))

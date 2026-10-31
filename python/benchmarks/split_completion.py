@@ -9,12 +9,12 @@ import argparse
 from statistics import median
 from time import perf_counter
 
-from lockstep_loop import Agent, LlmCompletion, ToolCall, ToolCompletion
+from lockstep_loop import Agent, LlmCompletion, MessageEnvelope, ToolCall, ToolCompletion
 
 
 def run(n):
     start = perf_counter()
-    agent = Agent(prompt="p", tool_specs=[])
+    agent = Agent(initial_messages=(MessageEnvelope(role="user", content="p"),), tool_specs=[])
     loop = agent.start([str(i) for i in range(n)])
     request = loop.next_request()
     loop.complete(LlmCompletion(request.request_id, "", (ToolCall("x", "read", {}),)))

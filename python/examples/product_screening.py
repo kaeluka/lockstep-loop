@@ -15,6 +15,7 @@ from lockstep_loop import (
     BatchResult,
     LlmCompletion,
     LlmRequest,
+    MessageEnvelope,
     ToolCall,
     ToolCompletion,
     ToolSpec,
@@ -81,7 +82,9 @@ def screen(agent: Agent[str], evidence: Mapping[str, str]) -> tuple[BatchResult[
 
 
 def main() -> None:
-    agent = Agent(prompt=PROMPT, tool_specs=[RATINGS])
+    agent = Agent(
+        initial_messages=(MessageEnvelope(role="user", content=PROMPT),), tool_specs=[RATINGS]
+    )
     outdoor = ratings("IP65", -20, 50)
     initial, llms, reads = screen(
         agent,
@@ -99,10 +102,10 @@ def main() -> None:
     changed, llms, reads = screen(agent, {"product-a/v2": ratings("IP65", 0, 50)})
     assert (llms, reads) == (1, 1)
     assert changed.results["product-a/v2"] == "does not meet toy requirements"
-    assert len(list(old.assets())) == 2 and len(list(changed.snapshot.assets())) == 3
+    assert len(list(old.conversations())) == 2 and len(list(changed.snapshot.conversations())) == 3
     print(f"Revised specifications: {llms} LLM call, {reads} tool execution")
-    for asset in changed.snapshot.assets():
-        print(asset.env_ids, "->", asset.value)
+    for conversation in changed.snapshot.conversations():
+        print(conversation.env_ids, "->", conversation.get_last_answer_asset())
     # Persist descriptors and shallow records with caller-owned codecs as shown
     # in history_replay.py. No product-specific types or storage live in the core.
 

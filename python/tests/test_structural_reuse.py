@@ -1,6 +1,4 @@
-
 """Reuse depends on observations/configuration, never implementation/version labels."""
-
 
 import pytest
 
@@ -8,6 +6,7 @@ from lockstep_loop import (
     Budget,
     LlmCompletion,
     LlmRequest,
+    MessageEnvelope,
     RecordStore,
     SubagentTool,
     ToolCall,
@@ -40,7 +39,12 @@ def drive(loop, implementation, provider=lambda _: "answer"):
 
 
 def config(**options):
-    return BatchLoop(prompt="inspect", env_ids=["e"], tool_specs=[READ, OTHER], **options)
+    return BatchLoop(
+        initial_messages=(MessageEnvelope(role="user", content="inspect"),),
+        env_ids=["e"],
+        tool_specs=[READ, OTHER],
+        **options,
+    )
 
 
 def test_changed_tool_implementation_same_output_reuses_different_output_branches():
@@ -57,7 +61,12 @@ def test_changed_tool_implementation_same_output_reuses_different_output_branche
         _, count = drive(config(snapshot=changed.snapshot), lambda _, value=value: value)
         assert count == 0
     with pytest.raises(ValueError, match="incompatible"):
-        BatchLoop(prompt="inspect", env_ids=["e"], tool_specs=[OTHER, READ], snapshot=old)
+        BatchLoop(
+            initial_messages=(MessageEnvelope(role="user", content="inspect"),),
+            env_ids=["e"],
+            tool_specs=[OTHER, READ],
+            snapshot=old,
+        )
 
 
 def test_provider_and_custom_grouping_policy_are_external_not_inferred():
@@ -78,8 +87,6 @@ def test_provider_and_custom_grouping_policy_are_external_not_inferred():
     # raw outputs to historical representatives. Provider policy remains external.
     exact, count = drive(config(snapshot=old.snapshot), lambda _: "same ", changed_provider)
     assert count == 0 and exact.results == old.results
-
-
 
 
 @pytest.mark.parametrize("initial_custom", [False, True])
@@ -119,7 +126,7 @@ def test_stricter_keys_match_representatives_not_old_evidence(strict):
     assert grouped.snapshot.root == before and len(old.snapshot.root.observations) == 1
     assert [e.outputs[0].tool_output for e in before.observations[0].evidence] == ["same ", "same"]
     assert changed.snapshot.root.observations[1].representative[0].tool_output == "same"
-    assert next(grouped.snapshot.assets()).messages[-2].content == "same "
+    assert next(grouped.snapshot.conversations()).messages[-2].content == "same "
 
 
 def test_coarser_keys_choose_first_existing_edge_without_merging_history():
@@ -135,14 +142,21 @@ def test_coarser_keys_choose_first_existing_edge_without_merging_history():
     assert len(edges) == 2 and edges[1] == before.observations[1]
     assert [e.outputs[0].tool_output for e in edges[0].evidence] == ["A", "a "]
     assert edges[0].representative[0].tool_output == "A"
-    assert next(replay.snapshot.assets()).messages[-2].content == "A"
+    assert next(replay.snapshot.conversations()).messages[-2].content == "A"
     assert old.snapshot.root == before and len(first.snapshot.root.observations) == 1
     exact, count = drive(config(snapshot=replay.snapshot), lambda _: "a")
     assert count == 0 and exact.results == {"e": "second"}
 
 
 def test_child_query_and_execution_do_not_distinguish_default_from_custom_identity():
-    tool = SubagentTool("child", "", {}, lambda _: "child prompt", lambda _: (READ,), subagents=())
+    tool = SubagentTool(
+        "child",
+        "",
+        {},
+        lambda _: (MessageEnvelope(role="user", content="child prompt"),),
+        lambda _: (READ,),
+        subagents=(),
+    )
     selected = None
     store = RecordStore()
     queries = []
@@ -153,7 +167,7 @@ def test_child_query_and_execution_do_not_distinguish_default_from_custom_identi
 
     for grouping in (None, lambda v: v, None):
         loop = BatchLoop(
-            prompt="parent",
+            initial_messages=(MessageEnvelope(role="user", content="parent"),),
             env_ids=["e"],
             tool_specs=[],
             subagents=[tool],
@@ -183,19 +197,37 @@ def test_child_query_and_execution_do_not_distinguish_default_from_custom_identi
 
 
 def test_child_structural_identity_and_fresh_budget():
-    tool = SubagentTool("child", "", {}, lambda _: "child", lambda _: (), subagents=())
-    loop = BatchLoop(prompt="p", env_ids=["e"], tool_specs=[], subagents=[tool])
+    tool = SubagentTool(
+        "child",
+        "",
+        {},
+        lambda _: (MessageEnvelope(role="user", content="child"),),
+        lambda _: (),
+        subagents=(),
+    )
+    loop = BatchLoop(
+        initial_messages=(MessageEnvelope(role="user", content="p"),),
+        env_ids=["e"],
+        tool_specs=[],
+        subagents=[tool],
+    )
     r = loop.next_request()
     loop.complete(LlmCompletion(r.request_id, "done"))
     replay = BatchLoop(
-        prompt="p",
+        initial_messages=(MessageEnvelope(role="user", content="p"),),
         env_ids=["e"],
         tool_specs=[],
         subagents=[tool],
         snapshot=loop.snapshot,
     )
     assert replay.done
-    fresh = BatchLoop(prompt="p", env_ids=["e"], tool_specs=[], subagents=[tool], budget=Budget(1))
+    fresh = BatchLoop(
+        initial_messages=(MessageEnvelope(role="user", content="p"),),
+        env_ids=["e"],
+        tool_specs=[],
+        subagents=[tool],
+        budget=Budget(1),
+    )
     assert fresh.snapshot.root.assistant is None
     request = fresh.next_request()
     fresh.complete(LlmCompletion(request.request_id, "done"))

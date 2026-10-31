@@ -1,6 +1,6 @@
 """Core types and orchestrator for lockstep-loop.
 
-lockstep-loop runs an agent's initial prompt across similar, read-only
+lockstep-loop runs an agent's initial messages across similar, read-only
 environments, sharing LLM work while observation paths remain equivalent:
 
 1. All environments start in one equivalence class sharing a single LLM
@@ -10,9 +10,9 @@ environments, sharing LLM work while observation paths remain equivalent:
 3. Tool results are compared and the class is refined: one sub-conversation
    per distinct result.  Branches then continue independently.
 4. The process repeats per branch until the loop finishes. The immutable AgentSnapshot
-   includes prompt, structural configuration, and accumulated
-   conversation trie; its Asset views expose leaf investigations and their complete paths.
-   EnvClass and SplitNode remain partition-only summaries, not assets or agents.
+   includes initial messages, structural configuration, and one accumulated
+   history trie; its Conversation views expose complete paths and asset accessors.
+   EnvClass is a flat execution-local grouping, not a second history tree.
 
 LLM work is shared by observation path; tools still execute per environment.
 Separate paths may publish the same value without remerging their conversations.
@@ -86,7 +86,13 @@ class Tool(Protocol[P_co]):
         """JSON Schema describing the call arguments."""
         ...
 
-    def __call__(self, args: Mapping[str, Any]) -> P_co: ...
+    def __call__(self, args: Any) -> P_co:
+        """Consume caller-owned immutable input, including null when the tool permits it.
+
+        The implementation validates its own advertised argument schema; the core
+        does not assume object-shaped input or interpret its contents.
+        """
+        ...
 
 
 @dataclass(frozen=True)
@@ -110,21 +116,34 @@ class ToolCall:
     """Unique within one assistant turn; ties tool result messages back to the call."""
 
     name: str
-    args: Mapping[str, Any]
+    args: Any
+    """Caller-owned immutable structured input; may include a real null value."""
 
 
 @dataclass(frozen=True)
-class Message(Generic[P]):
-    """A provider-neutral conversation message.
+class MessageEnvelope(Generic[P]):
+    """Structural envelope around an opaque caller-defined message value.
 
     ``tool_calls`` is only set on assistant messages; ``tool_call_id`` only
-    on tool messages.  ``content`` is opaque to the loop.
+    on tool messages. ``content`` may be text, images, audio, or another immutable
+    value: the library does not interpret it.
     """
 
-    role: Literal["user", "assistant", "tool"]
+    role: Literal["system", "user", "assistant", "tool"]
     content: P
     tool_calls: tuple[ToolCall, ...] = ()
     tool_call_id: str | None = None
+
+
+def _normalize_initial_messages(
+    messages: Sequence[MessageEnvelope[P]],
+) -> tuple[MessageEnvelope[P], ...]:
+    initial = tuple(messages)
+    if not initial:
+        raise ValueError("initial_messages must contain at least one message")
+    if not all(isinstance(message, MessageEnvelope) for message in initial):
+        raise TypeError("initial_messages must contain MessageEnvelope values")
+    return initial
 
 
 @dataclass(frozen=True)
@@ -157,7 +176,7 @@ class LlmRequest(Generic[P]):
     request_id: str
     branch_id: str
     env_ids: tuple[str, ...]
-    messages: tuple[Message[P], ...]
+    messages: tuple[MessageEnvelope[P], ...]
     tools: tuple[ToolSpec, ...]
     stats: RequestStats
 
@@ -233,8 +252,11 @@ class SubagentTool(Generic[P]):
     name: str
     description: str
     parameters: Mapping[str, Any]
-    build_prompt: Callable[[Mapping[str, Any]], P]
-    """Deterministically build the child's initial USER content; validate args here."""
+    build_initial_messages: Callable[[Any], Sequence[MessageEnvelope[P]]]
+    """Build the child's nonempty initial envelopes from immutable input; validate args here.
+
+    Input may be null or another structured value, not necessarily a mapping.
+    """
     sub_tool_specs: Callable[[str], Sequence[ToolSpec]]
     """Spec provider for the child loop's tools (one env id -> all specs)."""
     max_depth: int = 1
@@ -270,7 +292,7 @@ def _registration(
         if sub.name in by_name:
             if by_name[sub.name] != spec:
                 raise ValueError(f"conflicting ordinary/subagent spec for {sub.name!r}")
-            # Exact redundant advertisements are allowed for legacy callers.
+            # Exact redundant advertisements are allowed.
         else:
             advertised.append(spec)
             by_name[sub.name] = spec
@@ -293,24 +315,6 @@ class Budget:
 
 
 @dataclass(frozen=True)
-class SplitNode:
-    """An immutable node in the prefix-sharing trie.
-
-    Represents the set of environments whose conversations are identical so
-    far. Children retain result-group representations as labels, disambiguated
-    on representation collisions. Exact evidence and continuations live in
-    ``AgentSnapshot``, not this partition summary.
-
-    Nodes are never mutated: a split builds new child nodes and copies the
-    path from the split point back to the root (structural sharing).  Treat
-    ``children`` as read-only.
-    """
-
-    env_ids: tuple[str, ...]
-    children: Mapping[str, SplitNode] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
 class EnvClass:
     """A final equivalence class of environments."""
 
@@ -321,9 +325,6 @@ class EnvClass:
 @dataclass(frozen=True)
 class BatchResult(Generic[P]):
     """Final results, immutable snapshot and independent completed child updates."""
-
-    tree: SplitNode
-    """Legacy partition summary; use snapshot for replay."""
 
     classes: tuple[EnvClass, ...]
     """Final partition of environments by full tool-call trace."""
@@ -358,15 +359,13 @@ class _Branch(Generic[P]):
     """Mutable internal state for one live conversation branch."""
 
     branch_id: str
-    parent_id: str | None
-    group_key: str | None
-    """Edge label from the parent (None for the root)."""
     env_ids: tuple[str, ...]
-    messages: list[Message[P]]
+    messages: list[MessageEnvelope[P]]
     split_depth: int
     steps: int = 0
     history_path: _HistoryPath = ()
     final_content: P | None = None
+    finish_reason: Literal["answer", "budget"] | None = None
     turn_calls: tuple[ToolCall, ...] = ()
     turn_results: dict[str, dict[str, P]] = field(default_factory=dict)
     """tool_call_id -> (env_id -> result) for the current assistant turn."""
@@ -449,6 +448,7 @@ class _Transition(Generic[P]):
             branch.steps,
             branch.history_path,
             branch.final_content,
+            branch.finish_reason,
             branch.turn_calls,
             branch.turn_results,
         )
@@ -460,6 +460,7 @@ class _Transition(Generic[P]):
                 branch.steps,
                 branch.history_path,
                 branch.final_content,
+                branch.finish_reason,
                 branch.turn_calls,
                 branch.turn_results,
             ) = before
@@ -490,12 +491,12 @@ class _Transition(Generic[P]):
 
 
 class BatchLoop(Generic[P]):
-    """Orchestrates one prompt across many environments in lockstep.
+    """Orchestrates initial messages across many environments in lockstep.
 
     The loop owns partition refinement and the trie; the caller owns all
     execution.  A typical driver:
 
-        loop = BatchLoop(prompt=..., env_ids=..., tool_specs=...)
+        loop = BatchLoop(initial_messages=..., env_ids=..., tool_specs=...)
         while not loop.done:
             request = loop.next_request("any")
             if request is None:
@@ -537,7 +538,7 @@ class BatchLoop(Generic[P]):
     def __init__(
         self,
         *,
-        prompt: P,
+        initial_messages: Sequence[MessageEnvelope[P]],
         env_ids: Sequence[str],
         tool_specs: Sequence[ToolSpec],
         subagent: SubagentTool[P] | None = None,
@@ -555,7 +556,8 @@ class BatchLoop(Generic[P]):
         _unavailable_subagents: frozenset[str] = frozenset(),
     ) -> None:
         if snapshot is not None and not isinstance(snapshot, AgentSnapshot):
-            raise TypeError("snapshot must be an AgentSnapshot, not an asset or endpoint")
+            raise TypeError("snapshot must be an AgentSnapshot, not a conversation or endpoint")
+        initial = _normalize_initial_messages(initial_messages)
         envs = tuple(env_ids)
         if not envs:
             raise ValueError("env_ids must be non-empty")
@@ -574,15 +576,17 @@ class BatchLoop(Generic[P]):
         if feedback is not None and (snapshot is None or len(envs) != 1):
             raise ValueError("feedback requires a supplied snapshot and exactly one environment")
         if snapshot is not None and (
-            snapshot.descriptor.prompt != prompt
+            snapshot.descriptor.initial_messages != initial
             or snapshot.descriptor.tools != self._specs
             or snapshot.descriptor.subagents != sub_contracts
         ):
-            raise ValueError("incompatible snapshot prompt, tools or subagent configuration")
+            raise ValueError(
+                "incompatible snapshot initial_messages, tools or subagent configuration"
+            )
         if snapshot is None:
             store = record_store if record_store is not None else RecordStore[P]()
             snapshot = AgentSnapshot(
-                AgentDescriptor(prompt, self._specs, store.put(HistoryNode()), sub_contracts),
+                AgentDescriptor(initial, self._specs, store.put(HistoryNode()), sub_contracts),
                 store,
             )
         elif record_store is not None and record_store is not snapshot.store:
@@ -608,7 +612,6 @@ class BatchLoop(Generic[P]):
         self._advancing = False
         self._seq = 0
         self._branches: dict[str, _Branch[P]] = {}
-        self._partition: list[_Branch[P]] = []  # legacy per-run partition summary
         self._finals: list[_Branch[P]] = []
         self._child_histories: list[ChildAgentUpdate[P]] = []
         self._ready_llm: deque[LlmRequest[P]] = deque()
@@ -619,14 +622,11 @@ class BatchLoop(Generic[P]):
 
         root: _Branch[P] = _Branch(
             branch_id="root",
-            parent_id=None,
-            group_key=None,
             env_ids=envs,
-            messages=[Message(role="user", content=snapshot.descriptor.prompt)],
+            messages=list(snapshot.descriptor.initial_messages),
             split_depth=0,
         )
         self._branches[root.branch_id] = root
-        self._partition.append(root)
         self._run_atomic(lambda: self._request_llm(root))
         if not _defer_failure:
             self._raise_if_failed()
@@ -894,7 +894,7 @@ class BatchLoop(Generic[P]):
     def append_user_message(self, content: P) -> AgentSnapshot[P]:
         """Fork an OPEN continuation after resolving one environment by replay.
 
-        This legacy helper forks an already completed run; it does not resume
+        This helper forks an already completed run; it does not resume
         this loop. All environments reaching the path in the returned snapshot
         inherit the user message. Prefer the constructor's feedback option to
         enforce replay-only resolution before resumption. No endpoint ID exists.
@@ -911,10 +911,10 @@ class BatchLoop(Generic[P]):
             if len(branch.env_ids) != 1:
                 raise ValueError("user continuations require one resolved environment")
             node = self._recorded._node(branch.history_path)
-            if branch.messages[-1].role != "assistant" or branch.messages[-1].tool_calls:
+            if branch.finish_reason != "answer":
                 raise ValueError("resolve a completed assistant answer first")
             edge = UserContinuation(
-                Message(role="user", content=content),
+                MessageEnvelope(role="user", content=content),
                 self._recorded.store.put(HistoryNode()),
                 resolved_env_id=branch.env_ids[0],
             )
@@ -967,7 +967,7 @@ class BatchLoop(Generic[P]):
             return self._out_llm + self._out_tool
 
     def result(self) -> BatchResult[P]:
-        """The final snapshot: split trie, equivalence classes, results.
+        """The final snapshot, execution-local equivalence classes, and results.
 
         Raises RuntimeError unless the loop is done, or the stored terminal
         execution error when resolution failed. No partial revised result is published.
@@ -1103,7 +1103,7 @@ class BatchLoop(Generic[P]):
         reserved = self._unavailable_subagents | self._subagents.keys() | {s.name for s in declared}
         allowed = {s.name for s in nested}
         unavailable = frozenset(reserved - allowed)
-        prompt = sub.build_prompt(call.args)
+        initial_messages = _normalize_initial_messages(sub.build_initial_messages(call.args))
         child_specs, _, child_contracts = _registration(
             tuple(s for s in sub.sub_tool_specs(branch.env_ids[0]) if s.name not in unavailable),
             nested,
@@ -1120,15 +1120,15 @@ class BatchLoop(Generic[P]):
         if self._resolve_only and previous is None:
             return FeedbackResolutionError("no recorded subagent conversation")
         if previous is None and self._history_resolver is not None:
-            selected = self._history_resolver(AgentQuery(prompt, child_specs, child_contracts))
+            selected = self._history_resolver(
+                AgentQuery(initial_messages, child_specs, child_contracts)
+            )
             if selected is not None:
                 if not isinstance(selected, AgentDescriptor):
-                    raise TypeError(
-                        "agent_resolver must return AgentDescriptor or None"
-                    )
+                    raise TypeError("agent_resolver must return AgentDescriptor or None")
                 previous = AgentSnapshot(selected, self._recorded.store)
         child: BatchLoop[P] = BatchLoop(
-            prompt=prompt,
+            initial_messages=initial_messages,
             env_ids=branch.env_ids,
             tool_specs=child_specs,
             subagents=nested,
@@ -1173,9 +1173,12 @@ class BatchLoop(Generic[P]):
             seq=self._seq,
         )
 
-    def _finish(self, branch: _Branch[P], content: P) -> None:
+    def _finish(
+        self, branch: _Branch[P], content: P, *, reason: Literal["answer", "budget"]
+    ) -> None:
         self._watch_branch(branch)
         branch.final_content = content
+        branch.finish_reason = reason
         self._delete(self._branches, branch.branch_id)
         self._append(self._finals, branch)
 
@@ -1188,7 +1191,11 @@ class BatchLoop(Generic[P]):
                 if self._resolve_only:
                     self._fail(FeedbackResolutionError("budget exhausted while resolving feedback"))
                 else:
-                    self._finish(branch, cast(P, f"(budget exhausted after {branch.steps} steps)"))
+                    self._finish(
+                        branch,
+                        cast(P, f"(budget exhausted after {branch.steps} steps)"),
+                        reason="budget",
+                    )
                 return
             node = self._recorded._node(branch.history_path)
             if node.user_continuations and (
@@ -1240,11 +1247,13 @@ class BatchLoop(Generic[P]):
         branch = self._branches[request.branch_id]
         if self._accept_assistant(
             branch,
-            Message(role="assistant", content=completion.content, tool_calls=completion.tool_calls),
+            MessageEnvelope(
+                role="assistant", content=completion.content, tool_calls=completion.tool_calls
+            ),
         ):
             self._request_llm(branch)
 
-    def _accept_assistant(self, branch: _Branch[P], message: Message[P]) -> bool:
+    def _accept_assistant(self, branch: _Branch[P], message: MessageEnvelope[P]) -> bool:
         """Return True to schedule the next node after a user continuation."""
         if any(c.name in self._unavailable_subagents for c in message.tool_calls):
             self._fail(InvalidHistoryError("recorded call targets an unavailable subagent"))
@@ -1278,7 +1287,7 @@ class BatchLoop(Generic[P]):
             node = self._recorded._node(branch.history_path)
             if not node.user_continuations and self._feedback is not None:
                 edge = UserContinuation(
-                    Message(role="user", content=self._feedback.content),
+                    MessageEnvelope(role="user", content=self._feedback.content),
                     self._recorded.store.put(HistoryNode()),
                     resolved_env_id=branch.env_ids[0],
                 )
@@ -1291,7 +1300,7 @@ class BatchLoop(Generic[P]):
                 branch.messages.append(node.user_continuations[0].message)
                 branch.history_path = (*branch.history_path, ("user", 0))
                 return True
-            self._finish(branch, message.content)
+            self._finish(branch, message.content, reason="answer")
             return False
         branch.turn_calls = message.tool_calls
         branch.turn_results = {}
@@ -1328,15 +1337,13 @@ class BatchLoop(Generic[P]):
 
     def _plan_turn(
         self, branch: _Branch[P], results: dict[str, dict[str, P]]
-    ) -> list[tuple[list[str], int | None, str]]:
+    ) -> list[tuple[list[str], int | None]]:
         groups: dict[tuple[Hashable, ...], list[str]] = {}
         for env in branch.env_ids:
             key = tuple(self._comparison_key(results[c.id][env]) for c in branch.turn_calls)
             groups.setdefault(key, []).append(env)
         node = self._recorded._node(branch.history_path)
-        plan: list[tuple[list[str], int | None, str]] = []
-        labels: set[str] = set()
-        reserved = {str(key) for key in groups} if len(groups) > 1 else set()
+        plan: list[tuple[list[str], int | None]] = []
         for key, envs in groups.items():
             match = None
             # Apply today's function to both sides; first existing match wins
@@ -1345,26 +1352,19 @@ class BatchLoop(Generic[P]):
                 if key == tuple(self._comparison_key(o.tool_output) for o in edge.representative):
                     match = index
                     break
-            label = str(key) if len(groups) > 1 else ""
-            if label in labels:
-                suffix = 2
-                while f"{label} [collision {suffix}]" in labels | reserved:
-                    suffix += 1
-                label = f"{label} [collision {suffix}]"
-            labels.add(label)
-            plan.append((envs, match, label))
+            plan.append((envs, match))
         return plan
 
     def _advance_turn(
-        self, branch: _Branch[P], plan: list[tuple[list[str], int | None, str]] | None = None
+        self, branch: _Branch[P], plan: list[tuple[list[str], int | None]] | None = None
     ) -> None:
         if plan is None:
             plan = self._plan_turn(branch, branch.turn_results)
-        if self._resolve_only and any(match is None for _, match, _ in plan):
+        if self._resolve_only and any(match is None for _, match in plan):
             self._fail(FeedbackResolutionError("unseen tool observation while resolving feedback"))
             return
         split = len(plan) > 1
-        for envs, match, group_label in plan:
+        for envs, match in plan:
             path = branch.history_path
             messages = list(branch.messages)
             node = self._recorded._node(path)
@@ -1389,7 +1389,7 @@ class BatchLoop(Generic[P]):
             # Reuse the historical representative, not today's lossy-equivalent output.
             for call, output in zip(branch.turn_calls, edges[match].representative, strict=True):
                 messages.append(
-                    Message(role="tool", content=output.tool_output, tool_call_id=call.id)
+                    MessageEnvelope(role="tool", content=output.tool_output, tool_call_id=call.id)
                 )
             path = (*path, ("observation", match))
             if split:
@@ -1398,8 +1398,6 @@ class BatchLoop(Generic[P]):
                 label = f"b{self._next_branch}"
                 child: _Branch[P] = _Branch(
                     branch_id=f"{branch.branch_id}/{label}",
-                    parent_id=branch.branch_id,
-                    group_key=group_label,
                     env_ids=tuple(envs),
                     messages=messages,
                     split_depth=branch.split_depth + 1,
@@ -1407,7 +1405,6 @@ class BatchLoop(Generic[P]):
                     history_path=path,
                 )
                 self._put(self._branches, child.branch_id, child)
-                self._append(self._partition, child)
                 self._request_llm(child)
             else:
                 branch.messages = messages
@@ -1421,23 +1418,12 @@ class BatchLoop(Generic[P]):
             self._delete(self._branches, branch.branch_id)
 
     def _finalize(self) -> BatchResult[P]:
-        children_of: dict[str, dict[str, SplitNode]] = {}
-        root_node: SplitNode | None = None
-        for b in reversed(self._partition):
-            node = SplitNode(env_ids=b.env_ids, children=children_of.get(b.branch_id, {}))
-            if b.parent_id is None:
-                root_node = node
-            else:
-                assert b.group_key is not None
-                children_of.setdefault(b.parent_id, {})[b.group_key] = node
-        assert root_node is not None
         classes = tuple(EnvClass(id=b.branch_id, env_ids=b.env_ids) for b in self._finals)
         results: dict[str, P] = {}
         for b in self._finals:
             for env in b.env_ids:
                 results[env] = cast(P, b.final_content)
         return BatchResult(
-            tree=root_node,
             classes=classes,
             results=results,
             snapshot=self._recorded,
@@ -1447,7 +1433,7 @@ class BatchLoop(Generic[P]):
 
 def run_batch(
     *,
-    prompt: P,
+    initial_messages: Sequence[MessageEnvelope[P]],
     env_ids: Sequence[str],
     tool_specs: Sequence[ToolSpec],
     comparison_key: Callable[[P], Hashable] | None = None,
@@ -1465,7 +1451,7 @@ def run_batch(
     from .agent import Agent
 
     loop = Agent(
-        prompt=prompt,
+        initial_messages=initial_messages,
         tool_specs=tool_specs,
         comparison_key=comparison_key,
     ).start(env_ids, budget=budget)
@@ -1489,7 +1475,7 @@ def run_batch(
 
 def run_to_completion(
     *,
-    prompt: P,
+    initial_messages: Sequence[MessageEnvelope[P]],
     env_ids: Sequence[str],
     tools: Callable[[str], Sequence[Tool[P] | SubagentTool[P]]],
     complete_llm: Callable[[LlmRequest[P]], LlmCompletion[P]],
@@ -1526,7 +1512,7 @@ def run_to_completion(
     from .agent import Agent
 
     loop = Agent(
-        prompt=prompt,
+        initial_messages=initial_messages,
         tool_specs=specs,
         subagents=subagents,
         comparison_key=comparison_key,

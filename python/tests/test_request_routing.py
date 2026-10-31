@@ -1,4 +1,3 @@
-
 """Routing addresses must not be assembled from opaque provider tool-call IDs."""
 
 import pytest
@@ -6,6 +5,7 @@ import pytest
 from lockstep_loop import (
     LlmCompletion,
     LlmRequest,
+    MessageEnvelope,
     SubagentTool,
     ToolCall,
     ToolCompletion,
@@ -21,11 +21,16 @@ SPECS = (ToolSpec("investigate", "", {}), ToolSpec("probe", "", {}))
 
 def make_loop(env="old", snapshot=None):
     return BatchLoop(
-        prompt="parent",
+        initial_messages=(MessageEnvelope(role="user", content="parent"),),
         env_ids=[env],
         tool_specs=SPECS,
         subagent=SubagentTool(
-            "investigate", "", {}, lambda args: args["prompt"], lambda _: SPECS, max_depth=2
+            "investigate",
+            "",
+            {},
+            lambda args: (MessageEnvelope(role="user", content=args["prompt"]),),
+            lambda _: SPECS,
+            max_depth=2,
         ),
         snapshot=snapshot,
     )
@@ -109,9 +114,7 @@ def finish(loop, seen, opaque_id, reverse, *, replay=False):
 
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("opaque_id", OPAQUE_IDS)
-def test_opaque_nested_ids_route_concurrent_completions_without_aliasing(
-    reverse, opaque_id
-):
+def test_opaque_nested_ids_route_concurrent_completions_without_aliasing(reverse, opaque_id):
     loop = make_loop()
     seen = set()
     parent = pull(loop, seen, "llm")

@@ -1,4 +1,3 @@
-
 """Recorded turns are the replay engine's source of truth, not a split summary."""
 
 import pickle
@@ -11,6 +10,7 @@ from lockstep_loop import (
     Budget,
     LlmCompletion,
     LlmRequest,
+    MessageEnvelope,
     RecordStore,
     SubagentTool,
     ToolCall,
@@ -25,7 +25,7 @@ SPECS = (ToolSpec("read", "read-only", {"type": "object"}),)
 
 def make_loop(envs=("old",), snapshot=None, **kwargs):
     return BatchLoop(
-        prompt="inspect",
+        initial_messages=(MessageEnvelope(role="user", content="inspect"),),
         env_ids=envs,
         tool_specs=SPECS,
         snapshot=snapshot,
@@ -83,7 +83,7 @@ def test_non_splitting_checkpoints_replay_branch_and_preserve_snapshots():
     first_next = old.load(first.continuation)
     second = first_next.observations[0]
     assert old.load(second.continuation).assistant.content == "two"
-    assert result.tree.children == {}  # both checkpoints used to be invisible
+    assert len(result.classes) == 1  # both unsplit checkpoints remain in the history
 
     replay, llms = drive(make_loop(("new",), old), {"new": old_values})
     assert llms == []
@@ -171,7 +171,7 @@ def test_hash_and_repr_collisions_do_not_conflate_records_or_branches():
     result, _ = drive(make_loop(("a", "b")), {"a": ((a, a),), "b": ((b, b),)}, turns=1)
     assert result.results == {"a": a, "b": b}
     assert len({c.id for c in result.classes}) == 2
-    assert len(result.tree.children) == 2
+    assert len(result.snapshot.root.observations) == 2
     for value in (a, b):
         replay, requests = drive(
             make_loop(("next",), result.snapshot), {"next": ((value, value),)}, turns=1
@@ -226,12 +226,16 @@ def test_final_only_replay_and_structural_compatibility():
     bounded = make_loop(("new",), snapshot, budget=Budget(1))
     assert bounded.done and bounded.result().results == {"new": "done"}
     for kwargs in (
-        {"prompt": "changed prompt"},
+        {"initial_messages": (MessageEnvelope(role="user", content="changed prompt"),)},
         {"tool_specs": []},
-        {"subagent": SubagentTool("s", "", {}, lambda _: "", lambda _: [])},
+        {
+            "subagent": SubagentTool(
+                "s", "", {}, lambda _: (MessageEnvelope(role="user", content=""),), lambda _: []
+            )
+        },
     ):
         options = dict(
-            prompt="inspect",
+            initial_messages=(MessageEnvelope(role="user", content="inspect"),),
             env_ids=["new"],
             tool_specs=SPECS,
             snapshot=snapshot,

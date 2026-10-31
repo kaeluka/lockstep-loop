@@ -8,7 +8,15 @@ For advanced lazy/incremental storage, see history_replay.py.
 import io
 import pickle
 
-from lockstep_loop import Agent, LlmCompletion, LlmRequest, ToolCall, ToolCompletion, ToolSpec
+from lockstep_loop import (
+    Agent,
+    LlmCompletion,
+    LlmRequest,
+    MessageEnvelope,
+    ToolCall,
+    ToolCompletion,
+    ToolSpec,
+)
 
 
 def investigate(agent, env, observation):
@@ -40,7 +48,10 @@ def save(agent):
 
 
 def main():
-    agent = Agent(prompt="Read the status.", tool_specs=[ToolSpec("status", "Read status", {})])
+    agent = Agent(
+        initial_messages=(MessageEnvelope(role="user", content="Read the status."),),
+        tool_specs=[ToolSpec("status", "Read status", {})],
+    )
     assert investigate(agent, "yesterday", "clean") == 2
     old = agent.snapshot()
     saved = save(agent)

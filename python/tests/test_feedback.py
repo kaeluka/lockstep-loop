@@ -12,6 +12,7 @@ from lockstep_loop import (
     InvalidHistoryError,
     LlmCompletion,
     LlmRequest,
+    MessageEnvelope,
     RecordStore,
     SubagentTool,
     ToolCall,
@@ -29,7 +30,7 @@ OLD = "no issues"
 
 def loop_for(envs, snapshot=None, feedback=None, **options):
     return BatchLoop(
-        prompt=PROMPT,
+        initial_messages=(MessageEnvelope(role="user", content=PROMPT),),
         env_ids=envs,
         tool_specs=SPECS,
         snapshot=snapshot,
@@ -322,7 +323,9 @@ def test_partial_paths_and_unfinished_feedback_are_not_targets():
 
 def test_opaque_null_feedback_presence_and_constructor_limits():
     initial_loop = BatchLoop(
-        prompt=b"prompt", env_ids=["A"], tool_specs=[]
+        initial_messages=(MessageEnvelope(role="user", content=b"prompt"),),
+        env_ids=["A"],
+        tool_specs=[],
     )
     request = initial_loop.next_request()
     initial_loop.complete(LlmCompletion(request.request_id, b"same"))
@@ -330,7 +333,7 @@ def test_opaque_null_feedback_presence_and_constructor_limits():
     updated = old
     for _ in range(3):
         loop = BatchLoop(
-            prompt=b"prompt",
+            initial_messages=(MessageEnvelope(role="user", content=b"prompt"),),
             env_ids=["A"],
             tool_specs=[],
             snapshot=updated,
@@ -343,22 +346,29 @@ def test_opaque_null_feedback_presence_and_constructor_limits():
         assert loop.done
         updated = loop.snapshot
     replay = BatchLoop(
-        prompt=b"prompt", env_ids=["C"], tool_specs=[], snapshot=updated
+        initial_messages=(MessageEnvelope(role="user", content=b"prompt"),),
+        env_ids=["C"],
+        tool_specs=[],
+        snapshot=updated,
     )
     assert replay.done and replay.result().results == {"C": b"same"}
     assert not old.root.user_continuations
     bounded = BatchLoop(
-        prompt=b"prompt", env_ids=["A"], tool_specs=[], snapshot=old,
-        feedback=Feedback(None), budget=Budget(100),
+        initial_messages=(MessageEnvelope(role="user", content=b"prompt"),),
+        env_ids=["A"],
+        tool_specs=[],
+        snapshot=old,
+        feedback=Feedback(None),
+        budget=Budget(100),
     )
     assert isinstance(bounded.next_request(), LlmRequest)
     for options in (
         {"snapshot": None},
         {"env_ids": ["A", "B"]},
-        {"prompt": b"changed"},
+        {"initial_messages": (MessageEnvelope(role="user", content=b"changed"),)},
     ):
         config = dict(
-            prompt=b"prompt",
+            initial_messages=(MessageEnvelope(role="user", content=b"prompt"),),
             env_ids=["A"],
             tool_specs=[],
             snapshot=old,
@@ -419,10 +429,17 @@ def test_ambiguous_user_edges_are_rejected_not_implicitly_merged():
 def nested_loop(snapshot=None, feedback=None):
     specs = (ToolSpec("investigate", "", {}), ToolSpec("probe", "", {}))
     return BatchLoop(
-        prompt="parent",
+        initial_messages=(MessageEnvelope(role="user", content="parent"),),
         env_ids=["A"],
         tool_specs=specs,
-        subagent=SubagentTool("investigate", "", {}, lambda a: a["prompt"], lambda _: specs, 1),
+        subagent=SubagentTool(
+            "investigate",
+            "",
+            {},
+            lambda a: (MessageEnvelope(role="user", content=a["prompt"]),),
+            lambda _: specs,
+            1,
+        ),
         snapshot=snapshot,
         feedback=feedback,
     )

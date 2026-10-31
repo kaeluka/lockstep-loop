@@ -8,7 +8,7 @@ from lockstep_loop import (
     HistoryNode,
     LlmCompletion,
     LlmRequest,
-    Message,
+    MessageEnvelope,
     Observation,
     OutputRecord,
     RecordStore,
@@ -25,12 +25,17 @@ SPECS = (ToolSpec("probe", "", {}), ToolSpec("status", "", {}), ToolSpec("invest
 
 def nested_loop(envs, snapshot=None, depth=2):
     return BatchLoop(
-        prompt="main",
+        initial_messages=(MessageEnvelope(role="user", content="main"),),
         env_ids=envs,
         tool_specs=SPECS,
         snapshot=snapshot,
         subagent=SubagentTool(
-            "investigate", "", {}, lambda args: args["question"], lambda _: SPECS, depth
+            "investigate",
+            "",
+            {},
+            lambda args: (MessageEnvelope(role="user", content=args["question"]),),
+            lambda _: SPECS,
+            depth,
         ),
     )
 
@@ -222,7 +227,7 @@ def test_invalid_nested_completion_preserves_routes_and_snapshot():
 
 def simple_loop(envs, snapshot=None, store=None):
     return BatchLoop(
-        prompt="inspect",
+        initial_messages=(MessageEnvelope(role="user", content="inspect"),),
         env_ids=envs,
         tool_specs=SPECS[:1],
         snapshot=snapshot,
@@ -311,7 +316,7 @@ def test_user_continuations_are_scoped_by_resolved_path_not_answer_value():
     assert not untouched.user_continuations
     edge = answered.user_continuations[0]
     assert edge.resolved_env_id == "a"
-    assert edge.message == Message(role="user", content="Please check again.")
+    assert edge.message == MessageEnvelope(role="user", content="Please check again.")
     assert extended.load(edge.continuation).assistant is None
     assert not old.snapshot.load(old.snapshot.root.observations[0].continuation).user_continuations
     assert not resolving.snapshot.load(
@@ -326,15 +331,15 @@ def test_user_continuations_are_scoped_by_resolved_path_not_answer_value():
     open_ref = store.put(HistoryNode())
     same_answer = store.put(
         HistoryNode(
-            assistant=Message(role="assistant", content="same final"),
+            assistant=MessageEnvelope(role="assistant", content="same final"),
             user_continuations=(
-                UserContinuation(Message(role="user", content="One more check"), open_ref),
+                UserContinuation(MessageEnvelope(role="user", content="One more check"), open_ref),
             ),
         )
     )
     investigate = store.put(
         HistoryNode(
-            assistant=Message(
+            assistant=MessageEnvelope(
                 role="assistant", content="checking", tool_calls=(ToolCall("p", "probe", {}),)
             ),
             observations=(Observation((OutputRecord("A"),), (), same_answer),),
@@ -375,7 +380,7 @@ def test_storage_addresses_are_not_content_hashes_and_writer_reuse_is_rejected()
         invalid_writer.load(second)
 
 
-def test_partition_labels_and_collisions_are_preserved():
+def test_hash_and_repr_collisions_do_not_conflate_history_or_final_groups():
     class SameRepr:
         def __init__(self, value):
             self.value = value
@@ -389,13 +394,18 @@ def test_partition_labels_and_collisions_are_preserved():
         def __repr__(self):
             return "identical"
 
-    for outputs, expected in (
-        ({"a": "A", "b": "B"}, {"('A',)", "('B',)"}),
-        ({"a": SameRepr(1), "b": SameRepr(2)}, {"(identical,)", "(identical,) [collision 2]"}),
+    for outputs in (
+        {"a": "A", "b": "B"},
+        {"a": SameRepr(1), "b": SameRepr(2)},
     ):
-        loop = BatchLoop(prompt="inspect", env_ids=("a", "b"), tool_specs=SPECS[:1])
+        loop = BatchLoop(
+            initial_messages=(MessageEnvelope(role="user", content="inspect"),),
+            env_ids=("a", "b"),
+            tool_specs=SPECS[:1],
+        )
         result, _ = sequential(loop, outputs, 1)
-        assert set(result.tree.children) == expected
+        assert {c.env_ids for c in result.classes} == {("a",), ("b",)}
+        assert not hasattr(result, "tree")
         assert len({c.id for c in result.classes}) == 2
         assert len(result.snapshot.root.observations) == 2
         assert [e.representative[0].tool_output for e in result.snapshot.root.observations] == list(

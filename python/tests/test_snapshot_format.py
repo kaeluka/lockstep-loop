@@ -12,7 +12,7 @@ from lockstep_loop import (
     ChildAgentRun,
     EnvObservation,
     HistoryNode,
-    Message,
+    MessageEnvelope,
     NodeRef,
     Observation,
     OutputRecord,
@@ -26,7 +26,8 @@ from lockstep_loop import (
 
 def test_format_empty_snapshot_width_and_pickle_roundtrip(capsys):
     snapshot = Agent(
-        prompt="Inspect the greeting", tool_specs=[ToolSpec("read", "", {})]
+        initial_messages=(MessageEnvelope(role="user", content="Inspect the greeting"),),
+        tool_specs=[ToolSpec("read", "", {})],
     ).snapshot()
     expected = {
         "descriptor": snapshot.descriptor,
@@ -46,7 +47,7 @@ def test_format_loads_every_reachable_record_once_not_unrelated_store_records():
     store = RecordStore()
 
     def final(value):
-        return store.put(HistoryNode(assistant=Message("assistant", value)))
+        return store.put(HistoryNode(assistant=MessageEnvelope("assistant", value)))
 
     observation = final("observed-answer")
     feedback = final("feedback-answer")
@@ -56,12 +57,12 @@ def test_format_loads_every_reachable_record_once_not_unrelated_store_records():
     orphan = final("UNRELATED-RECORD")
 
     def descriptor(ref):
-        return AgentDescriptor("child-prompt", (), ref)
+        return AgentDescriptor((MessageEnvelope(role="user", content="child-prompt"),), (), ref)
 
     representative = (OutputRecord("representative-output"),)
     root = store.put(
         HistoryNode(
-            assistant=Message(
+            assistant=MessageEnvelope(
                 "assistant", "inspect", (ToolCall("read", "read", {"path": "/entry"}),)
             ),
             env_ids=("first-env", "second-env"),
@@ -75,7 +76,9 @@ def test_format_loads_every_reachable_record_once_not_unrelated_store_records():
                     observation,
                 ),
             ),
-            user_continuations=(UserContinuation(Message("user", "feedback-message"), feedback),),
+            user_continuations=(
+                UserContinuation(MessageEnvelope("user", "feedback-message"), feedback),
+            ),
             subagents=(
                 SubagentRecord(
                     "child-call",
@@ -95,7 +98,10 @@ def test_format_loads_every_reachable_record_once_not_unrelated_store_records():
         loaded.append(ref)
         return backend[ref]
 
-    snapshot = AgentSnapshot(AgentDescriptor("root-prompt", (), root), RecordStore(load=load))
+    snapshot = AgentSnapshot(
+        AgentDescriptor((MessageEnvelope(role="user", content="root-prompt"),), (), root),
+        RecordStore(load=load),
+    )
     assert "AgentDescriptor" in repr(snapshot)
     assert not loaded  # lightweight default representation
     formatted = snapshot.format()
@@ -118,7 +124,7 @@ def test_format_loads_every_reachable_record_once_not_unrelated_store_records():
     ):
         assert text in formatted
     assert "UNRELATED-RECORD" not in formatted
-    assert formatted.count("assistant=Message(role='assistant'") == 6
+    assert formatted.count("assistant=MessageEnvelope(role='assistant'") == 6
     assert snapshot.store.records() == {}
     assert snapshot.descriptor.root == root and store.records() == backend
     assert snapshot.format() == formatted
@@ -136,9 +142,11 @@ class Opaque:
 def test_format_uses_payload_repr_without_requiring_pickle_or_truncating_strings():
     payload = Opaque()
     store = RecordStore()
-    root = store.put(HistoryNode(assistant=Message("assistant", payload)))
+    root = store.put(HistoryNode(assistant=MessageEnvelope("assistant", payload)))
     long_prompt = "x" * 4000
-    snapshot = AgentSnapshot(AgentDescriptor(long_prompt, (), root), store)
+    snapshot = AgentSnapshot(
+        AgentDescriptor((MessageEnvelope(role="user", content=long_prompt),), (), root), store
+    )
     assert long_prompt in snapshot.format()
     assert "<opaque-evidence>" in snapshot.format()
     with pytest.raises(TypeError, match="Not pickleable"):
@@ -148,7 +156,7 @@ def test_format_uses_payload_repr_without_requiring_pickle_or_truncating_strings
 
 def test_deep_history_formatting_is_iterative_and_preserves_shared_addresses():
     store = RecordStore()
-    root = store.put(HistoryNode(assistant=Message("assistant", "end-marker")))
+    root = store.put(HistoryNode(assistant=MessageEnvelope("assistant", "end-marker")))
     for _ in range(1200):
         root = store.put(
             HistoryNode(
@@ -158,7 +166,9 @@ def test_deep_history_formatting_is_iterative_and_preserves_shared_addresses():
                 )
             )
         )
-    snapshot = AgentSnapshot(AgentDescriptor("deep", (), root), store)
+    snapshot = AgentSnapshot(
+        AgentDescriptor((MessageEnvelope(role="user", content="deep"),), (), root), store
+    )
     before = store.records()
     formatted = snapshot.format()
     assert formatted.count("HistoryNode(") == 1201
@@ -170,7 +180,9 @@ def test_deep_history_formatting_is_iterative_and_preserves_shared_addresses():
 def test_format_surfaces_missing_or_corrupt_records_without_changing_root(corrupt):
     root = NodeRef("missing", 0)
     store = RecordStore(load=(lambda _: None) if corrupt else None)
-    snapshot = AgentSnapshot(AgentDescriptor("p", (), root), store)
+    snapshot = AgentSnapshot(
+        AgentDescriptor((MessageEnvelope(role="user", content="p"),), (), root), store
+    )
     with pytest.raises(TypeError if corrupt else KeyError):
         snapshot.format()
     assert snapshot.descriptor.root == root and store.records() == {}

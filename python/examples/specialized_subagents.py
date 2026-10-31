@@ -12,6 +12,7 @@ from lockstep_loop import (
     Agent,
     LlmCompletion,
     LlmRequest,
+    MessageEnvelope,
     RecordStore,
     SubagentTool,
     ToolCall,
@@ -40,7 +41,9 @@ IMPORTS = SubagentTool(
     name="list_imports",
     description="List the packages imported by a file.",
     parameters=SCHEMA,
-    build_prompt=imports_prompt,
+    build_initial_messages=lambda args: (
+        MessageEnvelope(role="user", content=imports_prompt(args)),
+    ),
     sub_tool_specs=lambda _: (READ,),
     subagents=(),
 )
@@ -52,10 +55,10 @@ def investigate(parent_prompt, env, cache, backend):
     def resolve(query):
         # These configurations are fixed in this example. A more general index
         # may include all query fields; core verifies FULL compatibility either way.
-        return cache.get(query.prompt)
+        return cache.get(query.initial_messages[0].content)
 
     agent = Agent(
-        prompt=parent_prompt,
+        initial_messages=(MessageEnvelope(role="user", content=parent_prompt),),
         tool_specs=[],
         subagents=[IMPORTS],
         record_store=store,
@@ -106,7 +109,7 @@ if __name__ == "__main__":
     # Persist shallow records BEFORE publishing the selected child descriptor.
     # Trusted pickle only; choose your own codecs and backend in production.
     selected = pickle.loads(persist(original, backend))
-    cache[selected.prompt] = selected
+    cache[selected.initial_messages[0].content] = selected
 
     second, counts = investigate(
         "Parent B: a completely different parent prompt", "repo@commit-2", cache, backend
@@ -122,5 +125,5 @@ if __name__ == "__main__":
     # There is one update for this query here. Concurrent invocations would yield
     # separate entries; selecting/merging/publishing them is a caller decision.
     updated = pickle.loads(persist(update.snapshot, backend))
-    cache[updated.prompt] = updated
+    cache[updated.initial_messages[0].content] = updated
     print("Changed parent: 2 fresh parent LLM calls, 0 child LLM calls, 1 child tool rerun")

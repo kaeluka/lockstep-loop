@@ -14,6 +14,7 @@ from lockstep_loop import (
     FeedbackResolutionError,
     LlmCompletion,
     LlmRequest,
+    MessageEnvelope,
     RecordStore,
     SubagentTool,
     ToolCall,
@@ -56,7 +57,9 @@ def drive(run, values, *, answer=None):
 
 
 def test_fresh_sequential_branch_and_immutable_captures():
-    agent = Agent(prompt="greetings", tool_specs=[READ])
+    agent = Agent(
+        initial_messages=(MessageEnvelope(role="user", content="greetings"),), tool_specs=[READ]
+    )
     empty = agent.snapshot()
     run = agent.start(["alice", "bob"])
     assert isinstance(run, AgentRun) and run.snapshot() is empty
@@ -69,7 +72,7 @@ def test_fresh_sequential_branch_and_immutable_captures():
     assert empty.root.assistant is None
     with pytest.raises(FrozenInstanceError):
         old.descriptor = empty.descriptor
-    asset = next(old.assets())
+    asset = next(old.conversations())
     assert asset.snapshot is old
     assert [o.tool_output for o in asset.observations[0].representative] == ["hello", "hello"]
     same = agent.start(["carol"])
@@ -77,7 +80,7 @@ def test_fresh_sequential_branch_and_immutable_captures():
     changed = agent.start(["dave"])
     assert drive(changed, {"dave": "hola"}) == 1
     assert len(agent.snapshot().root.observations) == 2
-    assert len(old.root.observations) == 1 and asset.value == "hello"
+    assert len(old.root.observations) == 1 and asset.get_last_answer_asset() == "hello"
     assert len(asset.observations[0].evidence) == 2
     for value in ("hello", "hola"):
         assert drive(agent.start(["again"]), {"again": value}) == 0
@@ -88,7 +91,9 @@ def test_fresh_sequential_branch_and_immutable_captures():
 
 @pytest.mark.parametrize("reverse", [False, True])
 def test_overlapping_runs_capture_roots_last_completion_wins_without_merge(reverse):
-    agent = Agent(prompt="greetings", tool_specs=[READ])
+    agent = Agent(
+        initial_messages=(MessageEnvelope(role="user", content="greetings"),), tool_specs=[READ]
+    )
     drive(agent.start(["seed"]), {"seed": "known"})
     base = agent.snapshot()
     left, right = agent.start(["left"]), agent.start(["right"])
@@ -127,7 +132,11 @@ def test_overlapping_runs_capture_roots_last_completion_wins_without_merge(rever
 
 
 def test_storage_roundtrip_restores_prompt_specs_lazily_and_retains_opaque_evidence():
-    agent = Agent(prompt=b"greetings", tool_specs=[READ], comparison_key=bytes.strip)
+    agent = Agent(
+        initial_messages=(MessageEnvelope(role="user", content=b"greetings"),),
+        tool_specs=[READ],
+        comparison_key=bytes.strip,
+    )
     assert (
         drive(
             agent.start(["a", "b", "other"]),
@@ -173,7 +182,7 @@ def test_storage_roundtrip_restores_prompt_specs_lazily_and_retains_opaque_evide
 
 
 def test_final_only_immediate_completion_publication_and_invalid_completion():
-    agent = Agent(prompt="p", tool_specs=[])
+    agent = Agent(initial_messages=(MessageEnvelope(role="user", content="p"),), tool_specs=[])
     empty = agent.snapshot()
     run = agent.start(["a"])
     request = run.next_request()
@@ -198,7 +207,7 @@ def test_final_only_immediate_completion_publication_and_invalid_completion():
 
 
 def test_abandonment_failure_partial_snapshots_and_budget_are_not_assistant_facts():
-    agent = Agent(prompt="p", tool_specs=[READ])
+    agent = Agent(initial_messages=(MessageEnvelope(role="user", content="p"),), tool_specs=[READ])
     empty = agent.snapshot()
     abandoned = agent.start(["a"])
     r = abandoned.next_request()
@@ -239,16 +248,16 @@ def test_abandonment_failure_partial_snapshots_and_budget_are_not_assistant_fact
 
 
 def test_feedback_budget_publishes_real_open_continuation_immediately():
-    agent = Agent(prompt="p", tool_specs=[])
+    agent = Agent(initial_messages=(MessageEnvelope(role="user", content="p"),), tool_specs=[])
     run = agent.start(["a"])
     run.complete(LlmCompletion(run.next_request().request_id, "old"))
     old = agent.snapshot()
-    asset = next(old.assets())
+    asset = next(old.conversations())
     bounded = agent.start(["a"], feedback=Feedback("revise"), budget=Budget(1))
     opened = agent.snapshot()
     assert opened is bounded.snapshot() and opened is not old
-    assert not next(opened.assets()).is_complete
-    assert next(opened.assets()).value == "old" and asset.is_complete
+    assert not next(opened.conversations()).is_complete
+    assert next(opened.conversations()).get_last_answer_asset() == "old" and asset.is_complete
     followup = agent.start(["b"])
     r = followup.next_request()
     assert [m.content for m in r.messages] == ["p", "old", "revise"]
@@ -256,13 +265,32 @@ def test_feedback_budget_publishes_real_open_continuation_immediately():
     newest = agent.snapshot()
     bounded.result()
     assert agent.snapshot() is newest
-    assert not old.root.user_continuations and asset.value == "old"
+    assert not old.root.user_continuations and asset.get_last_answer_asset() == "old"
 
 
 def test_specialized_nested_children_cache_updates_and_cached_start_publication():
-    leaf = SubagentTool("leaf", "", {}, lambda _: "leaf prompt", lambda _: (), subagents=())
-    outer = SubagentTool("outer", "", {}, lambda _: "outer prompt", lambda _: (), 2, (leaf,))
-    agent = Agent(prompt="parent", tool_specs=[], subagents=[outer])
+    leaf = SubagentTool(
+        "leaf",
+        "",
+        {},
+        lambda _: (MessageEnvelope(role="user", content="leaf prompt"),),
+        lambda _: (),
+        subagents=(),
+    )
+    outer = SubagentTool(
+        "outer",
+        "",
+        {},
+        lambda _: (MessageEnvelope(role="user", content="outer prompt"),),
+        lambda _: (),
+        2,
+        (leaf,),
+    )
+    agent = Agent(
+        initial_messages=(MessageEnvelope(role="user", content="parent"),),
+        tool_specs=[],
+        subagents=[outer],
+    )
     run = agent.start(["a"])
     for name in ("outer", "leaf"):
         r = run.next_request()
@@ -286,10 +314,10 @@ def test_specialized_nested_children_cache_updates_and_cached_start_publication(
     imported = AgentSnapshot(pickle.loads(pickle.dumps(old.descriptor)), RecordStore(load=load))
     restored = Agent.from_snapshot(imported, subagents=[outer])
     assert not loaded
-    assert next(imported.assets()).value == "parent value"
+    assert next(imported.conversations()).get_last_answer_asset() == "parent value"
     assert len(loaded) == 2 and child.descriptor.root not in loaded
     imported_child = imported.child(imported.root.subagents[0])
-    assert next(imported_child.assets()).value == "outer value"
+    assert next(imported_child.conversations()).get_last_answer_asset() == "outer value"
     assert len(loaded) == 4
     assert child.root.subagents[0].snapshot.root not in loaded
     cached = restored.start(["b"])
@@ -297,7 +325,7 @@ def test_specialized_nested_children_cache_updates_and_cached_start_publication(
     assert cached.done and cached.next_request() is None
     assert len(cached.result().child_updates) == 2
     changed_parent = Agent(
-        prompt="changed parent",
+        initial_messages=(MessageEnvelope(role="user", content="changed parent"),),
         tool_specs=[],
         subagents=[outer],
         record_store=child.store,
@@ -314,7 +342,7 @@ def test_specialized_nested_children_cache_updates_and_cached_start_publication(
 
 
 def test_last_tool_completion_publishes_without_polling_and_failure_cannot_revert_new_head():
-    agent = Agent(prompt="p", tool_specs=[READ])
+    agent = Agent(initial_messages=(MessageEnvelope(role="user", content="p"),), tool_specs=[READ])
     drive(agent.start(["old"]), {"old": "known"})
     old = agent.snapshot()
     failed = agent.start(["bad"], feedback=Feedback("revise"))
@@ -342,8 +370,18 @@ def test_cached_child_rollup_callback_failure_rolls_back_completion_before_publi
             raise ValueError("factory unavailable")
         return args["name"]
 
-    sub = SubagentTool("child", "", {}, prompt, lambda _: ())
-    agent = Agent(prompt="parent", tool_specs=[READ], subagents=[sub])
+    sub = SubagentTool(
+        "child",
+        "",
+        {},
+        lambda args: (MessageEnvelope(role="user", content=prompt(args)),),
+        lambda _: (),
+    )
+    agent = Agent(
+        initial_messages=(MessageEnvelope(role="user", content="parent"),),
+        tool_specs=[READ],
+        subagents=[sub],
+    )
     original = agent.start(["old"])
     r = original.next_request()
     original.complete(LlmCompletion(r.request_id, "read", (ToolCall("r", "read", {}),)))

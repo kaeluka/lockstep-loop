@@ -13,12 +13,14 @@ from .core import (
     Completion,
     Feedback,
     LlmRequest,
+    MessageEnvelope,
     P,
     Request,
     SubagentTool,
     ToolRequest,
     ToolSpec,
     _ExecutionError,
+    _normalize_initial_messages,
     _registration,
 )
 from .history import AgentDescriptor, AgentResolver, AgentSnapshot, HistoryNode, RecordStore
@@ -36,18 +38,19 @@ class Agent(Generic[P]):
     def __init__(
         self,
         *,
-        prompt: P,
+        initial_messages: Sequence[MessageEnvelope[P]],
         tool_specs: Sequence[ToolSpec],
         subagents: Sequence[SubagentTool[P]] = (),
         agent_resolver: AgentResolver[P] | None = None,
         comparison_key: Callable[[P], Hashable] | None = None,
         record_store: RecordStore[P] | None = None,
     ) -> None:
+        initial = _normalize_initial_messages(initial_messages)
         definitions = tuple(subagents)
         specs, _, contracts = _registration(tool_specs, definitions)
         store = record_store if record_store is not None else RecordStore[P]()
         self._head = AgentSnapshot(
-            AgentDescriptor(prompt, specs, store.put(HistoryNode()), contracts), store
+            AgentDescriptor(initial, specs, store.put(HistoryNode()), contracts), store
         )
         self._subagents = definitions
         self._resolver = agent_resolver
@@ -65,12 +68,13 @@ class Agent(Generic[P]):
     ) -> Agent[P]:
         """Attach runtime callbacks to a snapshot, without loading any records.
 
-        Prompt and ordered tool specs come from the snapshot. Supply matching
+        Initial messages and ordered tool specs come from the snapshot. Supply matching
         subagent definitions when configured; executable callbacks are not stored.
         A new handle is independent, though immutable records/store may be shared.
         """
         if not isinstance(snapshot, AgentSnapshot):
             raise TypeError("snapshot must be an AgentSnapshot")
+        _normalize_initial_messages(snapshot.initial_messages)
         definitions = tuple(subagents)
         specs, _, contracts = _registration(snapshot.descriptor.tools, definitions)
         if specs != snapshot.descriptor.tools or contracts != snapshot.descriptor.subagents:
@@ -110,7 +114,7 @@ class Agent(Generic[P]):
         """
         snapshot = self.snapshot()
         engine = BatchLoop(
-            prompt=snapshot.prompt,
+            initial_messages=snapshot.initial_messages,
             env_ids=environments,
             tool_specs=snapshot.descriptor.tools,
             subagents=self._subagents,

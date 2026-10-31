@@ -1,4 +1,3 @@
-
 """Tests for the prototype lockstep loop."""
 
 from collections.abc import Callable, Mapping
@@ -11,7 +10,7 @@ from lockstep_loop import (
     Budget,
     LlmCompletion,
     LlmRequest,
-    Message,
+    MessageEnvelope,
     SubagentTool,
     ToolCall,
     ToolCompletion,
@@ -38,11 +37,16 @@ def test_single_env_no_tool_calls():
     def llm(request: LlmRequest) -> LlmCompletion:
         return LlmCompletion(request_id=request.request_id, content="done")
 
-    result = run_to_completion(prompt="hi", env_ids=["a"], tools=lambda env: [], complete_llm=llm)
+    result = run_to_completion(
+        initial_messages=(MessageEnvelope(role="user", content="hi"),),
+        env_ids=["a"],
+        tools=lambda env: [],
+        complete_llm=llm,
+    )
 
     assert result.results == {"a": "done"}
-    assert result.tree.env_ids == ("a",)
-    assert result.tree.children == {}
+    assert result.classes[0].env_ids == ("a",)
+    assert not result.snapshot.root.observations
     assert [c.env_ids for c in result.classes] == [("a",)]
 
 
@@ -50,9 +54,7 @@ def test_split_on_divergent_results():
     files = {"a": "hello", "b": "hello", "c": "goodbye"}
 
     def make_tools(env: str) -> list[FakeTool]:
-        return [
-            FakeTool("read_file", "read a file", {"type": "object"}, lambda args: files[env])
-        ]
+        return [FakeTool("read_file", "read a file", {"type": "object"}, lambda args: files[env])]
 
     requests: list[LlmRequest] = []
 
@@ -65,17 +67,18 @@ def test_split_on_divergent_results():
                 tool_calls=(ToolCall(id="t1", name="read_file", args={}),),
             )
         tool_message = request.messages[-1]
-        return LlmCompletion(
-            request_id=request.request_id, content=f"saw:{tool_message.content}"
-        )
+        return LlmCompletion(request_id=request.request_id, content=f"saw:{tool_message.content}")
 
     result = run_to_completion(
-        prompt="read it", env_ids=["a", "b", "c"], tools=make_tools, complete_llm=llm
+        initial_messages=(MessageEnvelope(role="user", content="read it"),),
+        env_ids=["a", "b", "c"],
+        tools=make_tools,
+        complete_llm=llm,
     )
 
     assert result.results == {"a": "saw:hello", "b": "saw:hello", "c": "saw:goodbye"}
     assert sorted(c.env_ids for c in result.classes) == [("a", "b"), ("c",)]
-    assert len(result.tree.children) == 2
+    assert len(result.snapshot.root.observations) == 2
 
     # the whole point: the shared prefix cost one LLM call for three envs
     first_turns = [r for r in requests if len(r.messages) == 1]
@@ -105,12 +108,13 @@ def test_multi_tool_turn_groups_by_result_tuple():
                     ToolCall(id="c2", name="t2", args={}),
                 ),
             )
-        return LlmCompletion(
-            request_id=request.request_id, content=request.messages[-1].content
-        )
+        return LlmCompletion(request_id=request.request_id, content=request.messages[-1].content)
 
     result = run_to_completion(
-        prompt="x", env_ids=["a", "b", "c"], tools=make_tools, complete_llm=llm
+        initial_messages=(MessageEnvelope(role="user", content="x"),),
+        env_ids=["a", "b", "c"],
+        tools=make_tools,
+        complete_llm=llm,
     )
 
     assert result.results == {"a": "x", "b": "x", "c": "y"}
@@ -130,12 +134,13 @@ def test_bytes_payloads_group_by_value():
                 content=b"",
                 tool_calls=(ToolCall(id="s", name="snap", args={}),),
             )
-        return LlmCompletion(
-            request_id=request.request_id, content=request.messages[-1].content
-        )
+        return LlmCompletion(request_id=request.request_id, content=request.messages[-1].content)
 
     result = run_to_completion(
-        prompt=b"go", env_ids=["a", "b", "c"], tools=make_tools, complete_llm=llm
+        initial_messages=(MessageEnvelope(role="user", content=b"go"),),
+        env_ids=["a", "b", "c"],
+        tools=make_tools,
+        complete_llm=llm,
     )
 
     assert result.results == {"a": b"\x89PNG-a", "b": b"\x89PNG-a", "c": b"\x89PNG-b"}
@@ -158,7 +163,7 @@ def test_custom_comparison_key_groups_unequal_values():
         return LlmCompletion(request_id=request.request_id, content="fin")
 
     result = run_to_completion(
-        prompt="x",
+        initial_messages=(MessageEnvelope(role="user", content="x"),),
         env_ids=["a", "b"],
         tools=make_tools,
         complete_llm=llm,
@@ -179,7 +184,9 @@ def test_subagent_merges_by_answer():
             "properties": {"question": {"type": "string"}},
             "required": ["question"],
         },
-        build_prompt=lambda args: f"Answer: {args['question']}",
+        build_initial_messages=lambda args: (
+            MessageEnvelope(role="user", content=f"Answer: {args['question']}"),
+        ),
         sub_tool_specs=lambda env: [
             ToolSpec(name="probe", description="", parameters={"type": "object", "properties": {}})
         ],
@@ -198,9 +205,7 @@ def test_subagent_merges_by_answer():
                 return LlmCompletion(
                     request_id=request.request_id,
                     content="",
-                    tool_calls=(
-                        ToolCall(id="inv", name="investigate", args={"question": "q?"}),
-                    ),
+                    tool_calls=(ToolCall(id="inv", name="investigate", args={"question": "q?"}),),
                 )
             return LlmCompletion(
                 request_id=request.request_id,
@@ -213,12 +218,10 @@ def test_subagent_merges_by_answer():
                 content="",
                 tool_calls=(ToolCall(id="pr", name="probe", args={}),),
             )
-        return LlmCompletion(
-            request_id=request.request_id, content=request.messages[-1].content
-        )
+        return LlmCompletion(request_id=request.request_id, content=request.messages[-1].content)
 
     result = run_to_completion(
-        prompt="main",
+        initial_messages=(MessageEnvelope(role="user", content="main"),),
         env_ids=["a", "b", "c"],
         tools=make_tools,
         complete_llm=llm,
@@ -233,12 +236,17 @@ def test_subagent_max_depth_zero_rejected():
         name="s",
         description="",
         parameters={},
-        build_prompt=lambda args: "p",
+        build_initial_messages=lambda args: (MessageEnvelope(role="user", content="p"),),
         sub_tool_specs=lambda env: [],
         max_depth=0,
     )
     with pytest.raises(ValueError, match="max_depth"):
-        BatchLoop(prompt="x", env_ids=["e"], tool_specs=[], subagent=subagent)
+        BatchLoop(
+            initial_messages=(MessageEnvelope(role="user", content="x"),),
+            env_ids=["e"],
+            tool_specs=[],
+            subagent=subagent,
+        )
 
 
 def test_budget_stops_runaway_branch():
@@ -253,7 +261,7 @@ def test_budget_stops_runaway_branch():
         return [FakeTool("noop", "does nothing", {}, lambda args: "ok")]
 
     result = run_to_completion(
-        prompt="x",
+        initial_messages=(MessageEnvelope(role="user", content="x"),),
         env_ids=["a"],
         tools=make_tools,
         complete_llm=llm,
@@ -265,7 +273,9 @@ def test_budget_stops_runaway_branch():
 
 def test_kind_filtered_pulls_and_any_merge_order():
     loop = BatchLoop(
-        prompt="x", env_ids=["a", "b"], tool_specs=[ToolSpec("t", "", {})]
+        initial_messages=(MessageEnvelope(role="user", content="x"),),
+        env_ids=["a", "b"],
+        tool_specs=[ToolSpec("t", "", {})],
     )
 
     first = loop.next_request("llm")
@@ -286,9 +296,7 @@ def test_kind_filtered_pulls_and_any_merge_order():
     assert loop.next_request("llm") is None  # per-kind None: llm work is not done, just empty
 
     # divergent results split the branch into two llm requests
-    loop.complete(
-        ToolCompletion(request_id=tool_req.request_id, results=(("a", "1"), ("b", "2")))
-    )
+    loop.complete(ToolCompletion(request_id=tool_req.request_id, results=(("a", "1"), ("b", "2"))))
 
     llm_a = loop.next_request("llm")
     assert isinstance(llm_a, LlmRequest)
@@ -311,7 +319,9 @@ def test_kind_filtered_pulls_and_any_merge_order():
 
 
 def test_result_before_done_raises():
-    loop = BatchLoop(prompt="x", env_ids=["a"], tool_specs=[])
+    loop = BatchLoop(
+        initial_messages=(MessageEnvelope(role="user", content="x"),), env_ids=["a"], tool_specs=[]
+    )
     with pytest.raises(RuntimeError):
         loop.result()
     req = loop.next_request()
@@ -322,7 +332,9 @@ def test_result_before_done_raises():
 
 
 def test_wrong_completion_type_leaves_loop_intact():
-    loop = BatchLoop(prompt="x", env_ids=["a"], tool_specs=[])
+    loop = BatchLoop(
+        initial_messages=(MessageEnvelope(role="user", content="x"),), env_ids=["a"], tool_specs=[]
+    )
     req = loop.next_request()
     assert isinstance(req, LlmRequest)
     with pytest.raises(TypeError):
@@ -333,10 +345,12 @@ def test_wrong_completion_type_leaves_loop_intact():
 
 
 def test_generator_adapter_protocol():
-    gen = run_batch(prompt="hi", env_ids=["a"], tool_specs=[])
+    gen = run_batch(
+        initial_messages=(MessageEnvelope(role="user", content="hi"),), env_ids=["a"], tool_specs=[]
+    )
     request = next(gen)
     assert isinstance(request, LlmRequest)
-    assert request.messages == (Message(role="user", content="hi"),)
+    assert request.messages == (MessageEnvelope(role="user", content="hi"),)
 
     with pytest.raises(StopIteration) as exc_info:
         gen.send(LlmCompletion(request_id=request.request_id, content="done"))
@@ -346,15 +360,13 @@ def test_generator_adapter_protocol():
 
 def test_generator_adapter_forwards_comparison_key_without_rewriting_payloads():
     gen = run_batch(
-        prompt="inspect",
+        initial_messages=(MessageEnvelope(role="user", content="inspect"),),
         env_ids=["a", "b"],
         tool_specs=[ToolSpec("read", "", {})],
         comparison_key=lambda output: (output.strip(),),
     )
     request = next(gen)
-    tool = gen.send(
-        LlmCompletion(request.request_id, "look", (ToolCall("r", "read", {}),))
-    )
+    tool = gen.send(LlmCompletion(request.request_id, "look", (ToolCall("r", "read", {}),)))
     request = gen.send(ToolCompletion(tool.request_id, (("b", "same\n"), ("a", "same "))))
     assert request.env_ids == ("a", "b")
     assert request.messages[-1].content == "same "
@@ -364,7 +376,9 @@ def test_generator_adapter_forwards_comparison_key_without_rewriting_payloads():
 
 
 def test_completion_for_unknown_request_rejected():
-    loop = BatchLoop(prompt="hi", env_ids=["a"], tool_specs=[])
+    loop = BatchLoop(
+        initial_messages=(MessageEnvelope(role="user", content="hi"),), env_ids=["a"], tool_specs=[]
+    )
     loop.next_request()
     with pytest.raises(ValueError, match="no outstanding request"):
         loop.complete(LlmCompletion(request_id="bogus", content="done"))
@@ -372,9 +386,15 @@ def test_completion_for_unknown_request_rejected():
 
 def test_empty_env_ids_rejected():
     with pytest.raises(ValueError, match="non-empty"):
-        BatchLoop(prompt="x", env_ids=[], tool_specs=[])
+        BatchLoop(
+            initial_messages=(MessageEnvelope(role="user", content="x"),), env_ids=[], tool_specs=[]
+        )
 
 
 def test_duplicate_env_ids_rejected():
     with pytest.raises(ValueError, match="unique"):
-        BatchLoop(prompt="x", env_ids=["a", "a"], tool_specs=[])
+        BatchLoop(
+            initial_messages=(MessageEnvelope(role="user", content="x"),),
+            env_ids=["a", "a"],
+            tool_specs=[],
+        )

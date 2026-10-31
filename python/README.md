@@ -13,9 +13,15 @@ Recording is unconditional, including children. No provider clients or storage
 backends are included.
 
 ```python
-from lockstep_loop import Agent, LlmCompletion
+from lockstep_loop import Agent, LlmCompletion, MessageEnvelope
 
-agent = Agent(prompt="Explain the checklist.", tool_specs=[])
+agent = Agent(
+    initial_messages=[
+        MessageEnvelope("system", "Use the supplied evidence."),
+        MessageEnvelope("user", "Explain the checklist."),
+    ],
+    tool_specs=[],
+)
 run = agent.start(["packet-a/v1", "packet-b/v1"])
 request = run.next_request()
 run.complete(LlmCompletion(request.request_id, "done"))  # mock provider
@@ -24,10 +30,21 @@ assert run.result().results == {"packet-a/v1": "done", "packet-b/v1": "done"}
 
 old = agent.snapshot()
 cached = agent.start(["packet-c/v1"])
-assert cached.done                         # cached final-only start also publishes
+assert cached.done  # cached final-only start also publishes
 assert cached.next_request() is None
 assert old.root.env_ids == ("packet-a/v1", "packet-b/v1")
 ```
+
+`initial_messages` must contain one or more `MessageEnvelope` values. Their roles,
+order, tool metadata, and opaque contents are preserved, not concatenated or
+interpreted. System, user, assistant, and tool context envelopes are supported;
+initial context does not consume the turn budget. Sequence containers are frozen
+as tuples; their contents remain borrowed immutable-by-contract values.
+
+Tool-call arguments are also caller-owned immutable values. They can be null or
+another structured value, not only a mapping. Tool implementations and child
+initial-message builders validate their own advertised schemas; callbacks may
+explicitly accept `None`, mapping inputs, or another supported input type.
 
 For tools, drive the run until `run.done`: pull `next_request("any")`, execute each
 `LlmRequest` or `ToolRequest`, then `complete(...)`. Return exactly one tool output
@@ -61,7 +78,7 @@ Old snapshots remain unchanged and reusable.
 
 ### Easy persistence: pickle the snapshot
 
-Save and restore the snapshot directly, without repeating prompt/specs or collecting
+Save and restore the snapshot directly, without repeating initial messages/specs or collecting
 records yourself:
 
 ```python
@@ -110,7 +127,7 @@ restored = AgentSnapshot(
     decode_descriptor(published),
     RecordStore(load=lambda ref: decode_node(backend.read(ref))),
 )
-agent = Agent.from_snapshot(restored)  # no node loads; prompt/specs from descriptor
+agent = Agent.from_snapshot(restored)  # no node loads; initial messages/specs from descriptor
 run = agent.start(["packet-a/v2"])
 ```
 
@@ -118,7 +135,7 @@ run = agent.start(["packet-a/v2"])
 loader. Reserve a fresh namespace for each durable writer (Python defaults to a
 UUID). Persist local writes and retain all referenced old records. The core loads
 only the relevant path; it performs no persistence I/O. Pickle examples use trusted
-bytes only. Do not pickle live handles/callbacks or Asset views. There is no stable
+bytes only. Do not pickle live handles/callbacks or Conversation views. There is no stable
 cross-language/version wire format or legacy migration layer.
 
 Full messages, tool calls/arguments and exact per-environment outputs are retained.
@@ -135,7 +152,8 @@ is never replaced by keys. Stricter keys can branch despite matching an old
 evidence item; coarser keys choose the first matching stored edge without merging.
 Replay retains that edge's historical representative in model context.
 
-Structural checks cover prompts, ordered tool specs, nested specs/allowlists/depth,
+Structural checks cover every initial envelope (content, role, metadata, and order),
+ordered tool specs, nested specs/allowlists/depth,
 and actual child factory outputs. Provider/adapter and grouping-policy compatibility
 remain caller-owned. No manual contract/version key or callback registry exists.
 
@@ -144,8 +162,11 @@ remain caller-owned. No manual contract/version key or callback registry exists.
 ```python
 from lockstep_loop import Budget, Feedback
 
-run = agent.start(["packet-a/v2"], feedback=Feedback("Also check exclusions."),
-                  budget=Budget(max_steps_per_branch=20))
+run = agent.start(
+    ["packet-a/v2"],
+    feedback=Feedback("Also check exclusions."),
+    budget=Budget(max_steps_per_branch=20),
+)
 ```
 
 Feedback first resolves an existing completed path through tool replay without new
@@ -164,7 +185,12 @@ assistant records. Exhaustion during feedback resolution is a failure.
 
 Invalid completions and Python callback exceptions leave pending work correctable.
 Child preparation and cached rollup occur transactionally before publication.
-`FeedbackResolutionError`/`InvalidHistoryError` indicate terminal failures;
+A child structural-compatibility mismatch detected while advancing a completion
+raises `ValueError` and rolls back that transition, including during replay. The
+completion remains pending: correct the supplied runtime/configuration or
+completion and retry. This preserves Python's transactional recovery contract;
+Rust treats incompatibility during recorded-turn replay as terminal instead.
+Stored `FeedbackResolutionError`/`InvalidHistoryError` indicate terminal failures;
 `done` becomes true and `result()` raises. Failures and abandoned runs **do not
 replace the owner's head**. `run.snapshot()` may expose validated partial history,
 not pending requests or a crash-recovery protocol. Caller side effects, warmed
@@ -183,14 +209,16 @@ records and transient execution state. There is no imposed payload truncation;
 opaque values use their normal Python representations and need not be pickleable.
 The dump can be large and contain sensitive provider/tool content. History is not
 modified, although loader caches may warm. Plain `repr(snapshot)` remains lightweight
-and does not load records. For conversation-oriented inspection, use Asset views below.
+and does not load records. For path-oriented inspection, use Conversation views below.
 
-### Specialized children and Asset views
+### Specialized children and conversations
 
 Configure `subagents=[SubagentTool(...), ...]` and optional `agent_resolver` on the
 Agent. Reattach matching subagent definitions on `from_snapshot`; executable
-prompt/spec factories are never serialized. `AgentQuery(prompt, tools, subagents)`
-selects a child `AgentDescriptor` or None. The shared store must load its records.
+initial-message/spec factories are never serialized. Each subagent's
+`build_initial_messages(args)` returns a nonempty sequence of `MessageEnvelope`
+values. `AgentQuery(initial_messages, tools, subagents)` selects a child
+`AgentDescriptor` or None. The shared store must load its records.
 Queries do not include parent identity, environment IDs or grouping mode.
 Recorded parent invocations pin their child revision; new invocations may consult
 the caller's cache. Child tools rerun and equal child answers need not split parents.
@@ -203,24 +231,45 @@ automatically published to an external cache; the caller selects future revision
 
 ```python
 snapshot = agent.snapshot()
-for asset in snapshot.assets():
-    print(asset.env_ids, asset.is_complete, asset.messages)
-    if asset.has_value:
-        print(asset.value)
-    # asset.observations retains representatives AND exact per-environment evidence
+for conversation in snapshot.conversations():
+    print(conversation.env_ids, conversation.is_complete, conversation.messages)
+    if conversation.has_answer:
+        asset = conversation.get_last_answer_asset()
+        print(asset)
+    # conversation.observations retains representatives AND exact per-environment evidence
 ```
 
-Assets are immutable, lazy, path-backed views anchored in that snapshot. Subsequent
-Agent publications do not retarget them. An open continuation can retain an older
-published value; a real None differs from no value. `asset.snapshot` is its owner.
-Inspect children separately with `snapshot.child(entry).assets()`.
+Conversations are immutable, lazy, path-backed views anchored in that snapshot.
+Subsequent Agent publications do not retarget them. Inspect children separately
+with `snapshot.child(entry).conversations()`; `conversation.snapshot` is the anchor.
+The history trie is the single stored representation. There is no `SplitNode` or
+`result.tree`; `result.classes` and `result.results` are flat summaries of this run,
+not a partition reconstructed from all accumulated historical conversations.
+
+An **asset** is the value the caller wants from a conversation, not another wrapper:
+
+- `get_last_answer_asset()` returns the most recent no-tool assistant answer.
+- `get_final_tool_input_asset("submitFinalAnswer")` returns the arguments of the
+  latest matching call, scanning responses and calls in reverse order. It returns
+  the input, not tool output or assistant commentary.
+- Both raise `LookupError` when absent; a recorded `None` is returned as `None`.
+- Both include initial assistant context and earlier answers/calls while feedback
+  is open. A recorded pending tool call is available for inspection immediately.
+- These are read-only accessors: they do not execute tools, declare calls terminal,
+  or introduce result-tool publication. Initial assistant context can supply an
+  asset even when a zero-budget investigation has not accepted any response;
+  `is_complete` remains false and budget completion cannot authorize feedback.
+
+Python exceptions distinguish absence from null; Rust uses `Option` instead.
+Exact per-environment outputs remain distinct from shared historical representatives.
+Environment-hygiene and environment-key-indexed equivalence remain design TODOs.
 
 ## Executable examples and convenience drivers
 
 From this directory, no paid APIs or credentials required:
 
 ```sh
-for example in product_screening snapshot_pickle history_replay feedback specialized_subagents agent_assets; do
+for example in product_screening snapshot_pickle history_replay feedback specialized_subagents agent_conversations; do
     PYTHONPATH=src python examples/$example.py
 done
 ```
@@ -229,10 +278,10 @@ done
 sequential runs. [Snapshot pickle](examples/snapshot_pickle.py) is the easy persistence
 path; [history replay](examples/history_replay.py) demonstrates advanced lazy/incremental
 storage. [Feedback](examples/feedback.py), [children](examples/specialized_subagents.py)
-and [assets](examples/agent_assets.py) cover the other boundaries.
+and [conversations](examples/agent_conversations.py) cover the other boundaries.
 
-The one-shot `run_batch(prompt=..., env_ids=..., tool_specs=..., ...)` generator and
-`run_to_completion(prompt=..., env_ids=..., tools=..., complete_llm=..., ...)` local
+The one-shot `run_batch(initial_messages=..., env_ids=..., tool_specs=..., ...)` generator and
+`run_to_completion(initial_messages=..., env_ids=..., tools=..., complete_llm=..., ...)` local
 tool driver construct Agents internally and return `BatchResult` with snapshots.
 Use `Agent.start` for repeated investigations, feedback and child-cache selection.
 The underlying `core.BatchLoop` is internal execution machinery, not a competing

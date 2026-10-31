@@ -12,6 +12,7 @@ from lockstep_loop import (
     FeedbackResolutionError,
     LlmCompletion,
     LlmRequest,
+    MessageEnvelope,
     ToolCall,
     ToolCompletion,
     ToolSpec,
@@ -27,7 +28,7 @@ def investigate(envs, snapshot=None, feedback=None):
         Agent.from_snapshot(snapshot)
         if snapshot is not None
         else Agent(
-            prompt=PROMPT,
+            initial_messages=(MessageEnvelope(role="user", content=PROMPT),),
             tool_specs=SPECS,
         )
     )

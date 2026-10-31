@@ -6,13 +6,13 @@ import pytest
 from lockstep_loop import (
     AgentDescriptor,
     AgentSnapshot,
-    Asset,
+    Conversation,
     EnvObservation,
     Feedback,
     HistoryNode,
     LlmCompletion,
     LlmRequest,
-    Message,
+    MessageEnvelope,
     Observation,
     OutputRecord,
     RecordStore,
@@ -28,20 +28,22 @@ READ = ToolSpec("read", "read-only", {})
 
 def record():
     loop = BatchLoop(
-        prompt="inspect", env_ids=["A", "B", "D"], tool_specs=[READ]
+        initial_messages=(MessageEnvelope(role="user", content="inspect"),),
+        env_ids=["A", "B", "D"],
+        tool_specs=[READ],
     )
     empty = loop.snapshot
-    initial = next(empty.assets())
-    assert not initial.is_complete and not initial.has_value and initial.env_ids == ()
+    initial = next(empty.conversations())
+    assert not initial.is_complete and not initial.has_answer and initial.env_ids == ()
     assert initial.messages[0].content == "inspect"
     with pytest.raises(LookupError):
-        _ = initial.value
+        _ = initial.get_last_answer_asset()
     request = loop.next_request()
     loop.complete(
         LlmCompletion(request.request_id, "read", (ToolCall("r", "read", {"path": "/entry"}),))
     )
-    pending = next(loop.snapshot.assets())
-    assert not pending.is_complete and not pending.has_value
+    pending = next(loop.snapshot.conversations())
+    assert not pending.is_complete and not pending.has_answer
     assert pending.env_ids == ("A", "B", "D")
     assert pending.messages[-1].tool_calls[0].args == {"path": "/entry"}
     request = loop.next_request()
@@ -49,8 +51,8 @@ def record():
         ToolCompletion(request.request_id, (("D", "different"), ("B", "shared"), ("A", "shared")))
     )
     open_agent = loop.snapshot
-    assert [a.env_ids for a in open_agent.assets()] == [("A", "B"), ("D",)]
-    assert all(not a.is_complete and not a.has_value for a in open_agent.assets())
+    assert [a.env_ids for a in open_agent.conversations()] == [("A", "B"), ("D",)]
+    assert all(not a.is_complete and not a.has_answer for a in open_agent.conversations())
     while not loop.done:
         r = loop.next_request()
         loop.complete(LlmCompletion(r.request_id, "no issues"))
@@ -60,31 +62,31 @@ def record():
     return loop.snapshot, empty, open_agent
 
 
-def test_assets_are_path_backed_leaves_not_values_or_environment_classes():
+def test_conversations_are_path_backed_leaves_not_values_or_environment_classes():
     agent, empty, opened = record()
     assert isinstance(agent, AgentSnapshot)
-    assert agent.prompt == "inspect"
-    assets = list(agent.assets())
+    assert agent.initial_messages[0].content == "inspect"
+    assets = list(agent.conversations())
     assert len(assets) == 2
     assert [a.env_ids for a in assets] == [("A", "B"), ("D",)]
-    assert all(a.is_complete and a.value == "no issues" for a in assets)
+    assert all(a.is_complete and a.get_last_answer_asset() == "no issues" for a in assets)
     assert assets[0].messages != assets[1].messages  # same answer, different investigations
     assert assets[0].snapshot is agent
     assert [m.role for m in assets[0].messages] == ["user", "assistant", "tool", "assistant"]
     assert assets[0].observations[0].evidence[1].env_id == "B"
     assert assets[0].nodes[-1] is assets[0].node
     assert not hasattr(assets[0], "id") and not hasattr(assets[0], "resume")
-    with pytest.raises(TypeError, match="AgentSnapshot.assets"):
-        Asset()
+    with pytest.raises(TypeError, match="AgentSnapshot.conversations"):
+        Conversation()
     with pytest.raises(TypeError, match="persist the snapshot"):
         pickle.dumps(assets[0])
     with pytest.raises(FrozenInstanceError):
         assets[0].snapshot = empty
-    assert not next(empty.assets()).has_value
-    assert all(not a.is_complete for a in opened.assets())
-    with pytest.raises(TypeError, match="not an asset"):
+    assert not next(empty.conversations()).has_answer
+    assert all(not a.is_complete for a in opened.conversations())
+    with pytest.raises(TypeError, match="not a conversation"):
         BatchLoop(
-            prompt="inspect",
+            initial_messages=(MessageEnvelope(role="user", content="inspect"),),
             env_ids=["A"],
             tool_specs=[READ],
             snapshot=assets[0],
@@ -94,9 +96,9 @@ def test_assets_are_path_backed_leaves_not_values_or_environment_classes():
 
 def test_feedback_moves_the_leaf_but_preserves_old_assets_and_publication():
     old, _, _ = record()
-    old_asset = next(old.assets())
+    old_asset = next(old.conversations())
     loop = BatchLoop(
-        prompt=old.prompt,
+        initial_messages=(MessageEnvelope(role="user", content=old.initial_messages[0].content),),
         env_ids=["A"],
         tool_specs=[READ],
         snapshot=old,
@@ -106,27 +108,33 @@ def test_feedback_moves_the_leaf_but_preserves_old_assets_and_publication():
     assert not isinstance(tool, LlmRequest)  # assets do not provide a replay shortcut
     loop.complete(ToolCompletion(tool.request_id, (("A", "shared"),)))
     pending_agent = loop.snapshot
-    pending, unrelated = list(pending_agent.assets())
+    pending, unrelated = list(pending_agent.conversations())
     assert pending.env_ids == ("A", "B")  # shared-path inheritance, not resolved_env_id filtering
-    assert not pending.is_complete and pending.has_value
-    assert pending.value == "no issues"  # old publication, not a fabricated new completed value
+    assert not pending.is_complete and pending.has_answer
+    assert (
+        pending.get_last_answer_asset() == "no issues"
+    )  # old publication, not a fabricated new completed value
     assert pending.messages[-1].content == "check /foo"
-    assert unrelated.is_complete and unrelated.messages == list(old.assets())[1].messages
+    assert unrelated.is_complete and unrelated.messages == list(old.conversations())[1].messages
     assert old_asset.is_complete and old_asset.messages[-1].content == "no issues"
     assert old_asset.node.user_continuations == ()
     request = loop.next_request()
     assert request.messages == pending.messages
     loop.complete(LlmCompletion(request.request_id, "no issues"))
     current = loop.result().snapshot
-    revised = next(current.assets())
-    assert revised.is_complete and revised.value == old_asset.value
+    revised = next(current.conversations())
+    assert (
+        revised.is_complete and revised.get_last_answer_asset() == old_asset.get_last_answer_asset()
+    )
     assert len(revised.messages) == len(old_asset.messages) + 2
     assert revised.nodes[-2].assistant == old_asset.node.assistant
     assert revised.nodes[-2].user_continuations  # historical endpoint, not another asset
-    assert len(list(current.assets())) == 2
-    assert not next(pending_agent.assets()).is_complete
+    assert len(list(current.conversations())) == 2
+    assert not next(pending_agent.conversations()).is_complete
     replay = BatchLoop(
-        prompt=current.prompt,
+        initial_messages=(
+            MessageEnvelope(role="user", content=current.initial_messages[0].content),
+        ),
         env_ids=["C"],
         tool_specs=[READ],
         snapshot=current,
@@ -138,7 +146,7 @@ def test_feedback_moves_the_leaf_but_preserves_old_assets_and_publication():
 
 def test_asset_views_keep_lossy_evidence_and_real_null_values():
     loop = BatchLoop(
-        prompt=b"inspect",
+        initial_messages=(MessageEnvelope(role="user", content=b"inspect"),),
         env_ids=["A", "B"],
         tool_specs=[READ],
         comparison_key=bytes.strip,
@@ -149,9 +157,9 @@ def test_asset_views_keep_lossy_evidence_and_real_null_values():
     loop.complete(ToolCompletion(r.request_id, (("A", b"bytes "), ("B", b"bytes"))))
     r = loop.next_request()
     loop.complete(LlmCompletion(r.request_id, None))
-    asset = next(loop.snapshot.assets())
-    assert asset.is_complete and asset.has_value and asset.value is None
-    assert asset.published_message.content is None
+    asset = next(loop.snapshot.conversations())
+    assert asset.is_complete and asset.has_answer and asset.get_last_answer_asset() is None
+    assert asset.last_answer.content is None
     assert asset.messages[-2].content == b"bytes "
     assert [e.outputs[0].tool_output for e in asset.observations[0].evidence] == [
         b"bytes ",
@@ -170,48 +178,50 @@ def test_asset_enumeration_is_lazy_read_only_and_does_not_visit_child_updates():
         return pickle.loads(records[reference])
 
     restored = AgentSnapshot(pickle.loads(pickle.dumps(agent.descriptor)), RecordStore(load=load))
-    views = restored.assets()
+    views = restored.conversations()
     assert loaded == []
     first = next(views)
     assert first.env_ids == ("A", "B")
     assert len(loaded) == 2
     assert agent.root.observations[1].continuation not in loaded
     assert restored.store.records() == {}
-    assert first.messages == next(agent.assets()).messages
+    assert first.messages == next(agent.conversations()).messages
     assert len(list(views)) == 1
     assert restored.store.records() == {}
 
 
-
-
-
-
 def test_deep_asset_inspection_is_iterative_and_read_only():
     store = RecordStore("deep-assets")
-    root = store.put(HistoryNode(assistant=Message("assistant", "done"), env_ids=("A",)))
+    root = store.put(HistoryNode(assistant=MessageEnvelope("assistant", "done"), env_ids=("A",)))
     for step in reversed(range(1500)):
         outputs = (OutputRecord(str(step)),)
         root = store.put(
             HistoryNode(
-                assistant=Message("assistant", "read", (ToolCall("r", "read", {"step": step}),)),
+                assistant=MessageEnvelope(
+                    "assistant", "read", (ToolCall("r", "read", {"step": step}),)
+                ),
                 env_ids=("A",),
                 observations=(Observation(outputs, (EnvObservation("A", outputs),), root),),
             )
         )
-    agent = AgentSnapshot(AgentDescriptor("inspect", (READ,), root), store)
+    agent = AgentSnapshot(
+        AgentDescriptor((MessageEnvelope(role="user", content="inspect"),), (READ,), root), store
+    )
     before = len(store.records())
-    asset = next(agent.assets())
+    asset = next(agent.conversations())
     assert len(asset.observations) == 1500
     assert len(asset.messages) == 3002
-    assert asset.value == "done" and asset.env_ids == ("A",)
+    assert asset.get_last_answer_asset() == "done" and asset.env_ids == ("A",)
     assert len(store.records()) == before
 
 
 def test_child_snapshots_preserve_lookup_provenance_and_persistence():
-    tool = SubagentTool("inspect", "", {}, lambda _: "child", lambda _: ())
+    tool = SubagentTool(
+        "inspect", "", {}, lambda _: (MessageEnvelope(role="user", content="child"),), lambda _: ()
+    )
     assert not hasattr(tool, "agent_contract") and not hasattr(tool, "history_contract")
     loop = BatchLoop(
-        prompt="parent",
+        initial_messages=(MessageEnvelope(role="user", content="parent"),),
         env_ids=["A"],
         tool_specs=[],
         subagents=[tool],
@@ -226,19 +236,21 @@ def test_child_snapshots_preserve_lookup_provenance_and_persistence():
     result = loop.result()
     update = result.child_updates[0]
     assert isinstance(update.snapshot, AgentSnapshot)
-    assert len(list(result.snapshot.assets())) == 1  # child leaves are not parent assets
+    assert len(list(result.snapshot.conversations())) == 1  # child leaves are not parent assets
     entry = result.snapshot.root.subagents[0]
     assert entry.agent_descriptor is entry.snapshot
     assert entry.runs[0].agent_descriptor is entry.runs[0].snapshot
-    assert [a.value for a in result.snapshot.child(entry).assets()] == ["child value"]
-    assert update.snapshot.descriptor.query().prompt == "child"
+    assert [a.get_last_answer_asset() for a in result.snapshot.child(entry).conversations()] == [
+        "child value"
+    ]
+    assert update.snapshot.descriptor.query().initial_messages[0].content == "child"
     stored = pickle.dumps(result.snapshot.root)
     assert b"SubagentRecord" in stored and b"ChildAgentRun" in stored
     assert pickle.loads(stored) == result.snapshot.root
     assert "snapshot" in vars(entry) and "agent_descriptor" not in vars(entry)
     # Snapshot descriptors select the child cache and still replay its conversation.
     replay = BatchLoop(
-        prompt="changed parent",
+        initial_messages=(MessageEnvelope(role="user", content="changed parent"),),
         env_ids=["B"],
         tool_specs=[],
         subagents=[tool],

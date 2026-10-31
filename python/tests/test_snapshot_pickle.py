@@ -16,7 +16,7 @@ from lockstep_loop import (
     HistoryNode,
     LlmCompletion,
     LlmRequest,
-    Message,
+    MessageEnvelope,
     NodeRef,
     Observation,
     OutputRecord,
@@ -82,7 +82,9 @@ def drive(run, values):
 
 @pytest.mark.parametrize("completed", [False, True])
 def test_empty_and_completed_snapshots_support_dump_load_and_from_snapshot(protocol, completed):
-    agent = Agent(prompt=b"prompt", tool_specs=[READ])
+    agent = Agent(
+        initial_messages=(MessageEnvelope(role="user", content=b"prompt"),), tool_specs=[READ]
+    )
     original = agent.snapshot()
     if completed:
         run = agent.start(["old"])
@@ -91,14 +93,16 @@ def test_empty_and_completed_snapshots_support_dump_load_and_from_snapshot(proto
         original = agent.snapshot()
     restored = roundtrip(original, protocol)
     assert restored == original and restored.root == original.root
-    assert restored.descriptor.tools == (READ,) and restored.prompt == b"prompt"
+    assert (
+        restored.descriptor.tools == (READ,) and restored.initial_messages[0].content == b"prompt"
+    )
     assert restored.store.namespace != original.store.namespace
     assert restored.store.records() == {}  # bundled records are not new local writes
     agent = Agent.from_snapshot(restored)
     run = agent.start(["new"])
     if not completed:
         r = run.next_request()
-        assert r.messages == (Message("user", b"prompt"),) and r.tools == (READ,)
+        assert r.messages == (MessageEnvelope("user", b"prompt"),) and r.tools == (READ,)
         run.complete(LlmCompletion(r.request_id, b"done"))
         assert original.root.assistant is None
     assert run.done and run.next_request() is None
@@ -111,7 +115,11 @@ def test_opaque_provider_payloads_and_unequal_evidence_survive_without_callbacks
     with pytest.raises((AttributeError, pickle.PicklingError)):
         pickle.dumps(key)
     prompt = {"text": "prompt", "content_blocks": (b"\x00\xffimage",)}
-    agent = Agent(prompt=prompt, tool_specs=[READ], comparison_key=key)
+    agent = Agent(
+        initial_messages=(MessageEnvelope(role="user", content=prompt),),
+        tool_specs=[READ],
+        comparison_key=key,
+    )
     run = agent.start(["a", "b"])
     assistant = {"text": "reasoning", "provider": {"encrypted": b"\xfe\x00", "usage": 42}}
     calls = (ToolCall("x", "read", {"opaque": b"\xff"}), ToolCall("y", "read", {}))
@@ -124,9 +132,9 @@ def test_opaque_provider_payloads_and_unequal_evidence_survive_without_callbacks
     run.complete(LlmCompletion(run.next_request().request_id, answer))
     original = agent.snapshot()
     restored = roundtrip(original, protocol)
-    assert restored.root.assistant == Message("assistant", assistant, calls)
-    asset = next(restored.assets())
-    assert asset.value == answer and asset.messages[0].content == prompt
+    assert restored.root.assistant == MessageEnvelope("assistant", assistant, calls)
+    asset = next(restored.conversations())
+    assert asset.get_last_answer_asset() == answer and asset.messages[0].content == prompt
     assert asset.messages[2].content == outputs[0]  # historical representative
     evidence = asset.observations[0].evidence
     assert [e.outputs[0].tool_output for e in evidence] == list(outputs)
@@ -143,20 +151,39 @@ def test_opaque_provider_payloads_and_unequal_evidence_survive_without_callbacks
         assert not isinstance(r, LlmRequest)
         replay.complete(ToolCompletion(r.request_id, (("new", new_output),)))
     assert replay.done and replay.result().results == {"new": answer}
-    assert next(replay.snapshot().assets()).messages[2].content == outputs[0]
+    assert next(replay.snapshot().conversations()).messages[2].content == outputs[0]
     assert replay.snapshot().root.observations[0].evidence[-1].outputs[0].tool_output == new_output
     assert len(original.root.observations[0].evidence) == 2
 
 
 def test_nested_children_feedback_and_all_invocation_base_result_roots_are_bundled(protocol):
     store = RecordStore()
-    seed = Agent(prompt=b"leaf", tool_specs=[READ], record_store=store)
+    seed = Agent(
+        initial_messages=(MessageEnvelope(role="user", content=b"leaf"),),
+        tool_specs=[READ],
+        record_store=store,
+    )
     drive(seed.start(["seed"]), {"seed": b"known"})
     base = seed.snapshot()
-    leaf = SubagentTool("leaf", "", {}, lambda _: b"leaf", lambda _: [READ], subagents=())
-    outer = SubagentTool("outer", "", {}, lambda _: b"outer", lambda _: [], 2, (leaf,))
+    leaf = SubagentTool(
+        "leaf",
+        "",
+        {},
+        lambda _: (MessageEnvelope(role="user", content=b"leaf"),),
+        lambda _: [READ],
+        subagents=(),
+    )
+    outer = SubagentTool(
+        "outer",
+        "",
+        {},
+        lambda _: (MessageEnvelope(role="user", content=b"outer"),),
+        lambda _: [],
+        2,
+        (leaf,),
+    )
     parent = Agent(
-        prompt=b"parent",
+        initial_messages=(MessageEnvelope(role="user", content=b"parent"),),
         tool_specs=[READ],
         subagents=[outer],
         record_store=store,
@@ -184,7 +211,7 @@ def test_nested_children_feedback_and_all_invocation_base_result_roots_are_bundl
     assert len(restored.root.subagents[0].runs) == 3
     child = restored.child(restored.root.subagents[0])
     assert len(child.root.subagents[0].runs) == 3
-    assert next(restored.assets()).messages[-2] == Message("user", b"check again")
+    assert next(restored.conversations()).messages[-2] == MessageEnvelope("user", b"check again")
     with pytest.raises(ValueError, match="subagent"):
         Agent.from_snapshot(restored)  # factories must be supplied again
     current = Agent.from_snapshot(restored, subagents=[outer])
@@ -198,14 +225,16 @@ def test_nested_children_feedback_and_all_invocation_base_result_roots_are_bundl
 
 
 def test_lazy_export_loads_all_reachable_branches_but_omits_other_runs_and_orphans(protocol):
-    agent = Agent(prompt=b"prompt", tool_specs=[READ])
+    agent = Agent(
+        initial_messages=(MessageEnvelope(role="user", content=b"prompt"),), tool_specs=[READ]
+    )
     drive(agent.start(["left", "right"]), {"left": b"L", "right": b"R"})
     drive(agent.start(["last"]), {"last": b"L"})
     selected = agent.snapshot()
     expected = {selected.descriptor.root, *(e.continuation for e in selected.root.observations)}
     unrelated = agent.start(["unrelated"])
     drive(unrelated, {"unrelated": b"not selected"})
-    orphan = selected.store.put(HistoryNode(assistant=Message("assistant", lambda: None)))
+    orphan = selected.store.put(HistoryNode(assistant=MessageEnvelope("assistant", lambda: None)))
     backend = dict(selected.store.records())
     loaded = []
 
@@ -244,14 +273,14 @@ class Collision:
 
 def test_deep_graph_walk_is_iterative_address_deduplicated_and_preserves_sharing(protocol):
     store = RecordStore()
-    tail = store.put(HistoryNode(assistant=Message("assistant", b"done")))
-    equal_but_distinct = store.put(HistoryNode(assistant=Message("assistant", b"done")))
+    tail = store.put(HistoryNode(assistant=MessageEnvelope("assistant", b"done")))
+    equal_but_distinct = store.put(HistoryNode(assistant=MessageEnvelope("assistant", b"done")))
     root = tail
     left, right = OutputRecord(Collision(1)), OutputRecord(Collision(2))
     for _ in range(1800):
         root = store.put(
             HistoryNode(
-                assistant=Message("assistant", b"read", (ToolCall("r", "read", {}),)),
+                assistant=MessageEnvelope("assistant", b"read", (ToolCall("r", "read", {}),)),
                 observations=(Observation((left,), (), root), Observation((right,), (), root)),
             )
         )
@@ -270,7 +299,10 @@ def test_deep_graph_walk_is_iterative_address_deduplicated_and_preserves_sharing
         loaded.append(ref)
         return source[ref]
 
-    original = AgentSnapshot(AgentDescriptor(b"prompt", (READ,), root), RecordStore(load=load))
+    original = AgentSnapshot(
+        AgentDescriptor((MessageEnvelope(role="user", content=b"prompt"),), (READ,), root),
+        RecordStore(load=load),
+    )
     restored = roundtrip(original, protocol)
     assert len(loaded) == len(set(loaded)) == 1802
     assert original.store.records() == {} and original.descriptor.root == root
@@ -291,7 +323,9 @@ def test_deep_graph_walk_is_iterative_address_deduplicated_and_preserves_sharing
 
 
 def test_independent_loads_allocate_unique_writers_and_repickle_without_external_records(protocol):
-    agent = Agent(prompt=b"prompt", tool_specs=[READ])
+    agent = Agent(
+        initial_messages=(MessageEnvelope(role="user", content=b"prompt"),), tool_specs=[READ]
+    )
     drive(agent.start(["old"]), {"old": b"known"})
     old = agent.snapshot()
     encoded = pickle.dumps(old, **protocol)
@@ -331,11 +365,11 @@ def test_independent_loads_allocate_unique_writers_and_repickle_without_external
 def test_unpickleable_payload_errors_are_not_lossily_hidden_or_mutating(field):
     bad = lambda: None  # noqa: E731
     store = RecordStore()
-    end = store.put(HistoryNode(assistant=Message("assistant", b"done")))
+    end = store.put(HistoryNode(assistant=MessageEnvelope("assistant", b"done")))
     outputs = (OutputRecord(bad if field == "output" else b"ok"),)
     root = store.put(
         HistoryNode(
-            assistant=Message(
+            assistant=MessageEnvelope(
                 "assistant", bad if field == "assistant" else b"read", (ToolCall("r", "read", {}),)
             ),
             observations=(Observation(outputs, (EnvObservation("e", outputs),), end),),
@@ -343,7 +377,12 @@ def test_unpickleable_payload_errors_are_not_lossily_hidden_or_mutating(field):
     )
     specs = (ToolSpec("read", "", {"bad": bad}),) if field == "schema" else (READ,)
     snapshot = AgentSnapshot(
-        AgentDescriptor(bad if field == "prompt" else b"prompt", specs, root), store
+        AgentDescriptor(
+            (MessageEnvelope(role="user", content=bad if field == "prompt" else b"prompt"),),
+            specs,
+            root,
+        ),
+        store,
     )
     before = store.records()
     with pytest.raises((AttributeError, pickle.PicklingError)):
@@ -357,10 +396,13 @@ def test_missing_reachable_records_fail_including_provenance_only_references(edg
     store = RecordStore()
     missing = NodeRef("missing", 0)
     present = store.put(HistoryNode())
-    descriptor = lambda ref: AgentDescriptor(b"child", (), ref)  # noqa: E731
+
+    def descriptor(ref):
+        return AgentDescriptor((MessageEnvelope(role="user", content=b"child"),), (), ref)
+
     node = HistoryNode(
         observations=(Observation((), (), missing),) if edge == "observation" else (),
-        user_continuations=(UserContinuation(Message("user", b"note"), missing),)
+        user_continuations=(UserContinuation(MessageEnvelope("user", b"note"), missing),)
         if edge == "feedback"
         else (),
         subagents=(
@@ -378,7 +420,9 @@ def test_missing_reachable_records_fail_including_provenance_only_references(edg
         ),
     )
     root = store.put(node)
-    snapshot = AgentSnapshot(AgentDescriptor(b"prompt", (), root), store)
+    snapshot = AgentSnapshot(
+        AgentDescriptor((MessageEnvelope(role="user", content=b"prompt"),), (), root), store
+    )
     before = store.records()
     with pytest.raises(KeyError):
         pickle.dumps(snapshot)
@@ -387,7 +431,10 @@ def test_missing_reachable_records_fail_including_provenance_only_references(edg
 
 def test_corrupt_loader_result_surfaces_without_changing_the_snapshot():
     root = NodeRef("source", 0)
-    snapshot = AgentSnapshot(AgentDescriptor(b"prompt", (), root), RecordStore(load=lambda _: None))
+    snapshot = AgentSnapshot(
+        AgentDescriptor((MessageEnvelope(role="user", content=b"prompt"),), (), root),
+        RecordStore(load=lambda _: None),
+    )
     with pytest.raises(TypeError, match="expected HistoryNode"):
         pickle.dumps(snapshot)
     assert snapshot.descriptor.root == root and snapshot.store.records() == {}

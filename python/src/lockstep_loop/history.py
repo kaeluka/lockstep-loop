@@ -1,4 +1,4 @@
-"""Immutable AgentSnapshot values, contextual Asset views, and shallow history records.
+"""Immutable AgentSnapshot values, contextual Conversation views, and shallow history records.
 
 Payloads, schemas and arguments are borrowed immutable values. NodeRef is a
 storage address, never a public conversation/session identity. No core I/O.
@@ -10,11 +10,11 @@ import threading
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from pprint import pformat
-from typing import TYPE_CHECKING, Generic, Literal, NoReturn, TypeAlias, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Literal, NoReturn, TypeAlias, TypeVar
 from uuid import uuid4
 
 if TYPE_CHECKING:
-    from .core import Message, ToolCall, ToolSpec
+    from .core import MessageEnvelope, ToolCall, ToolSpec
 
 P = TypeVar("P")
 
@@ -50,7 +50,7 @@ class Observation(Generic[P]):
 class UserContinuation(Generic[P]):
     """Shared-path continuation: every environment reaching this endpoint follows it."""
 
-    message: Message[P]
+    message: MessageEnvelope[P]
     continuation: NodeRef
     resolved_env_id: str | None = None
     """Resolution provenance only, NOT an inheritance/selection predicate."""
@@ -73,9 +73,12 @@ class AgentQuery(Generic[P]):
     External provider/grouping policy isolation is caller-owned.
     """
 
-    prompt: P
+    initial_messages: tuple[MessageEnvelope[P], ...]
     tools: tuple[ToolSpec, ...]
     subagents: tuple[SubagentContract, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "initial_messages", tuple(self.initial_messages))
 
 
 @dataclass(frozen=True)
@@ -85,13 +88,16 @@ class AgentDescriptor(Generic[P]):
     Attach a RecordStore to reconstruct an AgentSnapshot without eager loading.
     """
 
-    prompt: P
+    initial_messages: tuple[MessageEnvelope[P], ...]
     tools: tuple[ToolSpec, ...]
     root: NodeRef
     subagents: tuple[SubagentContract, ...] = ()
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "initial_messages", tuple(self.initial_messages))
+
     def query(self) -> AgentQuery[P]:
-        return AgentQuery(self.prompt, self.tools, self.subagents)
+        return AgentQuery(self.initial_messages, self.tools, self.subagents)
 
 
 AgentResolver: TypeAlias = Callable[[AgentQuery[P]], AgentDescriptor[P] | None]
@@ -138,9 +144,9 @@ class ChildAgentUpdate(Generic[P]):
 
 @dataclass(frozen=True)
 class HistoryNode(Generic[P]):
-    """A shared prefix or historical endpoint; an Asset also needs its snapshot/path context."""
+    """A shared prefix or endpoint; a Conversation also needs snapshot/path context."""
 
-    assistant: Message[P] | None = None
+    assistant: MessageEnvelope[P] | None = None
     env_ids: tuple[str, ...] = ()
     observations: tuple[Observation[P], ...] = ()
     subagents: tuple[SubagentRecord[P], ...] = ()
@@ -199,7 +205,7 @@ class RecordStore(Generic[P]):
 
 @dataclass(frozen=True)
 class AgentSnapshot(Generic[P]):
-    """Immutable prompt, structural configuration and accumulated conversation trie.
+    """Immutable initial messages, structural configuration and accumulated history trie.
 
     The descriptor selects a root; the store resolves immutable records lazily.
     Pickling bundles the entire reachable history, eagerly loading lazy records.
@@ -266,8 +272,8 @@ class AgentSnapshot(Generic[P]):
         return self.load(self.descriptor.root)
 
     @property
-    def prompt(self) -> P:
-        return self.descriptor.prompt
+    def initial_messages(self) -> tuple[MessageEnvelope[P], ...]:
+        return self.descriptor.initial_messages
 
     def load(self, ref: NodeRef) -> HistoryNode[P]:
         return self.store.load(ref)
@@ -276,23 +282,23 @@ class AgentSnapshot(Generic[P]):
         """Attach this store to the recorded child snapshot, without resolving an environment."""
         return AgentSnapshot(entry.agent_descriptor, self.store)
 
-    def assets(self) -> Iterator[Asset[P]]:
+    def conversations(self) -> Iterator[Conversation[P]]:
         """Lazily inspect this snapshot's structural leaves, not a per-run partition.
 
-        Child agents are separate tries: inspect them with child(entry).assets().
+        Child agents are separate tries: inspect them with child(entry).conversations().
         This does not execute tools, select feedback targets, or create records.
         """
         stack: list[tuple[NodeRef, int, Observation[P] | UserContinuation[P] | None]] = [
             (self.descriptor.root, 0, None)
         ]
-        path: list[_AssetStep[P]] = []
+        path: list[_ConversationStep[P]] = []
         while stack:
             reference, depth, via = stack.pop()
             del path[depth:]
             node = self.load(reference)
-            path.append(_AssetStep(node, via))
+            path.append(_ConversationStep(node, via))
             if not node.observations and not node.user_continuations:
-                yield Asset._view(self, tuple(path))
+                yield Conversation._view(self, tuple(path))
             else:
                 for user in reversed(node.user_continuations):
                     stack.append((user.continuation, depth + 1, user))
@@ -357,37 +363,40 @@ def _restore_snapshot(
 
 
 @dataclass(frozen=True, eq=False)
-class _AssetStep(Generic[P]):
+class _ConversationStep(Generic[P]):
     node: HistoryNode[P]
     via: Observation[P] | UserContinuation[P] | None
 
 
 @dataclass(frozen=True, eq=False, init=False)
-class Asset(Generic[P]):
-    """Read-only leaf investigation in one AgentSnapshot, backed by its path.
+class Conversation(Generic[P]):
+    """Read-only conversation path anchored in a snapshot, not an asset wrapper.
 
-    Values do not identify assets. An open continuation may retain an earlier
-    published message, or have no value yet. No ID, persistence or resume API is
-    provided: feedback still requires a snapshot and environment replay.
+    Callers choose assets through answer or final-tool-input accessors. An open
+    continuation may retain an earlier answer, or have none yet. No ID,
+    persistence or resume API: feedback uses snapshot and environment replay.
     """
 
     snapshot: AgentSnapshot[P] = field(repr=False)
-    _path: tuple[_AssetStep[P], ...] = field(repr=False)
+    _path: tuple[_ConversationStep[P], ...] = field(repr=False)
 
     def __init__(self) -> None:
         raise TypeError(
-            "Asset views come from AgentSnapshot.assets(); persist the snapshot, not a leaf"
+            "Conversation views come from AgentSnapshot.conversations(); "
+            "persist the snapshot, not a leaf"
         )
 
     @classmethod
-    def _view(cls, snapshot: AgentSnapshot[P], path: tuple[_AssetStep[P], ...]) -> Asset[P]:
+    def _view(
+        cls, snapshot: AgentSnapshot[P], path: tuple[_ConversationStep[P], ...]
+    ) -> Conversation[P]:
         view = object.__new__(cls)
         object.__setattr__(view, "snapshot", snapshot)
         object.__setattr__(view, "_path", path)
         return view
 
     def __reduce__(self) -> NoReturn:
-        raise TypeError("persist the snapshot; assets are contextual views")
+        raise TypeError("persist the snapshot; conversations are contextual views")
 
     @property
     def node(self) -> HistoryNode[P]:
@@ -404,18 +413,20 @@ class Asset(Generic[P]):
         return tuple(step.via for step in self._path if isinstance(step.via, Observation))
 
     @property
-    def messages(self) -> tuple[Message[P], ...]:
+    def messages(self) -> tuple[MessageEnvelope[P], ...]:
         """The model-visible conversation, using historical representatives."""
-        from .core import Message
+        from .core import MessageEnvelope
 
-        messages = [Message(role="user", content=self.snapshot.descriptor.prompt)]
+        messages = list(self.snapshot.descriptor.initial_messages)
         for index, step in enumerate(self._path):
             if isinstance(step.via, Observation):
                 assistant = self._path[index - 1].node.assistant
                 assert assistant is not None
                 for call, output in zip(assistant.tool_calls, step.via.representative, strict=True):
                     messages.append(
-                        Message(role="tool", content=output.tool_output, tool_call_id=call.id)
+                        MessageEnvelope(
+                            role="tool", content=output.tool_output, tool_call_id=call.id
+                        )
                     )
             elif isinstance(step.via, UserContinuation):
                 messages.append(step.via.message)
@@ -428,26 +439,42 @@ class Asset(Generic[P]):
         message = self.node.assistant
         return message is not None and message.role == "assistant" and not message.tool_calls
 
-    @property
-    def published_message(self) -> Message[P] | None:
-        """Latest terminal assistant reply on this path, even before pending feedback work."""
+    def _model_responses_reversed(self) -> Iterator[MessageEnvelope[P]]:
         for step in reversed(self._path):
-            message = step.node.assistant
-            if message is not None and message.role == "assistant" and not message.tool_calls:
-                return message
-        return None
+            if step.node.assistant is not None and step.node.assistant.role == "assistant":
+                yield step.node.assistant
+        for message in reversed(self.snapshot.initial_messages):
+            if message.role == "assistant":
+                yield message
 
     @property
-    def has_value(self) -> bool:
-        return self.published_message is not None
+    def last_answer(self) -> MessageEnvelope[P] | None:
+        """Latest no-tool model answer, including initial context and open feedback ancestors."""
+        return next((m for m in self._model_responses_reversed() if not m.tool_calls), None)
 
     @property
-    def value(self) -> P:
-        """Latest published payload. Raises LookupError if none; a real None remains a value."""
-        message = self.published_message
+    def has_answer(self) -> bool:
+        return self.last_answer is not None
+
+    def get_last_answer_asset(self) -> P:
+        """Latest answer content. Missing raises LookupError; a real None remains a value."""
+        message = self.last_answer
         if message is None:
-            raise LookupError("this open asset has no published value yet")
+            raise LookupError("this conversation has no model answer yet")
         return message.content
+
+    def get_final_tool_input_asset(self, tool_name: str) -> Any:
+        """Latest input to the named tool, in reverse response and call order.
+
+        Includes accepted pending calls and initial assistant context. Inspection
+        neither executes the tool nor makes its call terminal. Missing raises
+        LookupError; a recorded null input is returned as None.
+        """
+        for message in self._model_responses_reversed():
+            for call in reversed(message.tool_calls):
+                if call.name == tool_name:
+                    return call.args
+        raise LookupError(f"this conversation has no call to tool {tool_name!r}")
 
     @property
     def env_ids(self) -> tuple[str, ...]:

@@ -1,4 +1,3 @@
-
 """Structural guards, not wall-clock thresholds, for the serving hot path."""
 
 import pytest
@@ -7,6 +6,7 @@ import lockstep_loop.core as core
 from lockstep_loop import (
     LlmCompletion,
     LlmRequest,
+    MessageEnvelope,
     SubagentTool,
     ToolCall,
     ToolCompletion,
@@ -52,12 +52,10 @@ def unguard(values):
     return list(list.__iter__(values))
 
 
-def test_one_leaf_completion_and_queue_pull_do_not_walk_siblings_or_past_conversations(
-    monkeypatch
-):
+def test_one_leaf_completion_and_queue_pull_do_not_walk_siblings_or_past_conversations(monkeypatch):
     n = 1000
     loop = BatchLoop(
-        prompt="p",
+        initial_messages=(MessageEnvelope(role="user", content="p"),),
         env_ids=[str(i) for i in range(n)],
         tool_specs=[],
     )
@@ -65,19 +63,17 @@ def test_one_leaf_completion_and_queue_pull_do_not_walk_siblings_or_past_convers
     loop.complete(LlmCompletion(root.request_id, "", (ToolCall("x", "read", {}),)))
     tool = loop.next_request()
     loop.complete(ToolCompletion(tool.request_id, tuple((e, e) for e in tool.env_ids)))
-    # Include already finalized siblings as well as the retired pre-split parent.
+    # Include both active and already finalized siblings; retired parents are not retained.
     for _ in range(20):
         request = loop.next_request()
         loop.complete(LlmCompletion(request.request_id, "done"))
     active = dict(loop._branches)
-    for branch in loop._partition:
+    for branch in (*loop._branches.values(), *loop._finals):
         branch.messages = NoTraversalList(branch.messages)
-    loop._partition = NoTraversalList(loop._partition)
     loop._finals = NoTraversalList(loop._finals)
     loop._branches = LookupOnlyDict(loop._branches)
     loop._outstanding = LookupOnlyDict(loop._outstanding)
     containers = (
-        loop._partition,
         loop._finals,
         loop._branches,
         loop._outstanding,
@@ -104,7 +100,6 @@ def test_one_leaf_completion_and_queue_pull_do_not_walk_siblings_or_past_convers
         for before, after in zip(
             containers,
             (
-                loop._partition,
                 loop._finals,
                 loop._branches,
                 loop._outstanding,
@@ -119,7 +114,6 @@ def test_one_leaf_completion_and_queue_pull_do_not_walk_siblings_or_past_convers
         if key != request.branch_id:
             assert loop._branches[key] is branch
     # Building the result is intentionally O(n); serving each branch is not.
-    loop._partition = unguard(loop._partition)
     loop._finals = unguard(loop._finals)
     while not loop.done:
         request = loop.next_request()
@@ -128,9 +122,15 @@ def test_one_leaf_completion_and_queue_pull_do_not_walk_siblings_or_past_convers
 
 
 def test_child_completion_and_pull_do_not_copy_unrelated_children(monkeypatch):
-    sub = SubagentTool("child", "", {}, lambda a: a["prompt"], lambda _: [])
+    sub = SubagentTool(
+        "child",
+        "",
+        {},
+        lambda a: (MessageEnvelope(role="user", content=a["prompt"]),),
+        lambda _: [],
+    )
     loop = BatchLoop(
-        prompt="parent",
+        initial_messages=(MessageEnvelope(role="user", content="parent"),),
         env_ids=["e"],
         tool_specs=[],
         subagent=sub,
@@ -147,9 +147,8 @@ def test_child_completion_and_pull_do_not_copy_unrelated_children(monkeypatch):
     first_link = loop._child_ids[first.request_id]
     others = [link.child for link in loop._children.values() if link is not first_link]
     for child in others:
-        for branch in child._partition:
+        for branch in (*child._branches.values(), *child._finals):
             branch.messages = NoTraversalList(branch.messages)
-        child._partition = NoTraversalList(child._partition)
         child._finals = NoTraversalList(child._finals)
         child._branches = LookupOnlyDict(child._branches)
     watched = []
@@ -168,7 +167,6 @@ def test_child_completion_and_pull_do_not_copy_unrelated_children(monkeypatch):
     assert second.messages[0].content == "child-1"
     assert {id(changed) for changed in watched} == {id(loop), id(others[0])}
     for child in others:
-        child._partition = unguard(child._partition)
         child._finals = unguard(child._finals)
     loop.complete(LlmCompletion(second.request_id, "answer"))
     while not loop.done:
@@ -195,11 +193,17 @@ def test_callback_history_reads_never_publish_a_root_that_later_rolls_back():
         return args["prompt"]
 
     specs = (ToolSpec("read", "", {}), ToolSpec("child", "", {}))
-    sub = SubagentTool("child", "", {}, build, lambda _: specs)
+    sub = SubagentTool(
+        "child",
+        "",
+        {},
+        lambda args: (MessageEnvelope(role="user", content=build(args)),),
+        lambda _: specs,
+    )
 
     def make(snapshot=None, env="old"):
         return BatchLoop(
-            prompt="parent",
+            initial_messages=(MessageEnvelope(role="user", content="parent"),),
             env_ids=[env],
             tool_specs=specs,
             subagent=sub,
@@ -247,9 +251,18 @@ def test_callback_cannot_reenter_serving_and_issue_uncommitted_requests():
             current.next_request()
         raise KeyError("reject this completion")
 
-    sub = SubagentTool("child", "", {}, build, lambda _: [])
+    sub = SubagentTool(
+        "child",
+        "",
+        {},
+        lambda args: (MessageEnvelope(role="user", content=build(args)),),
+        lambda _: [],
+    )
     current = BatchLoop(
-        prompt="p", env_ids=["e"], tool_specs=[], subagent=sub
+        initial_messages=(MessageEnvelope(role="user", content="p"),),
+        env_ids=["e"],
+        tool_specs=[],
+        subagent=sub,
     )
     root = current.next_request()
     before = current.snapshot
@@ -271,11 +284,17 @@ def test_rollback_restores_child_serving_order_without_cloning_siblings():
         return args["prompt"]
 
     specs = (ToolSpec("read", "", {}), ToolSpec("child", "", {}))
-    sub = SubagentTool("child", "", {}, build, lambda _: specs)
+    sub = SubagentTool(
+        "child",
+        "",
+        {},
+        lambda args: (MessageEnvelope(role="user", content=build(args)),),
+        lambda _: specs,
+    )
 
     def make(snapshot=None):
         return BatchLoop(
-            prompt="parent",
+            initial_messages=(MessageEnvelope(role="user", content="parent"),),
             env_ids=["a", "b"],
             tool_specs=specs,
             subagent=sub,
