@@ -10,6 +10,7 @@ contain divergence. These are applications of the same domain-neutral loop.
   Includes documents, studies, products, datasets, suppliers, and source code.
 - **Name and inspect the model:** [Agents, conversations, and asset accessors](agent-assets.md).
 - **Serve requests:** [Python](../python/README.md) · [Rust](../rust/README.md).
+- **Route work per agent:** [runtime metadata](runtime-metadata.md).
 - **Record, replay, and persist:** [technical reference](history-reference.md).
 
 ## Runnable examples
@@ -37,6 +38,13 @@ The existing protocol demos use a small file-inspection fixture. That fixture is
 not an API requirement: product ratings, document sections, and dataset statistics
 use the same request/completion types. The [use-case guide](use-cases.md) explains
 how to bind tools to other evidence sources.
+
+## Agent-file host with OpenRouter
+
+The [Rust agent-file example](agent-examples/README.md) loads JSON definitions,
+uses per-agent manifest model settings, executes read-only repository tools, and
+persists history beside the definitions. Unlike the scripted examples above, a
+fresh investigation sends inspected source to OpenRouter and requires a key.
 
 ## Reference and maintenance
 

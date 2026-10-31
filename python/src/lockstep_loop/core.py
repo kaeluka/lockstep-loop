@@ -179,6 +179,8 @@ class LlmRequest(Generic[P]):
     messages: tuple[MessageEnvelope[P], ...]
     tools: tuple[ToolSpec, ...]
     stats: RequestStats
+    metadata: Any = field(default=None, compare=False, repr=False)
+    """Opaque immutable runtime metadata of the originating agent, not its parent."""
 
 
 @dataclass(frozen=True)
@@ -196,6 +198,8 @@ class ToolRequest:
     tool_call: ToolCall
     env_ids: tuple[str, ...]
     stats: RequestStats
+    metadata: Any = field(default=None, compare=False, repr=False)
+    """Opaque runtime metadata, including for tool requests emitted during replay."""
 
 
 #: Work the loop asks the caller to perform.
@@ -263,6 +267,8 @@ class SubagentTool(Generic[P]):
     """Total spawn depth below this call site; nested definitions are clamped to the remainder."""
     subagents: tuple[SubagentTool[P], ...] | None = None
     """Child allowlist. None preserves bounded self-recursion; () makes this a leaf."""
+    metadata: Any = field(default=None, compare=False, repr=False)
+    """Child-owned immutable runtime metadata; not inherited, compared, or persisted."""
 
 
 def _subagent_contract(sub: SubagentTool[P]) -> SubagentContract:
@@ -549,6 +555,7 @@ class BatchLoop(Generic[P]):
         snapshot: AgentSnapshot[P] | None = None,
         record_store: RecordStore[P] | None = None,
         feedback: Feedback[P] | None = None,
+        metadata: Any = None,
         _id_prefix: str = "",
         _resolve_only: bool = False,
         _defer_failure: bool = False,
@@ -570,6 +577,7 @@ class BatchLoop(Generic[P]):
         )
         self._specs, self._subagents, sub_contracts = _registration(tool_specs, definitions)
         self._history_resolver = agent_resolver
+        self._metadata = metadata
         self._unavailable_subagents = _unavailable_subagents - self._subagents.keys()
         if feedback is not None and not isinstance(feedback, Feedback):
             raise TypeError("feedback must be Feedback(content), or None for no intervention")
@@ -1137,6 +1145,7 @@ class BatchLoop(Generic[P]):
             budget=self._budget,
             snapshot=previous,
             record_store=self._recorded.store,
+            metadata=sub.metadata,
             _id_prefix=f"{self._id_prefix}{child_key}",
             _resolve_only=self._resolve_only,
             _defer_failure=True,
@@ -1227,6 +1236,7 @@ class BatchLoop(Generic[P]):
                 messages=tuple(branch.messages),
                 tools=self._specs,
                 stats=stats,
+                metadata=self._metadata,
             ),
         )
 
@@ -1240,6 +1250,7 @@ class BatchLoop(Generic[P]):
                 tool_call=call,
                 env_ids=branch.env_ids,
                 stats=stats,
+                metadata=self._metadata,
             ),
         )
 
@@ -1438,6 +1449,7 @@ def run_batch(
     tool_specs: Sequence[ToolSpec],
     comparison_key: Callable[[P], Hashable] | None = None,
     budget: Budget | None = None,
+    metadata: Any = None,
 ) -> Generator[Request[P] | None, Completion[P] | None, BatchResult[P]]:
     """One-shot Agent run as a generator, for pump-style drivers.
 
@@ -1454,6 +1466,7 @@ def run_batch(
         initial_messages=initial_messages,
         tool_specs=tool_specs,
         comparison_key=comparison_key,
+        metadata=metadata,
     ).start(env_ids, budget=budget)
 
     def pump() -> Generator[Request[P] | None, Completion[P] | None, BatchResult[P]]:
@@ -1482,6 +1495,7 @@ def run_to_completion(
     complete_tool: Callable[[ToolRequest], ToolCompletion[P]] | None = None,
     comparison_key: Callable[[P], Hashable] | None = None,
     budget: Budget | None = None,
+    metadata: Any = None,
 ) -> BatchResult[P]:
     """Construct and drive a fresh Agent synchronously, one request at a time.
 
@@ -1516,6 +1530,7 @@ def run_to_completion(
         tool_specs=specs,
         subagents=subagents,
         comparison_key=comparison_key,
+        metadata=metadata,
     ).start(envs, budget=budget)
     while not loop.done:
         request = loop.next_request()

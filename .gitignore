@@ -9,3 +9,12 @@ target/
 .mypy_cache/
 .ruff_cache/
 examples/
+# Runnable Rust agent-file example and its example-only support modules.
+!rust/examples/
+rust/examples/*
+!rust/examples/agent_file.rs
+!rust/examples/agent_file_support/
+!rust/examples/agent_file_support/**
+# Agent-file history contains source evidence and model responses.
+*.state.json
+.lockstep-cache-*

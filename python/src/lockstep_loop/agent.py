@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable, Hashable, Sequence
-from typing import Generic, Literal, overload
+from typing import Any, Generic, Literal, overload
 
 from .core import (
     BatchLoop,
@@ -32,7 +32,8 @@ class Agent(Generic[P]):
     Recording is unconditional. Payloads/schemas/arguments must remain immutable.
     Construct an independent handle with from_snapshot(agent.snapshot()); neither
     handles nor callbacks are persistence values. Provider policy and child-cache
-    selection/update policy remain caller-owned.
+    selection/update policy remain caller-owned. Opaque metadata is shared unchanged
+    with requests; keep it immutable. It is runtime-only, not part of snapshots.
     """
 
     def __init__(
@@ -44,6 +45,7 @@ class Agent(Generic[P]):
         agent_resolver: AgentResolver[P] | None = None,
         comparison_key: Callable[[P], Hashable] | None = None,
         record_store: RecordStore[P] | None = None,
+        metadata: Any = None,
     ) -> None:
         initial = _normalize_initial_messages(initial_messages)
         definitions = tuple(subagents)
@@ -55,6 +57,7 @@ class Agent(Generic[P]):
         self._subagents = definitions
         self._resolver = agent_resolver
         self._comparison_key = comparison_key
+        self._metadata = metadata
         self._lock = threading.Lock()
 
     @classmethod
@@ -65,12 +68,14 @@ class Agent(Generic[P]):
         subagents: Sequence[SubagentTool[P]] = (),
         agent_resolver: AgentResolver[P] | None = None,
         comparison_key: Callable[[P], Hashable] | None = None,
+        metadata: Any = None,
     ) -> Agent[P]:
         """Attach runtime callbacks to a snapshot, without loading any records.
 
         Initial messages and ordered tool specs come from the snapshot. Supply matching
         subagent definitions when configured; executable callbacks are not stored.
         A new handle is independent, though immutable records/store may be shared.
+        Supply current metadata explicitly; snapshots never persist it.
         """
         if not isinstance(snapshot, AgentSnapshot):
             raise TypeError("snapshot must be an AgentSnapshot")
@@ -84,6 +89,7 @@ class Agent(Generic[P]):
         agent._subagents = definitions
         agent._resolver = agent_resolver
         agent._comparison_key = comparison_key
+        agent._metadata = metadata
         agent._lock = threading.Lock()
         return agent
 
@@ -123,6 +129,7 @@ class Agent(Generic[P]):
             snapshot=snapshot,
             feedback=feedback,
             budget=budget,
+            metadata=self._metadata,
             _settle_on_completion=True,
         )
         return AgentRun._start(self, engine)

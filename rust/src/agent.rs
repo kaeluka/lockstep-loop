@@ -2,7 +2,7 @@
 use crate::{
     AgentDescriptor, AgentResolver, AgentSnapshot, BatchLoop, BatchResult, Budget,
     ComparisonKeyFunction, Completion, HistoryNode, LoopConfig, LoopError, MessageEnvelope,
-    RecordStore, Request, RequestKind, SubagentTool, ToolSpec, register,
+    Metadata, RecordStore, Request, RequestKind, SubagentTool, ToolSpec, register,
 };
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -14,13 +14,24 @@ use std::sync::{Arc, Mutex};
 pub struct AgentRuntime<P> {
     pub subagents: Vec<SubagentTool<P>>,
     pub agent_resolver: Option<AgentResolver<P>>,
+    /// Opaque agent metadata exposed on every request; not persisted or compared.
+    pub metadata: Metadata,
 }
 impl<P> Default for AgentRuntime<P> {
     fn default() -> Self {
         Self {
             subagents: vec![],
             agent_resolver: None,
+            metadata: Metadata::default(),
         }
+    }
+}
+
+impl<P> AgentRuntime<P> {
+    /// Reattach metadata when restoring a snapshot. It is not stored in history.
+    pub fn with_metadata(mut self, metadata: impl Into<Metadata>) -> Self {
+        self.metadata = metadata.into();
+        self
     }
 }
 
@@ -43,6 +54,11 @@ impl<P> AgentConfig<P> {
     }
     pub fn with_subagents(mut self, subagents: Vec<SubagentTool<P>>) -> Self {
         self.runtime.subagents = subagents;
+        self
+    }
+    /// Opaque metadata for every request; never a history-compatibility key.
+    pub fn with_metadata(mut self, metadata: impl Into<Metadata>) -> Self {
+        self.runtime.metadata = metadata.into();
         self
     }
     pub fn with_agent_resolver(mut self, resolver: AgentResolver<P>) -> Self {
@@ -181,6 +197,7 @@ where
             environments,
             snapshot.descriptor.tools.clone(),
         )
+        .with_metadata(self.runtime.metadata.clone())
         .with_snapshot(snapshot)
         .with_subagents(self.runtime.subagents.clone());
         config.agent_resolver = self.runtime.agent_resolver.clone();

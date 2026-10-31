@@ -444,6 +444,7 @@ fn nested_child_cache_updates_are_snapshots_and_cached_start_publishes() {
     let runtime = AgentRuntime {
         subagents: vec![outer.clone()],
         agent_resolver: None,
+        metadata: Metadata::default(),
     };
     let agent = Agent::new(
         AgentConfig::new(

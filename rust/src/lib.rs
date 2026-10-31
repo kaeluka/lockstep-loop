@@ -32,6 +32,15 @@ use std::hash::Hash;
 use std::sync::Arc;
 use thiserror::Error;
 
+/// Opaque caller-owned agent metadata, e.g. an agent file's manifest.
+///
+/// The core never interprets it and never uses it for history compatibility,
+/// grouping, persistence, or model/tool routing. It only carries the value
+/// from configuration into every emitted work request. The shared JSON object
+/// is cloned by Arc, not deep-copied per request. Children use their own value;
+/// no parent metadata inheritance or merge is performed.
+pub type Metadata = Arc<serde_json::Map<String, Value>>;
+
 type BudgetFallback<P> = dyn Fn(usize) -> P + Send + Sync;
 type InitialMessagesBuilder<P> =
     dyn Fn(&Value) -> Result<Vec<MessageEnvelope<P>>, LoopError> + Send + Sync;
@@ -149,6 +158,8 @@ pub struct LlmRequest<P> {
     pub messages: Vec<MessageEnvelope<P>>,
     pub tools: Vec<ToolSpec>,
     pub stats: RequestStats,
+    /// Opaque metadata of the agent that emitted this request.
+    pub metadata: Metadata,
 }
 
 /// One tool call to execute once per environment in `env_ids`.
@@ -159,6 +170,22 @@ pub struct ToolRequest {
     pub tool_call: ToolCall,
     pub env_ids: Vec<String>,
     pub stats: RequestStats,
+    /// Opaque metadata of the agent that emitted this request.
+    pub metadata: Metadata,
+}
+
+impl<P> LlmRequest<P> {
+    /// Runtime metadata of this request's originating agent, never its parent.
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+}
+
+impl ToolRequest {
+    /// Runtime metadata of this request's originating agent, including replay.
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -179,6 +206,14 @@ impl<P> Request<P> {
         match self {
             Self::Llm(request) => request.stats,
             Self::Tool(request) => request.stats,
+        }
+    }
+
+    /// Opaque metadata of the agent that emitted this request.
+    pub fn metadata(&self) -> &Metadata {
+        match self {
+            Self::Llm(request) => &request.metadata,
+            Self::Tool(request) => &request.metadata,
         }
     }
 }
@@ -275,6 +310,8 @@ impl<P> Debug for Budget<P> {
 pub struct SubagentTool<P> {
     pub spec: ToolSpec,
     pub max_depth: usize,
+    /// Opaque metadata carried by every request emitted by the child loop.
+    pub metadata: Metadata,
     /// None preserves bounded self-recursion; Some is an explicit child allowlist.
     pub subagents: Option<Vec<SubagentTool<P>>>,
     build_initial_messages: Arc<InitialMessagesBuilder<P>>,
@@ -309,6 +346,7 @@ impl<P> SubagentTool<P> {
         Self {
             spec,
             max_depth,
+            metadata: Metadata::default(),
             subagents: None,
             build_initial_messages: Arc::new(build_initial_messages),
             sub_tool_specs: Arc::new(sub_tool_specs),
@@ -317,6 +355,12 @@ impl<P> SubagentTool<P> {
 
     pub fn with_subagents(mut self, subagents: Vec<SubagentTool<P>>) -> Self {
         self.subagents = Some(subagents);
+        self
+    }
+
+    /// Set opaque metadata for every request emitted by this subagent's loops.
+    pub fn with_metadata(mut self, metadata: impl Into<Metadata>) -> Self {
+        self.metadata = metadata.into();
         self
     }
 
@@ -335,6 +379,7 @@ impl<P> SubagentTool<P> {
         Self {
             spec: self.spec.clone(),
             max_depth,
+            metadata: self.metadata.clone(),
             subagents: self.subagents.clone(),
             build_initial_messages: Arc::clone(&self.build_initial_messages),
             sub_tool_specs: Arc::clone(&self.sub_tool_specs),
@@ -366,6 +411,7 @@ pub struct LoopConfig<P> {
     pub initial_messages: Vec<MessageEnvelope<P>>,
     pub env_ids: Vec<String>,
     pub tool_specs: Vec<ToolSpec>,
+    pub metadata: Metadata,
     pub subagent: Option<SubagentTool<P>>,
     pub subagents: Option<Vec<SubagentTool<P>>>,
     /// Caller-owned child revision lookup.
@@ -389,6 +435,7 @@ impl<P> LoopConfig<P> {
             initial_messages,
             env_ids,
             tool_specs,
+            metadata: Metadata::default(),
             subagent: None,
             subagents: None,
             agent_resolver: None,
@@ -414,6 +461,12 @@ impl<P> LoopConfig<P> {
     /// A conflicting store on an existing snapshot is rejected during construction.
     pub fn with_record_store(mut self, store: RecordStore<P>) -> Self {
         self.record_store = Some(store);
+        self
+    }
+
+    /// Opaque metadata shared by every emitted request; not a compatibility key.
+    pub fn with_metadata(mut self, metadata: impl Into<Metadata>) -> Self {
+        self.metadata = metadata.into();
         self
     }
 
@@ -640,6 +693,7 @@ struct ChildRoute {
 pub struct BatchLoop<P, K = P> {
     specs: Vec<ToolSpec>,
     subagents: IndexMap<String, SubagentTool<P>>,
+    metadata: Metadata,
     agent_resolver: Option<AgentResolver<P>>,
     unavailable_subagents: HashSet<String>,
     comparison_key: Arc<ComparisonKeyFunction<P, K>>,
@@ -785,6 +839,7 @@ where
             turn_results: HashMap::new(),
         };
         let mut loop_ = Self {
+            metadata: config.metadata,
             specs: registry.specs,
             subagents: registry.subagents,
             agent_resolver: config.agent_resolver,
@@ -1226,6 +1281,7 @@ where
             messages: branch.messages.clone(),
             tools: self.specs.clone(),
             stats,
+            metadata: self.metadata.clone(),
         });
         self.branches.insert(branch.branch_id.clone(), branch);
     }
@@ -1238,6 +1294,7 @@ where
             tool_call: call,
             env_ids: branch.env_ids.clone(),
             stats,
+            metadata: self.metadata.clone(),
         });
     }
 
@@ -1456,6 +1513,7 @@ where
             initial_messages,
             env_ids: branch.env_ids.clone(),
             tool_specs: registry.specs,
+            metadata: subagent.metadata.clone(),
             subagent: None,
             subagents: Some(nested),
             agent_resolver: self.agent_resolver.clone(),

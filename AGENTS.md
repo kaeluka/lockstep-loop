@@ -231,6 +231,14 @@ environments.
 
 The caller executes model and tool requests; the agent coordinates them.
 
+Agents also carry opaque, immutable runtime metadata (for example an agent-file
+manifest). Every work request exposes its originating agent's metadata. Children
+use their own metadata, never implicitly inheriting their parent's. The core does
+not interpret it, expose it to the model, compare it for history compatibility,
+or persist it in snapshots/records. Restoration reattaches current metadata
+explicitly. Model selection and model-specific cache isolation remain host policy.
+See [runtime metadata](docs/runtime-metadata.md) for Python and Rust APIs.
+
 History reuse requires equal initial messages, ordered tool specifications, and
 nested subagent specifications, allowlists, and depth limits. Actual child initial
 messages and specifications are checked on entry. Independent child lookup uses

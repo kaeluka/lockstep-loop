@@ -1,7 +1,7 @@
 use lockstep_loop::{
     Agent, AgentConfig, AgentDescriptor, AgentResolver, AgentRuntime, BatchLoop, Completion,
-    LlmCompletion, LoopConfig, LoopError, MessageEnvelope, Request, RequestKind, Role, RunOptions,
-    SubagentTool, ToolCall, ToolCompletion, ToolSpec,
+    LlmCompletion, LoopConfig, LoopError, MessageEnvelope, Metadata, Request, RequestKind, Role,
+    RunOptions, SubagentTool, ToolCall, ToolCompletion, ToolSpec,
 };
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -361,6 +361,129 @@ fn asset_accessors_preserve_missing_null_and_latest_named_call_semantics() {
     assert_eq!(replay_result.classes.len(), 1);
     assert_eq!(replay_result.classes[0].env_ids, ["c"]);
     assert_eq!(result.classes[0].env_ids, ["a", "b"]);
+}
+
+#[test]
+fn opaque_metadata_reaches_parent_and_child_requests_without_affecting_history() {
+    let parent_metadata: Metadata =
+        serde_json::from_value(json!({"model": "parent-model", "tags": ["p"]})).unwrap();
+    let child_metadata: Metadata = serde_json::from_value(json!({"model": "child-model"})).unwrap();
+    let child = SubagentTool::new(
+        spec("child"),
+        |_| vec![MessageEnvelope::user("child".to_owned())],
+        |_| vec![spec("leaf")],
+        1,
+    )
+    .with_metadata(child_metadata.clone());
+    let agent = Agent::new(
+        AgentConfig::new(
+            vec![MessageEnvelope::user("parent".to_owned())],
+            vec![spec("tool")],
+        )
+        .with_subagents(vec![child])
+        .with_metadata(parent_metadata.clone()),
+    )
+    .unwrap();
+    let mut run = agent
+        .start(vec!["a".into()], RunOptions::default())
+        .unwrap();
+    let Request::Llm(request) = run.next_request(RequestKind::Any).unwrap() else {
+        panic!("expected parent LLM request")
+    };
+    assert_eq!(request.metadata(), &parent_metadata);
+    assert!(Arc::ptr_eq(request.metadata(), &parent_metadata));
+    run.complete(Completion::Llm(LlmCompletion {
+        request_id: request.request_id,
+        content: "delegate".into(),
+        tool_calls: vec![ToolCall::new("c", "child", json!({}))],
+    }))
+    .unwrap();
+    let Request::Llm(request) = run.next_request(RequestKind::Llm).unwrap() else {
+        panic!("expected child LLM request")
+    };
+    assert_eq!(request.metadata, child_metadata);
+    run.complete(Completion::Llm(LlmCompletion {
+        request_id: request.request_id,
+        content: "inspect".into(),
+        tool_calls: vec![ToolCall::new("t", "leaf", json!({}))],
+    }))
+    .unwrap();
+    let Request::Tool(request) = run.next_request(RequestKind::Tool).unwrap() else {
+        panic!("expected child tool request")
+    };
+    assert_eq!(request.metadata, child_metadata);
+    run.complete(Completion::Tool(ToolCompletion {
+        request_id: request.request_id,
+        results: vec![("a".into(), "done".into())],
+    }))
+    .unwrap();
+    let Request::Llm(request) = run.next_request(RequestKind::Llm).unwrap() else {
+        panic!("expected child final LLM request")
+    };
+    assert_eq!(request.metadata, child_metadata);
+    run.complete(Completion::Llm(LlmCompletion::final_answer(
+        request.request_id,
+        "child answer".into(),
+    )))
+    .unwrap();
+    let Request::Llm(request) = run.next_request(RequestKind::Llm).unwrap() else {
+        panic!("expected parent continuation")
+    };
+    assert_eq!(request.metadata, parent_metadata);
+    run.complete(Completion::Llm(LlmCompletion::final_answer(
+        request.request_id,
+        "parent answer".into(),
+    )))
+    .unwrap();
+    assert!(run.is_done());
+
+    assert!(
+        !serde_json::to_string(&run.snapshot().descriptor)
+            .unwrap()
+            .contains("parent-model")
+    );
+    for node in run.snapshot().store.records().values() {
+        assert!(!serde_json::to_string(node).unwrap().contains("child-model"));
+    }
+
+    // Metadata is runtime-only: a restored handle accepts changed metadata and
+    // replays recorded reasoning without treating metadata as a structural key.
+    let restored = Agent::from_snapshot(
+        run.snapshot(),
+        AgentRuntime {
+            subagents: vec![
+                SubagentTool::new(
+                    spec("child"),
+                    |_| vec![MessageEnvelope::user("child".to_owned())],
+                    |_| vec![spec("leaf")],
+                    1,
+                )
+                .with_metadata(
+                    serde_json::from_value::<Metadata>(json!({"model": "other"})).unwrap(),
+                ),
+            ],
+            agent_resolver: None,
+            metadata: serde_json::from_value(json!({"model": "other"})).unwrap(),
+        },
+    )
+    .unwrap();
+    let mut replay = restored
+        .start(vec!["b".into()], RunOptions::default())
+        .unwrap();
+    while let Some(request) = replay.next_request(RequestKind::Any) {
+        assert_eq!(request.metadata()["model"], "other");
+        let Request::Tool(request) = request else {
+            panic!("unchanged tool results must reuse recorded reasoning")
+        };
+        replay
+            .complete(Completion::Tool(ToolCompletion {
+                request_id: request.request_id,
+                results: vec![("b".into(), "done".into())],
+            }))
+            .unwrap();
+    }
+    assert!(replay.is_done());
+    assert_eq!(replay.result().unwrap().results["b"], "parent answer");
 }
 
 #[test]
