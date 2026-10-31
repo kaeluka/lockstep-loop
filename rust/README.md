@@ -12,10 +12,13 @@ requests. [Visual guide](../docs/concepts.md) · [Use cases](../docs/use-cases.m
 is mutable request/completion state. Recording is unconditional, including children.
 
 ```rust
-use lockstep_loop::{Agent, AgentConfig, Completion, LlmCompletion, RequestKind, RunOptions};
+use lockstep_loop::{Agent, AgentConfig, Completion, LlmCompletion, MessageEnvelope, RequestKind, RunOptions};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let agent = Agent::new(AgentConfig::new("Explain the checklist.".to_owned(), vec![]))?;
+    let agent = Agent::new(AgentConfig::new(vec![
+        MessageEnvelope::system("Assess the supplied evidence.".to_owned()),
+        MessageEnvelope::user("Explain the checklist.".to_owned()),
+    ], vec![]))?;
     let mut run = agent.start(vec!["packet-a/v1".into()], RunOptions::default())?;
     let request = run.next_request(RequestKind::Any).unwrap();
     run.complete(Completion::Llm(LlmCompletion::final_answer(request.request_id(), "done".into())))?;
@@ -82,7 +85,7 @@ let snapshot = AgentSnapshot {
     }),
 };
 let agent = Agent::from_snapshot(snapshot, AgentRuntime::default())?;
-// No repeated prompt/specs and no record loading until start/traversal.
+// No repeated initial messages/specs and no record loading until start/traversal.
 ```
 
 `RecordStore` is an append-only write set/cache, not a backend. Loaders are
@@ -124,11 +127,18 @@ I/O, serialization protocol, GC or crash recovery, and has no Python counterpart
 
 ### Runtime configuration and grouping
 
-Fresh configuration: `AgentConfig::new(prompt, tool_specs)`, optionally
+Fresh configuration: `AgentConfig::new(initial_messages, tool_specs)`, optionally
 `.with_subagents(...)`, `.with_agent_resolver(AgentResolver::new(...))`, and
 `.with_record_store(...)`. Restored agents take `AgentRuntime { subagents,
 agent_resolver }`; factories must match recorded structural configuration.
 Executable callbacks are never serialized.
+
+`initial_messages` is a nonempty `Vec<MessageEnvelope<P>>`, preserved in order.
+An envelope supplies a `Role` (`System`, `User`, `Assistant`, or `Tool`) and call
+metadata; its content `P` remains opaque and can contain bytes, audio, images, or
+caller-defined multimodal values. Helpers are `MessageEnvelope::system`, `user`,
+`assistant`, and `tool`. Empty initial sequences are rejected, including child
+factory results. Snapshots and child queries retain the entire initial sequence.
 
 `Agent::new` and `from_snapshot` use identity keys and require
 `P: Clone + Eq + Hash + Debug + 'static`. Custom grouping uses
@@ -144,8 +154,9 @@ stricter keys can branch despite matching old evidence, and coarser keys select 
 first matching stored edge without merging. Historical representatives remain
 model context; full new evidence is appended separately.
 
-Structural checks cover prompts, ordered specs, nested allowlists/depth, and actual
-child prompt/spec factory outputs. Provider/adapter and grouping-policy isolation
+Structural checks cover every initial envelope's role, content and call metadata
+in sequence order, ordered specs, nested allowlists/depth, and actual child
+initial-message/spec factory outputs. Provider/adapter and grouping-policy isolation
 remain caller-owned, without manual version keys. Payload Clone must have immutable
 value semantics; interior-mutable aliases must never change submitted facts.
 
@@ -180,10 +191,12 @@ panics are not recovered: discard that live run. Caller side effects and unreach
 append-only writes are not rolled back. These semantics differ from Python's
 broader transactional callback-exception rollback.
 
-### Children and Asset views
+### Children, conversations, and asset accessors
 
-`SubagentTool` factories deterministically build initial user prompts and tool
-specs. Nested allowlists/depth caps are enforced. A resolver receives a child
+`SubagentTool` factories deterministically build nonempty initial-envelope vectors
+and tool specs. `SubagentTool::new` takes a factory returning
+`Vec<MessageEnvelope<P>>`; `try_new` accepts a fallible factory returning
+`Result<Vec<MessageEnvelope<P>>, LoopError>`. Nested allowlists/depth caps are enforced. A resolver receives a child
 `AgentQuery` (no parent/environment/grouping identity) and returns
 `Result<Option<AgentDescriptor<P>>, LoopError>`. The shared store must resolve the
 selected records. Recorded parent invocations pin their revision; only new
@@ -197,24 +210,49 @@ cache revisions; no merge or external cache update is automatic.
 
 ```rust,ignore
 let snapshot = agent.snapshot(); // keep this value alive while borrowing views
-for asset in snapshot.assets() {
-    println!("{:?}: {:?}", asset.env_ids(), asset.value());
-    println!("{:?}", asset.messages());
+for conversation in snapshot.conversations() {
+    println!("{:?}: {:?}", conversation.env_ids(), conversation.get_last_answer_asset());
+    println!("{:?}", conversation.get_final_tool_input_asset("submitFinalAnswer"));
+    println!("{:?}", conversation.messages());
 }
 ```
 
-`Asset<'_, P>` borrows an immutable snapshot and retains its path, unaffected by
-later Agent publication. Traversal is lazy and does not clone payloads; requesting
-owned `messages()` requires Clone. An open continuation may retain a previous
-value; `Some(&None)` differs from no publication. `asset.snapshot()` exposes its
-anchor. Child leaves are separate: inspect `snapshot.child(entry).assets()`.
+`Conversation<'_, P>` borrows an immutable snapshot and retains its path,
+unaffected by later Agent publication. `Conversations` lazily visits the history
+trie's structural leaves without cloning contents; requesting owned `messages()`
+requires Clone. `conversation.snapshot()` exposes its anchor. Child conversations
+are separate: inspect `snapshot.child(entry).conversations()`.
+
+An asset is the value the caller cares about, not a library wrapper:
+- `get_last_answer_asset() -> Option<&P>` selects the latest no-tool model answer,
+  including one before an open follow-up. `Some(&None)` is a real optional null
+  answer, distinct from missing (`None`).
+- `get_final_tool_input_asset(tool_name) -> Option<&serde_json::Value>` selects the
+  latest matching tool-call input, scanning turns and calls in reverse order.
+  It returns the input, not the tool output. `Some(&Value::Null)` is a real null
+  input, distinct from missing. A final-answer tool is still an ordinary tool;
+  this accessor adds no execution side effects or termination/publication policy.
+
+Both accessors include initial model envelopes and require neither Clone nor
+payload equality. Initial assistant context does not consume the turn budget or
+make a budget-limited execution a completed answer: the last-answer accessor may
+expose an initial answer while the current history position remains open. Only
+an accepted terminal response at that position permits a user continuation.
+Conversation evidence retains each environment's actual outputs,
+while shared model-visible content uses historical representatives. Custom
+equivalence does not provide cross-environment isolation.
+
+There is one persistent history trie, including every non-splitting tool-result
+checkpoint. `BatchResult` contains its snapshot plus flat run-local `classes`,
+`results`, and `child_updates`; it has no second partition tree. The returned
+classes describe only this execution, not all historical environments.
 
 ## Examples, convenience drivers and limits
 
 From the repository root, no providers or credentials:
 
 ```sh
-for example in product_screening history_replay feedback specialized_subagents agent_assets; do
+for example in product_screening history_replay feedback specialized_subagents agent_conversations; do
     cargo run -p lockstep-loop --example "$example"
 done
 ```

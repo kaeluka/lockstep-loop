@@ -1,7 +1,7 @@
 use lockstep_loop::{
-    BatchLoop, Budget, Completion, FunctionTool, LlmCompletion, LoopConfig, LoopError, Message,
-    Request, RequestKind, SubagentTool, ToolCall, ToolCompletion, ToolEntry, ToolSpec,
-    run_to_completion, run_to_completion_by,
+    BatchLoop, Budget, Completion, FunctionTool, LlmCompletion, LoopConfig, LoopError,
+    MessageEnvelope, Request, RequestKind, SubagentTool, ToolCall, ToolCompletion, ToolEntry,
+    ToolSpec, run_to_completion, run_to_completion_by,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -23,7 +23,7 @@ where
 #[test]
 fn single_env_no_tool_calls() {
     let result = run_to_completion(
-        "hi".to_owned(),
+        vec![lockstep_loop::MessageEnvelope::user("hi".to_owned())],
         vec!["a".to_owned()],
         |_| Vec::new(),
         |request| LlmCompletion::final_answer(&request.request_id, "done".to_owned()),
@@ -32,8 +32,9 @@ fn single_env_no_tool_calls() {
     .unwrap();
 
     assert_eq!(result.results["a"], "done");
-    assert_eq!(result.tree.env_ids, ["a"]);
-    assert!(result.tree.children.is_empty());
+    assert_eq!(result.classes[0].env_ids, ["a"]);
+    assert_eq!(result.classes.len(), 1);
+    assert!(result.snapshot.root().observations.is_empty());
     assert_eq!(result.classes[0].env_ids, ["a"]);
 }
 
@@ -42,7 +43,7 @@ fn splits_on_divergent_results_and_llm_requests_carry_env_sets() {
     let data = BTreeMap::from([("a", "hello"), ("b", "hello"), ("c", "goodbye")]);
     let mut request_envs = Vec::new();
     let result = run_to_completion(
-        "read it".to_owned(),
+        vec![lockstep_loop::MessageEnvelope::user("read it".to_owned())],
         vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
         |env| vec![constant_tool("read_file", data[env].to_owned())],
         |request| {
@@ -71,14 +72,15 @@ fn splits_on_divergent_results_and_llm_requests_carry_env_sets() {
     let mut later_sizes = request_envs[1..].iter().map(Vec::len).collect::<Vec<_>>();
     later_sizes.sort_unstable();
     assert_eq!(later_sizes, [1, 2]);
-    assert_eq!(result.tree.children.len(), 2);
+    assert_eq!(result.classes.len(), 2);
+    assert_eq!(result.snapshot.root().observations.len(), 2);
 }
 
 #[test]
 fn multi_tool_turn_groups_by_result_tuple() {
     let data = BTreeMap::from([("a", ("1", "x")), ("b", ("1", "x")), ("c", ("1", "y"))]);
     let result = run_to_completion(
-        "x".to_owned(),
+        vec![lockstep_loop::MessageEnvelope::user("x".to_owned())],
         vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
         |env| {
             vec![
@@ -130,7 +132,7 @@ fn opaque_byte_payloads_group_by_value() {
         ("c", b"PNG-b".to_vec()),
     ]);
     let result = run_to_completion(
-        b"go".to_vec(),
+        vec![lockstep_loop::MessageEnvelope::user(b"go".to_vec())],
         vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
         |env| vec![constant_tool("snap", data[env].clone())],
         |request| {
@@ -159,7 +161,7 @@ fn opaque_byte_payloads_group_by_value() {
 fn custom_grouping_can_merge_unequal_values() {
     let data = BTreeMap::from([("a", "result v1\n"), ("b", "result v1")]);
     let result = run_to_completion_by(
-        "x".to_owned(),
+        vec![lockstep_loop::MessageEnvelope::user("x".to_owned())],
         vec!["a".to_owned(), "b".to_owned()],
         |env| vec![constant_tool("t", data[env].to_owned())],
         |request| {
@@ -187,7 +189,12 @@ fn subagent_answers_refine_the_parent_branch() {
     let answers = Arc::new(BTreeMap::from([("a", "yes"), ("b", "yes"), ("c", "no")]));
     let subagent = SubagentTool::new(
         spec("investigate"),
-        |args| format!("Answer: {}", args["question"].as_str().unwrap()),
+        |args| {
+            vec![lockstep_loop::MessageEnvelope::user(format!(
+                "Answer: {}",
+                args["question"].as_str().unwrap()
+            ))]
+        },
         |_| vec![spec("probe")],
         1,
     );
@@ -195,7 +202,7 @@ fn subagent_answers_refine_the_parent_branch() {
     let factory_answers = Arc::clone(&answers);
     let mut request_ids = Vec::new();
     let result = run_to_completion(
-        "main".to_owned(),
+        vec![lockstep_loop::MessageEnvelope::user("main".to_owned())],
         vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
         move |env| {
             vec![
@@ -254,9 +261,17 @@ fn subagent_answers_refine_the_parent_branch() {
 
 #[test]
 fn zero_subagent_depth_is_rejected() {
-    let config = LoopConfig::new("x".to_owned(), vec!["e".to_owned()], Vec::new()).with_subagent(
-        SubagentTool::new(spec("s"), |_| "p".to_owned(), |_| Vec::new(), 0),
-    );
+    let config = LoopConfig::new(
+        vec![lockstep_loop::MessageEnvelope::user("x".to_owned())],
+        vec!["e".to_owned()],
+        Vec::new(),
+    )
+    .with_subagent(SubagentTool::new(
+        spec("s"),
+        |_| vec![lockstep_loop::MessageEnvelope::user("p".to_owned())],
+        |_| Vec::new(),
+        0,
+    ));
     assert!(matches!(
         BatchLoop::new(config),
         Err(LoopError::InvalidSubagentDepth)
@@ -266,7 +281,7 @@ fn zero_subagent_depth_is_rejected() {
 #[test]
 fn budget_uses_caller_supplied_generic_payload() {
     let result = run_to_completion(
-        "x".to_owned(),
+        vec![lockstep_loop::MessageEnvelope::user("x".to_owned())],
         vec!["a".to_owned()],
         |_| vec![constant_tool("noop", "ok".to_owned())],
         |request| LlmCompletion {
@@ -288,7 +303,7 @@ fn budget_uses_caller_supplied_generic_payload() {
 #[test]
 fn multi_tool_completions_may_arrive_out_of_order() {
     let mut loop_ = BatchLoop::new(LoopConfig::new(
-        "x".to_owned(),
+        vec![lockstep_loop::MessageEnvelope::user("x".to_owned())],
         vec!["a".to_owned(), "b".to_owned()],
         vec![spec("t1"), spec("t2")],
     ))
@@ -349,7 +364,7 @@ fn multi_tool_completions_may_arrive_out_of_order() {
 #[test]
 fn filtered_pulls_and_any_use_issue_order() {
     let mut loop_ = BatchLoop::new(LoopConfig::new(
-        "x".to_owned(),
+        vec![lockstep_loop::MessageEnvelope::user("x".to_owned())],
         vec!["a".to_owned(), "b".to_owned()],
         vec![spec("t")],
     ))
@@ -407,7 +422,7 @@ fn filtered_pulls_and_any_use_issue_order() {
 #[test]
 fn completion_errors_leave_the_request_outstanding() {
     let mut loop_ = BatchLoop::new(LoopConfig::new(
-        "x".to_owned(),
+        vec![lockstep_loop::MessageEnvelope::user("x".to_owned())],
         vec!["a".to_owned()],
         Vec::new(),
     ))
@@ -437,12 +452,16 @@ fn completion_errors_leave_the_request_outstanding() {
 #[test]
 fn validates_environment_and_completion_sets() {
     assert!(matches!(
-        BatchLoop::<String>::new(LoopConfig::new("x".to_owned(), Vec::new(), Vec::new())),
+        BatchLoop::<String>::new(LoopConfig::new(
+            vec![lockstep_loop::MessageEnvelope::user("x".to_owned())],
+            Vec::new(),
+            Vec::new()
+        )),
         Err(LoopError::EmptyEnvIds)
     ));
     assert!(matches!(
         BatchLoop::<String>::new(LoopConfig::new(
-            "x".to_owned(),
+            vec![lockstep_loop::MessageEnvelope::user("x".to_owned())],
             vec!["a".to_owned(), "a".to_owned()],
             Vec::new()
         )),
@@ -450,7 +469,7 @@ fn validates_environment_and_completion_sets() {
     ));
 
     let mut loop_ = BatchLoop::new(LoopConfig::new(
-        "x".to_owned(),
+        vec![lockstep_loop::MessageEnvelope::user("x".to_owned())],
         vec!["a".to_owned(), "b".to_owned()],
         vec![spec("t")],
     ))
@@ -483,7 +502,7 @@ fn validates_environment_and_completion_sets() {
 #[test]
 fn duplicate_tool_call_ids_are_rejected_without_consuming_request() {
     let mut loop_ = BatchLoop::new(LoopConfig::new(
-        "x".to_owned(),
+        vec![lockstep_loop::MessageEnvelope::user("x".to_owned())],
         vec!["a".to_owned()],
         vec![spec("t")],
     ))
@@ -508,5 +527,8 @@ fn duplicate_tool_call_ids_are_rejected_without_consuming_request() {
 
 #[test]
 fn message_helpers_match_provider_neutral_shape() {
-    assert_eq!(Message::user("x").tool_calls, Vec::<ToolCall>::new());
+    assert_eq!(
+        MessageEnvelope::user("x").tool_calls,
+        Vec::<ToolCall>::new()
+    );
 }

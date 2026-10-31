@@ -81,7 +81,7 @@ fn screen(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Default namespaces suffice in memory; durable writers reserve unique namespaces.
     let agent = Agent::new(AgentConfig::new(
-        PROMPT.into(),
+        vec![lockstep_loop::MessageEnvelope::user(PROMPT.into())],
         vec![ToolSpec::new(
             "read_ratings",
             "Read the sensor's enclosure rating and minimum/maximum temperatures in Celsius.",
@@ -120,11 +120,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "does not meet toy requirements"
     );
     let extended = changed.snapshot();
-    assert_eq!(old.assets().count(), 2);
-    assert_eq!(extended.assets().count(), 3);
+    assert_eq!(old.conversations().count(), 2);
+    assert_eq!(extended.conversations().count(), 3);
     println!("Revised specifications: {llms} LLM call, {reads} tool execution");
-    for asset in extended.assets() {
-        println!("{:?} -> {}", asset.env_ids(), asset.value().unwrap());
+    for asset in extended.conversations() {
+        println!(
+            "{:?} -> {}",
+            asset.env_ids(),
+            asset.get_last_answer_asset().unwrap()
+        );
     }
     Ok(())
 }

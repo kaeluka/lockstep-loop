@@ -22,7 +22,7 @@ fn config(
     feedback: Option<&str>,
 ) -> LoopConfig<String> {
     let c = LoopConfig::new(
-        PROMPT.into(),
+        vec![lockstep_loop::MessageEnvelope::user(PROMPT.into())],
         envs.iter().map(|e| (*e).into()).collect(),
         specs(),
     );
@@ -565,7 +565,13 @@ fn partial_paths_and_unfinished_feedback_are_not_targets() {
 
 #[test]
 fn opaque_null_feedback_presence_and_constructor_limits() {
-    let base = || LoopConfig::new(Some(vec![0_u8, 255]), vec!["A".into()], vec![]);
+    let base = || {
+        LoopConfig::new(
+            vec![lockstep_loop::MessageEnvelope::user(Some(vec![0_u8, 255]))],
+            vec!["A".into()],
+            vec![],
+        )
+    };
     let mut initial_loop = BatchLoop::new(base()).unwrap();
     let request = initial_loop.next_request(RequestKind::Any).unwrap();
     initial_loop
@@ -613,7 +619,7 @@ fn opaque_null_feedback_presence_and_constructor_limits() {
         Err(LoopError::InvalidFeedback)
     ));
     let mut changed = base().with_snapshot(old.clone()).with_feedback(None);
-    changed.prompt = Some(vec![99]);
+    changed.initial_messages[0].content = Some(vec![99]);
     assert!(matches!(
         BatchLoop::new(changed),
         Err(LoopError::IncompatibleHistory)
@@ -743,14 +749,21 @@ fn nested_config(
             .map(|s| ToolSpec::new(*s, "", json!({})))
             .collect()
     };
-    let config = LoopConfig::new("parent".into(), vec!["A".into()], specs()).with_subagent(
-        SubagentTool::new(
-            ToolSpec::new("investigate", "", json!({})),
-            |a| a["prompt"].as_str().unwrap().into(),
-            move |_| specs(),
-            1,
-        ),
-    );
+    let config = LoopConfig::new(
+        vec![lockstep_loop::MessageEnvelope::user("parent".into())],
+        vec!["A".into()],
+        specs(),
+    )
+    .with_subagent(SubagentTool::new(
+        ToolSpec::new("investigate", "", json!({})),
+        |a| {
+            vec![lockstep_loop::MessageEnvelope::user(
+                a["prompt"].as_str().unwrap().into(),
+            )]
+        },
+        move |_| specs(),
+        1,
+    ));
     let mut config = match previous {
         Some(h) => config.with_snapshot(h),
         None => config,

@@ -1,8 +1,8 @@
 //! Mutable handles over immutable snapshot values. No provider or persistence I/O.
 use crate::{
     AgentDescriptor, AgentResolver, AgentSnapshot, BatchLoop, BatchResult, Budget,
-    ComparisonKeyFunction, Completion, HistoryNode, LoopConfig, LoopError, RecordStore, Request,
-    RequestKind, SubagentTool, ToolSpec, register,
+    ComparisonKeyFunction, Completion, HistoryNode, LoopConfig, LoopError, MessageEnvelope,
+    RecordStore, Request, RequestKind, SubagentTool, ToolSpec, register,
 };
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -27,15 +27,15 @@ impl<P> Default for AgentRuntime<P> {
 /// Fresh-agent configuration; budgets and feedback belong to individual runs.
 #[derive(Clone, Debug)]
 pub struct AgentConfig<P> {
-    pub prompt: P,
+    pub initial_messages: Vec<MessageEnvelope<P>>,
     pub tool_specs: Vec<ToolSpec>,
     pub runtime: AgentRuntime<P>,
     pub record_store: RecordStore<P>,
 }
 impl<P> AgentConfig<P> {
-    pub fn new(prompt: P, tool_specs: Vec<ToolSpec>) -> Self {
+    pub fn new(initial_messages: Vec<MessageEnvelope<P>>, tool_specs: Vec<ToolSpec>) -> Self {
         Self {
-            prompt,
+            initial_messages,
             tool_specs,
             runtime: AgentRuntime::default(),
             record_store: RecordStore::default(),
@@ -91,7 +91,7 @@ where
     pub fn new(config: AgentConfig<P>) -> Result<Self, LoopError> {
         Self::with_comparison_key(config, Clone::clone)
     }
-    /// Restore without repeating prompt/specs or loading any history records.
+    /// Restore without repeating initial messages/specs or loading history records.
     pub fn from_snapshot(
         snapshot: AgentSnapshot<P>,
         runtime: AgentRuntime<P>,
@@ -110,10 +110,13 @@ where
         config: AgentConfig<P>,
         comparison_key: impl Fn(&P) -> K + Send + Sync + 'static,
     ) -> Result<Self, LoopError> {
+        if config.initial_messages.is_empty() {
+            return Err(LoopError::EmptyInitialMessages);
+        }
         let registry = register(config.tool_specs, config.runtime.subagents.clone())?;
         let snapshot = AgentSnapshot {
             descriptor: AgentDescriptor {
-                prompt: config.prompt,
+                initial_messages: config.initial_messages,
                 tools: registry.specs,
                 subagents: registry.contracts,
                 root: config.record_store.put(HistoryNode::default()),
@@ -129,12 +132,15 @@ where
 
     /// Restore with a current grouping function; no callable identity/mode gate.
     /// Matching subagent factories must be supplied; callbacks are never persisted.
-    /// Prompt and ordered tool specs come exclusively from the snapshot.
+    /// Initial messages and ordered tool specs come exclusively from the snapshot.
     pub fn from_snapshot_by(
         snapshot: AgentSnapshot<P>,
         runtime: AgentRuntime<P>,
         comparison_key: impl Fn(&P) -> K + Send + Sync + 'static,
     ) -> Result<Self, LoopError> {
+        if snapshot.descriptor.initial_messages.is_empty() {
+            return Err(LoopError::EmptyInitialMessages);
+        }
         let registry = register(snapshot.descriptor.tools.clone(), runtime.subagents.clone())?;
         if registry.specs != snapshot.descriptor.tools
             || registry.contracts != snapshot.descriptor.subagents
@@ -171,7 +177,7 @@ where
     ) -> Result<AgentRun<P, K>, LoopError> {
         let snapshot = self.snapshot();
         let mut config = LoopConfig::new(
-            snapshot.descriptor.prompt.clone(),
+            snapshot.descriptor.initial_messages.clone(),
             environments,
             snapshot.descriptor.tools.clone(),
         )

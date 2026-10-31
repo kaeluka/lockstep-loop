@@ -38,7 +38,10 @@ fn definition(name: &str, kind: &str) -> SubagentTool<String> {
                     "expected exactly one string file_path".into(),
                 ));
             }
-            Ok(format!("{kind}:{}", args["file_path"].as_str().unwrap()))
+            Ok(vec![lockstep_loop::MessageEnvelope::user(format!(
+                "{kind}:{}",
+                args["file_path"].as_str().unwrap()
+            ))])
         },
         |_| Ok(vec![read()]),
         1,
@@ -60,7 +63,7 @@ fn calls(path: &str) -> Vec<ToolCall> {
 }
 fn config(prompt: &str, envs: &[&str]) -> LoopConfig<String> {
     LoopConfig::new(
-        prompt.into(),
+        vec![lockstep_loop::MessageEnvelope::user(prompt.into())],
         envs.iter().map(|s| (*s).into()).collect(),
         vec![status()],
     )
@@ -252,7 +255,7 @@ fn multiple_tools_changed_parent_reuses_children_and_exposes_persistable_provena
     let mut selected = BTreeMap::new();
     for u in &old.child_updates {
         let d = publish(&u.snapshot, &backend);
-        selected.insert(d.prompt.clone(), d);
+        selected.insert(d.initial_messages[0].content.clone(), d);
         assert!(u.base.is_none());
         assert_eq!(u.env_ids, ["old"]);
     }
@@ -271,7 +274,9 @@ fn multiple_tools_changed_parent_reuses_children_and_exposes_persistable_provena
         .with_record_store(store)
         .with_agent_resolver(move |q| {
             observed.lock().unwrap().push(q.clone());
-            Ok(selected_for_resolver.get(&q.prompt).cloned())
+            Ok(selected_for_resolver
+                .get(&q.initial_messages[0].content)
+                .cloned())
         });
     let mut new_calls = calls("foo.py");
     for call in &mut new_calls {
@@ -308,7 +313,7 @@ fn multiple_tools_changed_parent_reuses_children_and_exposes_persistable_provena
     assert_eq!(queries.lock().unwrap().len(), 2);
     let parent = &second.result.snapshot;
     for u in &second.result.child_updates {
-        let key = u.snapshot.descriptor.prompt.clone();
+        let key = u.snapshot.descriptor.initial_messages[0].content.clone();
         assert_eq!(u.base.as_ref(), selected.get(&key));
         assert_ne!(u.snapshot.descriptor.root, u.base.as_ref().unwrap().root);
         let root = parent.root();
@@ -412,7 +417,11 @@ fn changed_arguments_and_new_observations_do_not_split_parent_on_equal_answers()
         );
         assert!(result.result.child_updates[0].base.is_none());
         assert_eq!(
-            result.result.child_updates[0].snapshot.descriptor.prompt,
+            result.result.child_updates[0]
+                .snapshot
+                .descriptor
+                .initial_messages[0]
+                .content,
             format!("imports:{path}")
         );
         assert!(
@@ -426,7 +435,12 @@ fn changed_arguments_and_new_observations_do_not_split_parent_on_equal_answers()
         super_config("parent-new-implementation", &["old"]).with_record_store(store(&backend));
     let rebuilt = SubagentTool::new(
         definitions()[0].spec.clone(),
-        |a| format!("imports:{}", a["file_path"].as_str().unwrap()),
+        |a| {
+            vec![lockstep_loop::MessageEnvelope::user(format!(
+                "imports:{}",
+                a["file_path"].as_str().unwrap()
+            ))]
+        },
         |_| vec![read()],
         1,
     )
@@ -611,7 +625,7 @@ fn incompatible_resolver_results_and_malformed_args_leave_fresh_requests_recover
     object.insert("subagent".into(), serde_json::Value::Null);
     assert!(serde_json::from_value::<AgentDescriptor<String>>(legacy).is_err());
     let mut wrong_prompt = descriptor.clone();
-    wrong_prompt.prompt = "other".into();
+    wrong_prompt.initial_messages[0].content = "other".into();
     let mut wrong_nested = descriptor.clone();
     wrong_nested.subagents = old.snapshot.descriptor.subagents.clone();
     let mut wrong_tools = descriptor.clone();
@@ -714,8 +728,10 @@ fn resolver_error_after_a_prepared_hit_keeps_the_whole_turn_pending() {
     let config = config("parent-retry", &["new"])
         .with_record_store(store(&backend))
         .with_agent_resolver(move |q| {
-            seen.lock().unwrap().push(q.prompt.clone());
-            if q.prompt.starts_with("imports:") {
+            seen.lock()
+                .unwrap()
+                .push(q.initial_messages[0].content.clone());
+            if q.initial_messages[0].content.starts_with("imports:") {
                 return Ok(Some(descriptor.clone()));
             }
             if fault.load(Ordering::Relaxed) {
@@ -753,7 +769,13 @@ fn resolver_error_after_a_prepared_hit_keeps_the_whole_turn_pending() {
 fn registration_legacy_advertisements_and_all_serial_driver_entries() {
     let imports = definitions().remove(0);
     let metrics = definitions().remove(1);
-    let base = || LoopConfig::new("p".to_owned(), vec!["e".into()], vec![]);
+    let base = || {
+        LoopConfig::new(
+            vec![lockstep_loop::MessageEnvelope::user("p".to_owned())],
+            vec!["e".into()],
+            vec![],
+        )
+    };
     assert!(matches!(
         BatchLoop::new(base().with_subagent(imports.clone()).with_subagents(vec![])),
         Err(LoopError::AmbiguousSubagents)
@@ -803,7 +825,9 @@ fn registration_legacy_advertisements_and_all_serial_driver_entries() {
     assert_eq!(request.tools.len(), 1);
     let i = imports.clone();
     let result = run_to_completion(
-        "parent-driver".to_owned(),
+        vec![lockstep_loop::MessageEnvelope::user(
+            "parent-driver".to_owned(),
+        )],
         vec!["e".into()],
         move |_| {
             vec![
@@ -828,7 +852,9 @@ fn registration_legacy_advertisements_and_all_serial_driver_entries() {
     let runtime_sub = imports.clone();
     assert!(matches!(
         run_to_completion(
-            "parent-driver".to_owned(),
+            vec![lockstep_loop::MessageEnvelope::user(
+                "parent-driver".to_owned()
+            )],
             vec!["a".into(), "b".into()],
             move |env| {
                 let ordinary = Arc::new(FunctionTool::new(read(), |_| "value".to_owned()));
@@ -852,7 +878,7 @@ fn registration_legacy_advertisements_and_all_serial_driver_entries() {
     }));
     assert!(matches!(
         run_to_completion(
-            "p".to_owned(),
+            vec![lockstep_loop::MessageEnvelope::user("p".to_owned())],
             vec!["e".into()],
             move |_| vec![
                 ToolEntry::Subagent(conflict_sub.clone()),
@@ -865,7 +891,7 @@ fn registration_legacy_advertisements_and_all_serial_driver_entries() {
     ));
     assert!(matches!(
         run_to_completion(
-            "p".to_owned(),
+            vec![lockstep_loop::MessageEnvelope::user("p".to_owned())],
             vec!["e".into()],
             move |_| vec![
                 ToolEntry::Subagent(imports.clone()),
@@ -884,14 +910,24 @@ fn explicit_nested_allowlists_cannot_reset_depth_or_leak_sibling_reserved_tools(
     leaf.max_depth = 99;
     let middle = SubagentTool::new(
         ToolSpec::new("middle", "", json!({})),
-        |a| format!("middle:{}", a["file_path"].as_str().unwrap()),
+        |a| {
+            vec![lockstep_loop::MessageEnvelope::user(format!(
+                "middle:{}",
+                a["file_path"].as_str().unwrap()
+            ))]
+        },
         |_| vec![read(), ToolSpec::new("outer", "", json!({}))],
         99,
     )
     .with_subagents(vec![leaf]);
     let outer = SubagentTool::new(
         ToolSpec::new("outer", "", json!({})),
-        |a| format!("outer:{}", a["file_path"].as_str().unwrap()),
+        |a| {
+            vec![lockstep_loop::MessageEnvelope::user(format!(
+                "outer:{}",
+                a["file_path"].as_str().unwrap()
+            ))]
+        },
         |_| vec![read(), ToolSpec::new("sibling", "", json!({}))],
         2,
     )
@@ -1000,7 +1036,9 @@ fn selected_feedback_revision_is_reused_without_automatically_updating_old_paren
     let child = imports(&old);
     let mut feedback = BatchLoop::new(
         LoopConfig::new(
-            child.descriptor.prompt.clone(),
+            vec![lockstep_loop::MessageEnvelope::user(
+                child.descriptor.initial_messages[0].content.clone(),
+            )],
             vec!["old".into()],
             child.descriptor.tools.clone(),
         )
@@ -1088,14 +1126,22 @@ fn selected_feedback_revision_is_reused_without_automatically_updating_old_paren
 fn opaque_byte_prompts_are_verified_by_value_not_lookup_keys() {
     let tool = SubagentTool::new(
         ToolSpec::new("opaque", "", json!({})),
-        |a| a["value"].as_str().unwrap().as_bytes().to_vec(),
+        |a| {
+            vec![lockstep_loop::MessageEnvelope::user(
+                a["value"].as_str().unwrap().as_bytes().to_vec(),
+            )]
+        },
         |_| vec![],
         1,
     )
     .with_subagents(vec![]);
     let mut first = BatchLoop::new(
-        LoopConfig::new(b"parent-A".to_vec(), vec!["e".into()], vec![])
-            .with_subagents(vec![tool.clone()]),
+        LoopConfig::new(
+            vec![lockstep_loop::MessageEnvelope::user(b"parent-A".to_vec())],
+            vec!["e".into()],
+            vec![],
+        )
+        .with_subagents(vec![tool.clone()]),
     )
     .unwrap();
     let r = first.next_request(RequestKind::Any).unwrap();
@@ -1123,10 +1169,14 @@ fn opaque_byte_prompts_are_verified_by_value_not_lookup_keys() {
     let snapshot = first.result().unwrap().child_updates.remove(0).snapshot;
     let d = snapshot.descriptor.clone();
     let mut second = BatchLoop::new(
-        LoopConfig::new(b"parent-B".to_vec(), vec!["e".into()], vec![])
-            .with_subagents(vec![tool])
-            .with_record_store(snapshot.store)
-            .with_agent_resolver(move |_| Ok(Some(d.clone()))),
+        LoopConfig::new(
+            vec![lockstep_loop::MessageEnvelope::user(b"parent-B".to_vec())],
+            vec!["e".into()],
+            vec![],
+        )
+        .with_subagents(vec![tool])
+        .with_record_store(snapshot.store)
+        .with_agent_resolver(move |_| Ok(Some(d.clone()))),
     )
     .unwrap();
     let r = second.next_request(RequestKind::Any).unwrap();

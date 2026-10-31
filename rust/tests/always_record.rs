@@ -13,7 +13,11 @@ fn config(
     budget: Option<usize>,
     env: &str,
 ) -> LoopConfig<String> {
-    let mut c = LoopConfig::new("p".into(), vec![env.into()], vec![read()]);
+    let mut c = LoopConfig::new(
+        vec![lockstep_loop::MessageEnvelope::user("p".into())],
+        vec![env.into()],
+        vec![read()],
+    );
     if let Some(agent) = agent {
         c = c.with_snapshot(agent);
     }
@@ -89,7 +93,7 @@ fn constructor_and_sync_driver_publish_immutable_agents() {
         Err(LoopError::UnresolvedConversation)
     );
     let result = run_to_completion(
-        "p".to_owned(),
+        vec![lockstep_loop::MessageEnvelope::user("p".to_owned())],
         vec!["e".into()],
         |_| vec![],
         |r| LlmCompletion::final_answer(&r.request_id, "answer".into()),
@@ -124,7 +128,9 @@ fn zero_budget_is_an_open_agent_and_generic_fallback_needs_only_clone() {
     #[derive(Clone)]
     struct Opaque(std::rc::Rc<usize>);
     let result = run_to_completion_by(
-        Opaque(std::rc::Rc::new(10)),
+        vec![lockstep_loop::MessageEnvelope::user(Opaque(
+            std::rc::Rc::new(10),
+        ))],
         vec!["e".into()],
         |_| vec![],
         |_| panic!("zero budget must not call model"),
@@ -134,7 +140,64 @@ fn zero_budget_is_an_open_agent_and_generic_fallback_needs_only_clone() {
     .unwrap();
     assert_eq!(*result.results["e"].0, 0);
     assert!(result.snapshot().root().assistant.is_none());
-    assert_eq!(*result.snapshot().descriptor.prompt.0, 10);
+    assert_eq!(
+        *result.snapshot().descriptor.initial_messages[0].content.0,
+        10
+    );
+}
+
+#[test]
+fn initial_assistant_answer_does_not_make_zero_budget_a_completed_conversation() {
+    let initial_messages = vec![
+        lockstep_loop::MessageEnvelope::system("context".to_owned()),
+        lockstep_loop::MessageEnvelope::assistant("initial answer".to_owned(), vec![]),
+    ];
+    let mut loop_ = BatchLoop::new(
+        LoopConfig::new(initial_messages.clone(), vec!["e".into()], vec![])
+            .with_budget(Budget::new(0, |steps| format!("exhausted:{steps}"))),
+    )
+    .unwrap();
+    assert!(loop_.is_done());
+    assert!(loop_.next_request(RequestKind::Any).is_none());
+    let result = loop_.result().unwrap();
+    assert_eq!(result.results["e"], "exhausted:0");
+    let snapshot = result.snapshot();
+    assert!(snapshot.root().assistant.is_none());
+    assert!(snapshot.root().env_ids.is_empty());
+    let conversation = snapshot.conversations().next().unwrap();
+    assert!(!conversation.is_complete());
+    assert_eq!(
+        conversation.get_last_answer_asset().unwrap(),
+        "initial answer"
+    );
+    assert_eq!(
+        loop_.append_user_message("feedback".into()),
+        Err(LoopError::UnresolvedConversation)
+    );
+    assert_eq!(loop_.snapshot(), *snapshot);
+    assert!(loop_.snapshot().root().user_continuations.is_empty());
+
+    // Initial assistant context is valid and does not consume the turn budget.
+    let mut resumed = BatchLoop::new(
+        LoopConfig::new(initial_messages.clone(), vec!["new".into()], vec![])
+            .with_snapshot(snapshot.clone())
+            .with_budget(Budget::new(1, |_| "unexpected fallback".into())),
+    )
+    .unwrap();
+    answer(&mut resumed, "real answer", vec![]);
+    assert_eq!(resumed.result().unwrap().results["new"], "real answer");
+    let extended = resumed.append_user_message("feedback".into()).unwrap();
+    let mut feedback = BatchLoop::new(
+        LoopConfig::new(initial_messages, vec!["new".into()], vec![]).with_snapshot(extended),
+    )
+    .unwrap();
+    answer(&mut feedback, "revised answer", vec![]);
+    assert_eq!(feedback.result().unwrap().results["new"], "revised answer");
+    assert!(snapshot.root().assistant.is_none());
+    assert_eq!(
+        conversation.get_last_answer_asset().unwrap(),
+        "initial answer"
+    );
 }
 
 #[test]
@@ -285,7 +348,7 @@ fn budget_after_feedback_preserves_open_continuation_and_counts_replayed_answers
 fn child_budget_keeps_child_open_and_parent_records_actual_tool_result() {
     let sub = SubagentTool::new(
         ToolSpec::new("child", "", json!({})),
-        |_| "child".to_owned(),
+        |_| vec![lockstep_loop::MessageEnvelope::user("child".to_owned())],
         |_| vec![read()],
         1,
     )

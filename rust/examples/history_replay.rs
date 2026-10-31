@@ -13,7 +13,9 @@ fn investigate(
     previous: Option<AgentSnapshot<String>>,
 ) -> Result<(AgentSnapshot<String>, usize, String), Box<dyn std::error::Error>> {
     let config = AgentConfig::new(
-        "Read the revision's status.".to_owned(),
+        vec![lockstep_loop::MessageEnvelope::user(
+            "Read the revision's status.".to_owned(),
+        )],
         vec![ToolSpec::new(
             "status",
             "Read status without changing it.",

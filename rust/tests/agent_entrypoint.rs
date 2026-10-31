@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 fn config() -> AgentConfig<String> {
     AgentConfig::new(
-        "greetings".into(),
+        vec![lockstep_loop::MessageEnvelope::user("greetings".into())],
         vec![ToolSpec::new("read", "Read greeting", json!({}))],
     )
 }
@@ -82,7 +82,7 @@ fn call(run: &mut AgentRun<String>, name: &str) {
 }
 
 #[test]
-fn fresh_sequential_branch_and_snapshot_backed_assets() {
+fn fresh_sequential_branch_and_snapshot_backed_conversations() {
     let agent = Agent::new(config()).unwrap();
     let empty = agent.snapshot();
     let mut run = start(&agent, "a");
@@ -92,9 +92,9 @@ fn fresh_sequential_branch_and_snapshot_backed_assets() {
     assert_eq!(old, run.snapshot());
     assert_eq!(run.result().unwrap().snapshot, old);
     assert!(empty.root().assistant.is_none());
-    let asset = old.assets().next().unwrap();
-    assert_eq!(asset.value().unwrap(), "hello");
-    assert_eq!(asset.observations()[0].representative.len(), 2);
+    let conversation = old.conversations().next().unwrap();
+    assert_eq!(conversation.get_last_answer_asset().unwrap(), "hello");
+    assert_eq!(conversation.observations()[0].representative.len(), 2);
     assert_eq!(
         drive(&mut start(&agent, "b"), &format!("{}{}", "hel", "lo")),
         0
@@ -102,14 +102,14 @@ fn fresh_sequential_branch_and_snapshot_backed_assets() {
     assert_eq!(drive(&mut start(&agent, "c"), "hola"), 1);
     assert_eq!(agent.snapshot().root().observations.len(), 2);
     assert_eq!(old.root().observations.len(), 1);
-    assert_eq!(asset.observations()[0].evidence.len(), 1);
+    assert_eq!(conversation.observations()[0].evidence.len(), 1);
     for value in ["hello", "hola"] {
         assert_eq!(drive(&mut start(&agent, "again"), value), 0);
     }
     let fork = Agent::from_snapshot(old.clone(), AgentRuntime::default()).unwrap();
     assert_eq!(drive(&mut start(&fork, "fork"), "hello"), 0);
     assert_eq!(fork.snapshot().root().observations.len(), 1);
-    assert_eq!(asset.value().unwrap(), "hello");
+    assert_eq!(conversation.get_last_answer_asset().unwrap(), "hello");
 }
 
 #[test]
@@ -232,7 +232,11 @@ fn storage_roundtrip_lazy_restore_uses_snapshot_configuration_and_raw_evidence()
 
 #[test]
 fn final_only_start_publishes_immediately_invalid_completions_are_correctable() {
-    let agent = Agent::new(AgentConfig::new("p".to_owned(), vec![])).unwrap();
+    let agent = Agent::new(AgentConfig::new(
+        vec![lockstep_loop::MessageEnvelope::user("p".to_owned())],
+        vec![],
+    ))
+    .unwrap();
     let empty = agent.snapshot();
     let mut run = start(&agent, "a");
     let r = run.next_request(RequestKind::Any).unwrap();
@@ -362,11 +366,11 @@ fn abandoned_and_failed_runs_do_not_publish_budget_publishes_only_real_history()
 }
 
 #[test]
-fn feedback_budget_publishes_open_continuation_and_keeps_old_asset_anchored() {
+fn feedback_budget_publishes_open_continuation_and_keeps_old_conversation_anchored() {
     let agent = Agent::new(config()).unwrap();
     answer(&mut start(&agent, "a"), "old");
     let old = agent.snapshot();
-    let asset = old.assets().next().unwrap();
+    let conversation = old.conversations().next().unwrap();
     let mut bounded = agent
         .start(
             vec!["a".into()],
@@ -378,8 +382,16 @@ fn feedback_budget_publishes_open_continuation_and_keeps_old_asset_anchored() {
         .unwrap();
     let opened = agent.snapshot();
     assert_eq!(opened, bounded.snapshot());
-    assert!(!opened.assets().next().unwrap().is_complete());
-    assert_eq!(opened.assets().next().unwrap().value().unwrap(), "old");
+    assert!(!opened.conversations().next().unwrap().is_complete());
+    assert_eq!(
+        opened
+            .conversations()
+            .next()
+            .unwrap()
+            .get_last_answer_asset()
+            .unwrap(),
+        "old"
+    );
     let mut followup = start(&agent, "b");
     let Request::Llm(r) = followup.next_request(RequestKind::Any).unwrap() else {
         panic!()
@@ -401,22 +413,30 @@ fn feedback_budget_publishes_open_continuation_and_keeps_old_asset_anchored() {
     bounded.result().unwrap();
     assert_eq!(agent.snapshot(), newest);
     assert!(old.root().user_continuations.is_empty());
-    assert!(asset.is_complete());
-    assert_eq!(asset.value().unwrap(), "old");
+    assert!(conversation.is_complete());
+    assert_eq!(conversation.get_last_answer_asset().unwrap(), "old");
 }
 
 #[test]
 fn nested_child_cache_updates_are_snapshots_and_cached_start_publishes() {
     let leaf = SubagentTool::new(
         ToolSpec::new("leaf", "", json!({})),
-        |_| "leaf prompt".to_owned(),
+        |_| {
+            vec![lockstep_loop::MessageEnvelope::user(
+                "leaf prompt".to_owned(),
+            )]
+        },
         |_| vec![],
         1,
     )
     .with_subagents(vec![]);
     let outer = SubagentTool::new(
         ToolSpec::new("outer", "", json!({})),
-        |_| "outer prompt".to_owned(),
+        |_| {
+            vec![lockstep_loop::MessageEnvelope::user(
+                "outer prompt".to_owned(),
+            )]
+        },
         |_| vec![],
         2,
     )
@@ -426,7 +446,11 @@ fn nested_child_cache_updates_are_snapshots_and_cached_start_publishes() {
         agent_resolver: None,
     };
     let agent = Agent::new(
-        AgentConfig::new("parent".to_owned(), vec![]).with_subagents(vec![outer.clone()]),
+        AgentConfig::new(
+            vec![lockstep_loop::MessageEnvelope::user("parent".to_owned())],
+            vec![],
+        )
+        .with_subagents(vec![outer.clone()]),
     )
     .unwrap();
     let mut run = start(&agent, "a");
@@ -464,14 +488,24 @@ fn nested_child_cache_updates_are_snapshots_and_cached_start_publishes() {
     let restored = Agent::from_snapshot(imported.clone(), runtime).unwrap();
     assert!(loaded.lock().unwrap().is_empty());
     assert_eq!(
-        imported.assets().next().unwrap().value().unwrap(),
+        imported
+            .conversations()
+            .next()
+            .unwrap()
+            .get_last_answer_asset()
+            .unwrap(),
         "parent value"
     );
     assert_eq!(loaded.lock().unwrap().len(), 2);
     assert!(!loaded.lock().unwrap().contains(&child.descriptor.root));
     let imported_child = imported.child(&imported.root().subagents[0]);
     assert_eq!(
-        imported_child.assets().next().unwrap().value().unwrap(),
+        imported_child
+            .conversations()
+            .next()
+            .unwrap()
+            .get_last_answer_asset()
+            .unwrap(),
         "outer value"
     );
     assert_eq!(loaded.lock().unwrap().len(), 4);
@@ -487,12 +521,17 @@ fn nested_child_cache_updates_are_snapshots_and_cached_start_publishes() {
     assert_eq!(cached.result().unwrap().child_updates.len(), 2);
     let selected = child.descriptor.clone();
     let parent = Agent::new(
-        AgentConfig::new("changed parent".to_owned(), vec![])
-            .with_subagents(vec![outer])
-            .with_record_store(child.store.clone())
-            .with_agent_resolver(AgentResolver::new(move |q| {
-                Ok((q == &selected.query()).then(|| selected.clone()))
-            })),
+        AgentConfig::new(
+            vec![lockstep_loop::MessageEnvelope::user(
+                "changed parent".to_owned(),
+            )],
+            vec![],
+        )
+        .with_subagents(vec![outer])
+        .with_record_store(child.store.clone())
+        .with_agent_resolver(AgentResolver::new(move |q| {
+            Ok((q == &selected.query()).then(|| selected.clone()))
+        })),
     )
     .unwrap();
     let mut other = start(&parent, "c");
@@ -579,7 +618,9 @@ fn cached_child_rollup_failure_is_terminal_without_publication_and_fresh_errors_
             if flag.load(Ordering::SeqCst) && args["name"] == "second" {
                 return Err(LoopError::SubagentPreparation("unavailable".into()));
             }
-            Ok(args["name"].as_str().unwrap().to_owned())
+            Ok(vec![lockstep_loop::MessageEnvelope::user(
+                args["name"].as_str().unwrap().to_owned(),
+            )])
         },
         |_| Ok(vec![]),
         1,

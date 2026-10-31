@@ -5,9 +5,9 @@
 //! class splits only when tool results differ. The caller owns all LLM and
 //! tool execution and may complete requests in any order.
 //!
-//! An immutable [`AgentSnapshot`] contains the initial prompt, structural configuration
-//! and accumulated trie. Its [`Asset`] views are leaf investigations backed by
-//! complete conversations, not just published values or environment classes.
+//! An immutable [`AgentSnapshot`] contains ordered initial messages, structural
+//! configuration and one accumulated history trie. Its [`Conversation`] views
+//! expose recorded paths and accessors for caller-chosen asset values.
 //! Successful runs automatically publish their snapshots to the mutable Agent.
 //! Overlapping runs do not merge: last completion wins. Feedback resolves an
 //! existing path through environment replay.
@@ -17,9 +17,10 @@ pub use agent::{Agent, AgentConfig, AgentRun, AgentRuntime, RunOptions};
 mod history;
 use history::PathStep;
 pub use history::{
-    AgentDescriptor, AgentQuery, AgentResolver, AgentSnapshot, Asset, Assets, ChildAgentRun,
-    ChildAgentUpdate, CursorError, EnvObservation, HistoryNode, NodeRef, Observation, OutputRecord,
-    RecordBatch, RecordStore, SubagentContract, SubagentRecord, UserContinuation, WriteCursor,
+    AgentDescriptor, AgentQuery, AgentResolver, AgentSnapshot, ChildAgentRun, ChildAgentUpdate,
+    Conversation, Conversations, CursorError, EnvObservation, HistoryNode, NodeRef, Observation,
+    OutputRecord, RecordBatch, RecordStore, SubagentContract, SubagentRecord, UserContinuation,
+    WriteCursor,
 };
 
 use indexmap::IndexMap;
@@ -32,7 +33,9 @@ use std::sync::Arc;
 use thiserror::Error;
 
 type BudgetFallback<P> = dyn Fn(usize) -> P + Send + Sync;
-type PromptBuilder<P> = dyn Fn(&Value) -> Result<P, LoopError> + Send + Sync;
+type InitialMessagesBuilder<P> =
+    dyn Fn(&Value) -> Result<Vec<MessageEnvelope<P>>, LoopError> + Send + Sync;
+type InitialMessagesEq<P> = fn(&[MessageEnvelope<P>], &[MessageEnvelope<P>]) -> bool;
 type SubToolSpecFactory = dyn Fn(&str) -> Result<Vec<ToolSpec>, LoopError> + Send + Sync;
 type ComparisonKeyFunction<P, K> = dyn Fn(&P) -> K + Send + Sync;
 type ToolFunction<P> = dyn Fn(&Value) -> P + Send + Sync;
@@ -75,21 +78,32 @@ impl ToolCall {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
+    System,
     User,
     Assistant,
     Tool,
 }
 
-/// Provider-neutral conversation message. Payloads are opaque to the loop.
+/// Structural conversation envelope. Its message content `P` is opaque to the library.
+/// Message contents may be text, images, audio, or caller-defined multimodal values.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Message<P> {
+pub struct MessageEnvelope<P> {
     pub role: Role,
     pub content: P,
     pub tool_calls: Vec<ToolCall>,
     pub tool_call_id: Option<String>,
 }
 
-impl<P> Message<P> {
+impl<P> MessageEnvelope<P> {
+    pub fn system(content: P) -> Self {
+        Self {
+            role: Role::System,
+            content,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
     pub fn user(content: P) -> Self {
         Self {
             role: Role::User,
@@ -132,7 +146,7 @@ pub struct LlmRequest<P> {
     pub request_id: String,
     pub branch_id: String,
     pub env_ids: Vec<String>,
-    pub messages: Vec<Message<P>>,
+    pub messages: Vec<MessageEnvelope<P>>,
     pub tools: Vec<ToolSpec>,
     pub stats: RequestStats,
 }
@@ -256,27 +270,27 @@ impl<P> Debug for Budget<P> {
 }
 
 /// Reserved specialized tool implemented by a nested investigation.
-/// The caller deterministically constructs initial USER content from structured
-/// arguments; schemas are advertisements, not runtime argument validation.
+/// The caller deterministically constructs a nonempty initial-message sequence from
+/// structured arguments; schemas advertise tools, not runtime argument validation.
 pub struct SubagentTool<P> {
     pub spec: ToolSpec,
     pub max_depth: usize,
     /// None preserves bounded self-recursion; Some is an explicit child allowlist.
     pub subagents: Option<Vec<SubagentTool<P>>>,
-    build_prompt: Arc<PromptBuilder<P>>,
+    build_initial_messages: Arc<InitialMessagesBuilder<P>>,
     sub_tool_specs: Arc<SubToolSpecFactory>,
 }
 
 impl<P> SubagentTool<P> {
     pub fn new(
         spec: ToolSpec,
-        build_prompt: impl Fn(&Value) -> P + Send + Sync + 'static,
+        build_initial_messages: impl Fn(&Value) -> Vec<MessageEnvelope<P>> + Send + Sync + 'static,
         sub_tool_specs: impl Fn(&str) -> Vec<ToolSpec> + Send + Sync + 'static,
         max_depth: usize,
     ) -> Self {
         Self::try_new(
             spec,
-            move |args| Ok(build_prompt(args)),
+            move |args| Ok(build_initial_messages(args)),
             move |env| Ok(sub_tool_specs(env)),
             max_depth,
         )
@@ -285,7 +299,10 @@ impl<P> SubagentTool<P> {
     /// Fallible factories validate structured args without panicking or consuming a request.
     pub fn try_new(
         spec: ToolSpec,
-        build_prompt: impl Fn(&Value) -> Result<P, LoopError> + Send + Sync + 'static,
+        build_initial_messages: impl Fn(&Value) -> Result<Vec<MessageEnvelope<P>>, LoopError>
+        + Send
+        + Sync
+        + 'static,
         sub_tool_specs: impl Fn(&str) -> Result<Vec<ToolSpec>, LoopError> + Send + Sync + 'static,
         max_depth: usize,
     ) -> Self {
@@ -293,7 +310,7 @@ impl<P> SubagentTool<P> {
             spec,
             max_depth,
             subagents: None,
-            build_prompt: Arc::new(build_prompt),
+            build_initial_messages: Arc::new(build_initial_messages),
             sub_tool_specs: Arc::new(sub_tool_specs),
         }
     }
@@ -319,7 +336,7 @@ impl<P> SubagentTool<P> {
             spec: self.spec.clone(),
             max_depth,
             subagents: self.subagents.clone(),
-            build_prompt: Arc::clone(&self.build_prompt),
+            build_initial_messages: Arc::clone(&self.build_initial_messages),
             sub_tool_specs: Arc::clone(&self.sub_tool_specs),
         }
     }
@@ -346,7 +363,7 @@ impl<P> Debug for SubagentTool<P> {
 #[doc(hidden)]
 #[derive(Clone, Debug)]
 pub struct LoopConfig<P> {
-    pub prompt: P,
+    pub initial_messages: Vec<MessageEnvelope<P>>,
     pub env_ids: Vec<String>,
     pub tool_specs: Vec<ToolSpec>,
     pub subagent: Option<SubagentTool<P>>,
@@ -357,15 +374,19 @@ pub struct LoopConfig<P> {
     pub budget: Option<Budget<P>>,
     /// Optional prior snapshot for replay.
     pub snapshot: Option<AgentSnapshot<P>>,
-    prompt_eq: Option<fn(&P, &P) -> bool>,
+    initial_messages_eq: Option<InitialMessagesEq<P>>,
     /// Some(payload) is one intervention; even Some(None) for an optional payload.
     pub feedback: Option<P>,
 }
 
 impl<P> LoopConfig<P> {
-    pub fn new(prompt: P, env_ids: Vec<String>, tool_specs: Vec<ToolSpec>) -> Self {
+    pub fn new(
+        initial_messages: Vec<MessageEnvelope<P>>,
+        env_ids: Vec<String>,
+        tool_specs: Vec<ToolSpec>,
+    ) -> Self {
         Self {
-            prompt,
+            initial_messages,
             env_ids,
             tool_specs,
             subagent: None,
@@ -374,7 +395,7 @@ impl<P> LoopConfig<P> {
             record_store: None,
             budget: None,
             snapshot: None,
-            prompt_eq: None,
+            initial_messages_eq: None,
             feedback: None,
         }
     }
@@ -385,7 +406,7 @@ impl<P> LoopConfig<P> {
         P: PartialEq,
     {
         self.snapshot = Some(previous);
-        self.prompt_eq = Some(PartialEq::eq);
+        self.initial_messages_eq = Some(PartialEq::eq);
         self
     }
 
@@ -434,20 +455,6 @@ impl<P> LoopConfig<P> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SplitEdge {
-    /// Result-group debug representation; distinct edges may have identical labels.
-    pub group_key: String,
-    pub node: SplitNode,
-}
-
-/// Immutable result trie node.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SplitNode {
-    pub env_ids: Vec<String>,
-    pub children: Vec<SplitEdge>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnvClass {
     pub id: String,
     pub env_ids: Vec<String>,
@@ -455,7 +462,6 @@ pub struct EnvClass {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BatchResult<P> {
-    pub tree: SplitNode,
     pub classes: Vec<EnvClass>,
     /// Final answers or budget fallbacks, separate from recorded model evidence.
     pub results: BTreeMap<String, P>,
@@ -493,7 +499,7 @@ pub enum LoopError {
     SubagentPreparation(String),
     #[error("snapshot resolution failed: {0}")]
     HistoryResolution(String),
-    #[error("incompatible snapshot prompt, tools, subagents or record store")]
+    #[error("incompatible snapshot initial_messages, tools, subagents or record store")]
     IncompatibleHistory,
     #[error("feedback requires a supplied snapshot and exactly one environment")]
     InvalidFeedback,
@@ -503,6 +509,8 @@ pub enum LoopError {
     InvalidUserContinuation,
     #[error("resolve a recorded single-environment run before appending user context")]
     UnresolvedConversation,
+    #[error("initial_messages must contain at least one message")]
+    EmptyInitialMessages,
     #[error("env_ids must be non-empty")]
     EmptyEnvIds,
     #[error("env_ids must be unique; duplicate {0:?}")]
@@ -533,7 +541,7 @@ pub enum LoopError {
 struct Branch<P> {
     branch_id: String,
     env_ids: Vec<String>,
-    messages: Vec<Message<P>>,
+    messages: Vec<MessageEnvelope<P>>,
     split_depth: usize,
     steps: usize,
     history_path: Vec<PathStep>,
@@ -541,12 +549,9 @@ struct Branch<P> {
     turn_results: HashMap<String, BTreeMap<String, P>>,
 }
 
-#[derive(Clone)]
-struct BranchRecord {
-    branch_id: String,
-    parent_id: Option<String>,
-    group_key: Option<String>,
-    env_ids: Vec<String>,
+enum FinishReason {
+    Answer,
+    BudgetExhausted,
 }
 
 #[derive(Clone)]
@@ -645,13 +650,12 @@ pub struct BatchLoop<P, K = P> {
     next_branch: u64,
     next_child: u64,
     branches: HashMap<String, Branch<P>>,
-    partition: Vec<BranchRecord>, // legacy per-run partition summary
     recorded: AgentSnapshot<P>,
     feedback: Option<P>,
     resolve_only: bool,
     resolution_base: Option<AgentSnapshot<P>>,
     error: Option<LoopError>,
-    prompt_eq: Option<fn(&P, &P) -> bool>,
+    initial_messages_eq: Option<InitialMessagesEq<P>>,
     finals: Vec<FinalBranch<P>>,
     child_updates: Vec<ChildAgentUpdate<P>>,
     ready_llm: VecDeque<LlmRequest<P>>,
@@ -710,6 +714,9 @@ where
         resolve_only: bool,
         mut unavailable_subagents: HashSet<String>,
     ) -> Result<Self, LoopError> {
+        if config.initial_messages.is_empty() {
+            return Err(LoopError::EmptyInitialMessages);
+        }
         if config.env_ids.is_empty() {
             return Err(LoopError::EmptyEnvIds);
         }
@@ -731,15 +738,23 @@ where
             return Err(LoopError::InvalidFeedback);
         }
         let resolve_only = resolve_only || config.feedback.is_some();
-        let prompt_eq = config
-            .prompt_eq
-            .or_else(|| config.agent_resolver.as_ref().map(|r| r.prompt_eq));
+        let initial_messages_eq = config.initial_messages_eq.or_else(|| {
+            config
+                .agent_resolver
+                .as_ref()
+                .map(|r| r.initial_messages_eq)
+        });
         let recorded = if let Some(previous) = config.snapshot {
             if config
                 .record_store
                 .as_ref()
                 .is_some_and(|s| !s.same_store(&previous.store))
-                || !prompt_eq.is_some_and(|eq| eq(&previous.descriptor.prompt, &config.prompt))
+                || !initial_messages_eq.is_some_and(|eq| {
+                    eq(
+                        &previous.descriptor.initial_messages,
+                        &config.initial_messages,
+                    )
+                })
                 || previous.descriptor.tools != registry.specs
                 || previous.descriptor.subagents != registry.contracts
             {
@@ -750,7 +765,7 @@ where
             let store = config.record_store.unwrap_or_default();
             AgentSnapshot {
                 descriptor: AgentDescriptor {
-                    prompt: config.prompt,
+                    initial_messages: config.initial_messages,
                     tools: registry.specs.clone(),
                     root: store.put(HistoryNode::default()),
                     subagents: registry.contracts,
@@ -758,22 +773,16 @@ where
                 store,
             }
         };
-        let prompt = recorded.descriptor.prompt.clone();
+        let initial_messages = recorded.descriptor.initial_messages.clone();
         let root = Branch {
             branch_id: "root".to_owned(),
             env_ids: config.env_ids.clone(),
-            messages: vec![Message::user(prompt)],
+            messages: initial_messages,
             split_depth: 0,
             steps: 0,
             history_path: Vec::new(),
             turn_calls: Vec::new(),
             turn_results: HashMap::new(),
-        };
-        let root_record = BranchRecord {
-            branch_id: root.branch_id.clone(),
-            parent_id: None,
-            group_key: None,
-            env_ids: root.env_ids.clone(),
         };
         let mut loop_ = Self {
             specs: registry.specs,
@@ -787,13 +796,12 @@ where
             next_branch: 0,
             next_child: 0,
             branches: HashMap::new(),
-            partition: vec![root_record],
             resolution_base: resolve_only.then(|| recorded.clone()),
             recorded,
             feedback: config.feedback,
             resolve_only,
             error: None,
-            prompt_eq,
+            initial_messages_eq,
             finals: Vec::new(),
             child_updates: Vec::new(),
             ready_llm: VecDeque::new(),
@@ -1007,7 +1015,7 @@ where
         let path = &self.finals[0].history_path;
         let mut node = snapshot.node(path).as_ref().clone();
         node.user_continuations.push(UserContinuation {
-            message: Message::user(content),
+            message: MessageEnvelope::user(content),
             continuation: snapshot.store.put(HistoryNode::default()),
             resolved_env_id: Some(self.finals[0].env_ids[0].clone()),
         });
@@ -1180,7 +1188,7 @@ where
                     self.fail(LoopError::FeedbackResolutionMiss);
                 } else {
                     let content = (budget.exhausted)(branch.steps);
-                    self.finish_branch(branch, content);
+                    self.finish_branch(branch, content, FinishReason::BudgetExhausted);
                 }
                 return;
             }
@@ -1233,12 +1241,11 @@ where
         });
     }
 
-    fn finish_branch(&mut self, branch: Branch<P>, content: P) {
+    fn finish_branch(&mut self, branch: Branch<P>, content: P, reason: FinishReason) {
         self.finals.push(FinalBranch {
-            answered: branch
-                .messages
-                .last()
-                .is_some_and(|m| m.role == Role::Assistant && m.tool_calls.is_empty()),
+            // Initial context can end in an assistant answer. Only accepting a
+            // terminal response at this history position authorizes continuation.
+            answered: matches!(reason, FinishReason::Answer),
             history_path: branch.history_path,
             branch_id: branch.branch_id,
             env_ids: branch.env_ids,
@@ -1255,7 +1262,7 @@ where
             .branches
             .get(&request.branch_id)
             .expect("LLM request must reference an active branch");
-        let message = Message::assistant(completion.content, completion.tool_calls);
+        let message = MessageEnvelope::assistant(completion.content, completion.tool_calls);
         let prepared = self.prepare_assistant_children(branch, &message)?;
         if let Some(branch) = self.accept_prepared(branch.clone(), message, prepared) {
             self.schedule_branch(branch);
@@ -1266,7 +1273,7 @@ where
     fn prepare_assistant_children(
         &self,
         branch: &Branch<P>,
-        message: &Message<P>,
+        message: &MessageEnvelope<P>,
     ) -> Result<PreparedChildren<P, K>, LoopError> {
         let mut children = IndexMap::new();
         let mut next_child = self.next_child;
@@ -1289,7 +1296,11 @@ where
         })
     }
 
-    fn accept_assistant(&mut self, branch: Branch<P>, message: Message<P>) -> Option<Branch<P>> {
+    fn accept_assistant(
+        &mut self,
+        branch: Branch<P>,
+        message: MessageEnvelope<P>,
+    ) -> Option<Branch<P>> {
         match self.prepare_assistant_children(&branch, &message) {
             Ok(prepared) => self.accept_prepared(branch, message, prepared),
             Err(error) => {
@@ -1302,7 +1313,7 @@ where
     fn accept_prepared(
         &mut self,
         mut branch: Branch<P>,
-        message: Message<P>,
+        message: MessageEnvelope<P>,
         mut prepared: PreparedChildren<P, K>,
     ) -> Option<Branch<P>> {
         self.branches.remove(&branch.branch_id);
@@ -1319,7 +1330,7 @@ where
                 && let Some(content) = self.feedback.take()
             {
                 node.user_continuations.push(UserContinuation {
-                    message: Message::user(content),
+                    message: MessageEnvelope::user(content),
                     continuation: snapshot.store.put(HistoryNode::default()),
                     resolved_env_id: Some(branch.env_ids[0].clone()),
                 });
@@ -1332,7 +1343,7 @@ where
                 branch.history_path.push(PathStep::User(0));
                 return Some(branch);
             }
-            self.finish_branch(branch, message.content);
+            self.finish_branch(branch, message.content, FinishReason::Answer);
             return None;
         }
 
@@ -1399,7 +1410,10 @@ where
             .filter(|spec| !unavailable.contains(&spec.name))
             .collect();
         let registry = register(raw_specs, nested.clone())?;
-        let prompt = (subagent.build_prompt)(&call.args)?;
+        let initial_messages = (subagent.build_initial_messages)(&call.args)?;
+        if initial_messages.is_empty() {
+            return Err(LoopError::EmptyInitialMessages);
+        }
         let mut previous = None;
         let mut prior_runs = Vec::new();
         let node = self.recorded.node(&branch.history_path);
@@ -1426,7 +1440,7 @@ where
             && let Some(resolver) = &self.agent_resolver
         {
             let query = AgentQuery {
-                prompt: prompt.clone(),
+                initial_messages: initial_messages.clone(),
                 tools: registry.specs.clone(),
                 subagents: registry.contracts,
             };
@@ -1439,7 +1453,7 @@ where
         }
         let base = previous.as_ref().map(|h| h.descriptor.clone());
         let config = LoopConfig {
-            prompt,
+            initial_messages,
             env_ids: branch.env_ids.clone(),
             tool_specs: registry.specs,
             subagent: None,
@@ -1448,7 +1462,7 @@ where
             record_store: Some(self.recorded.store.clone()),
             budget: self.budget.clone(),
             snapshot: previous,
-            prompt_eq: self.prompt_eq,
+            initial_messages_eq: self.initial_messages_eq,
             feedback: None,
         };
         // The locally reserved key uses only internal invocation counters, not
@@ -1531,7 +1545,10 @@ where
             let edge = &mut node.observations[index];
             edge.evidence.extend(evidence);
             for (call, output) in branch.turn_calls.iter().zip(&edge.representative) {
-                messages.push(Message::tool(output.tool_output.clone(), call.id.clone()));
+                messages.push(MessageEnvelope::tool(
+                    output.tool_output.clone(),
+                    call.id.clone(),
+                ));
             }
             snapshot.replace_node(&history_path, node);
             history_path.push(PathStep::Observation(index));
@@ -1555,12 +1572,6 @@ where
                 turn_calls: Vec::new(),
                 turn_results: HashMap::new(),
             };
-            self.partition.push(BranchRecord {
-                branch_id,
-                parent_id: Some(branch.branch_id.clone()),
-                group_key: Some(format!("{key:?}")),
-                env_ids,
-            });
             self.schedule_branch(child);
             if self.error.is_some() {
                 return;
@@ -1569,31 +1580,6 @@ where
     }
 
     fn finalize(&self) -> BatchResult<P> {
-        let mut children_of: HashMap<String, Vec<SplitEdge>> = HashMap::new();
-        let mut root = None;
-        for record in self.partition.iter().rev() {
-            let mut children = children_of.remove(&record.branch_id).unwrap_or_default();
-            children.reverse();
-            let node = SplitNode {
-                env_ids: record.env_ids.clone(),
-                children,
-            };
-            if let Some(parent_id) = &record.parent_id {
-                children_of
-                    .entry(parent_id.clone())
-                    .or_default()
-                    .push(SplitEdge {
-                        group_key: record
-                            .group_key
-                            .clone()
-                            .expect("non-root record must have a group key"),
-                        node,
-                    });
-            } else {
-                root = Some(node);
-            }
-        }
-
         let classes = self
             .finals
             .iter()
@@ -1609,7 +1595,6 @@ where
             }
         }
         BatchResult {
-            tree: root.expect("partition always contains a root"),
             classes,
             results,
             snapshot: self.recorded.clone(),
@@ -1666,7 +1651,7 @@ impl<P> Clone for ToolEntry<P> {
 
 /// Synchronous convenience driver with value-equality grouping.
 pub fn run_to_completion<P, TF, LF>(
-    prompt: P,
+    initial_messages: Vec<MessageEnvelope<P>>,
     env_ids: Vec<String>,
     tools: TF,
     complete_llm: LF,
@@ -1677,13 +1662,20 @@ where
     TF: Fn(&str) -> Vec<ToolEntry<P>>,
     LF: FnMut(&LlmRequest<P>) -> LlmCompletion<P>,
 {
-    run_to_completion_inner(prompt, env_ids, tools, complete_llm, Clone::clone, budget)
+    run_to_completion_inner(
+        initial_messages,
+        env_ids,
+        tools,
+        complete_llm,
+        Clone::clone,
+        budget,
+    )
 }
 
 /// Synchronous convenience driver with a caller-provided comparison key.
 /// See [`Agent::with_comparison_key`] for key and payload semantics.
 pub fn run_to_completion_by<P, K, TF, LF, CK>(
-    prompt: P,
+    initial_messages: Vec<MessageEnvelope<P>>,
     env_ids: Vec<String>,
     tools: TF,
     complete_llm: LF,
@@ -1697,11 +1689,18 @@ where
     LF: FnMut(&LlmRequest<P>) -> LlmCompletion<P>,
     CK: Fn(&P) -> K + Send + Sync + 'static,
 {
-    run_to_completion_inner(prompt, env_ids, tools, complete_llm, comparison_key, budget)
+    run_to_completion_inner(
+        initial_messages,
+        env_ids,
+        tools,
+        complete_llm,
+        comparison_key,
+        budget,
+    )
 }
 
 fn run_to_completion_inner<P, K, TF, LF, CK>(
-    prompt: P,
+    initial_messages: Vec<MessageEnvelope<P>>,
     env_ids: Vec<String>,
     tools: TF,
     mut complete_llm: LF,
@@ -1739,7 +1738,7 @@ where
 
     // This one-shot driver also accepts opaque P without PartialEq. It cannot
     // restore/replay a prior root; use Agent for repeated investigations.
-    let mut config = LoopConfig::new(prompt, env_ids, specs).with_subagents(subagents);
+    let mut config = LoopConfig::new(initial_messages, env_ids, specs).with_subagents(subagents);
     config.budget = budget;
     let mut loop_ = BatchLoop::<P, K>::build(
         config,

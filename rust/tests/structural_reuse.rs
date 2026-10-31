@@ -12,7 +12,11 @@ fn specs() -> Vec<ToolSpec> {
     ]
 }
 fn config() -> LoopConfig<String> {
-    LoopConfig::new("inspect".into(), vec!["e".into()], specs())
+    LoopConfig::new(
+        vec![lockstep_loop::MessageEnvelope::user("inspect".into())],
+        vec!["e".into()],
+        specs(),
+    )
 }
 fn drive(
     mut loop_: BatchLoop<String>,
@@ -206,7 +210,7 @@ fn stricter_keys_match_representatives_not_old_evidence() {
         ["same ", "same"]
     );
     assert_eq!(
-        agent.assets().next().unwrap().messages()[2].content,
+        agent.conversations().next().unwrap().messages()[2].content,
         "same "
     );
 }
@@ -249,7 +253,7 @@ fn coarser_keys_choose_first_existing_edge_without_merging_history() {
     );
     assert_eq!(root.observations[0].representative[0].tool_output, "A");
     assert_eq!(
-        replay.snapshot().assets().next().unwrap().messages()[2].content,
+        replay.snapshot().conversations().next().unwrap().messages()[2].content,
         "A"
     );
     assert_eq!(agent.root(), before);
@@ -267,7 +271,11 @@ fn coarser_keys_choose_first_existing_edge_without_merging_history() {
 fn child_query_and_execution_ignore_default_custom_mode() {
     let tool = SubagentTool::new(
         ToolSpec::new("child", "", json!({})),
-        |_| "child prompt".to_owned(),
+        |_| {
+            vec![lockstep_loop::MessageEnvelope::user(
+                "child prompt".to_owned(),
+            )]
+        },
         |_| vec![specs()[0].clone()],
         1,
     )
@@ -278,13 +286,17 @@ fn child_query_and_execution_ignore_default_custom_mode() {
     for custom in [false, true, false] {
         let candidate = selected.clone();
         let seen = queries.clone();
-        let c = LoopConfig::new("parent".to_owned(), vec!["e".into()], vec![])
-            .with_subagent(tool.clone())
-            .with_record_store(store.clone())
-            .with_agent_resolver(move |q| {
-                seen.lock().unwrap().push(q.clone());
-                Ok(candidate.as_ref().filter(|d| d.query() == *q).cloned())
-            });
+        let c = LoopConfig::new(
+            vec![lockstep_loop::MessageEnvelope::user("parent".to_owned())],
+            vec!["e".into()],
+            vec![],
+        )
+        .with_subagent(tool.clone())
+        .with_record_store(store.clone())
+        .with_agent_resolver(move |q| {
+            seen.lock().unwrap().push(q.clone());
+            Ok(candidate.as_ref().filter(|d| d.query() == *q).cloned())
+        });
         let mut loop_ = if custom {
             BatchLoop::with_comparison_key(c, Clone::clone)
         } else {
@@ -344,7 +356,7 @@ fn child_query_and_execution_ignore_default_custom_mode() {
 fn child_structural_identity_and_fresh_budget() {
     let tool = SubagentTool::new(
         ToolSpec::new("child", "", json!({})),
-        |_| "child".to_owned(),
+        |_| vec![lockstep_loop::MessageEnvelope::user("child".to_owned())],
         |_| vec![],
         1,
     )

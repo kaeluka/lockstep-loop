@@ -36,7 +36,7 @@ fn specs() -> Vec<ToolSpec> {
 
 fn config(envs: &[&str], snapshot: Option<AgentSnapshot<String>>) -> LoopConfig<String> {
     let config = LoopConfig::new(
-        "inspect".into(),
+        vec![lockstep_loop::MessageEnvelope::user("inspect".into())],
         envs.iter().map(|s| (*s).into()).collect(),
         specs(),
     );
@@ -115,7 +115,7 @@ fn non_splitting_checkpoints_replay_branch_and_share_old_paths() {
     let values = [("same", "one"), ("same", "two")];
     assert_eq!(drive(&mut loop_, &[("old", &values)], 2).len(), 3);
     let result = loop_.result().unwrap();
-    assert!(result.tree.children.is_empty());
+    assert_eq!(result.classes.len(), 1);
     assert!(empty.root().assistant.is_none());
     let old = result.snapshot;
     let root = old.root();
@@ -263,12 +263,8 @@ fn hash_and_debug_collisions_cannot_conflate_records() {
     assert_eq!(result.results["a"], "a");
     assert_eq!(result.results["b"], "b");
     assert_ne!(result.classes[0].id, result.classes[1].id);
-    // Equal diagnostic strings do not identify edges in the legacy Vec.
-    assert_eq!(result.tree.children.len(), 2);
-    assert_eq!(
-        result.tree.children[0].group_key,
-        result.tree.children[1].group_key
-    );
+    // Equal hashes/debug strings do not identify refinement groups or history edges.
+    assert_eq!(result.classes.len(), 2);
     let snapshot = result.snapshot;
     assert_eq!(snapshot.root().observations.len(), 2);
     for value in ["a", "b"] {
@@ -371,7 +367,7 @@ fn structural_checks_final_only_replay_and_fresh_budget() {
     let replay = config(&["new"], None).with_snapshot(snapshot.clone());
     assert!(BatchLoop::new(replay).unwrap().is_done());
     let mut changed = config(&["new"], Some(snapshot.clone()));
-    changed.prompt = "changed prompt".into();
+    changed.initial_messages[0].content = "changed prompt".into();
     assert!(matches!(
         BatchLoop::new(changed),
         Err(LoopError::IncompatibleHistory)
@@ -446,7 +442,13 @@ fn reverse_branch_completions_keep_siblings_and_never_merge() {
 
 #[test]
 fn opaque_bytes_and_fulfilled_assistant_snapshot_restart_tools() {
-    let make_config = |env: &str| LoopConfig::new(vec![0, 255], vec![env.into()], specs());
+    let make_config = |env: &str| {
+        LoopConfig::new(
+            vec![lockstep_loop::MessageEnvelope::user(vec![0, 255])],
+            vec![env.into()],
+            specs(),
+        )
+    };
     let mut loop_ = BatchLoop::new(make_config("old")).unwrap();
     let request = loop_.next_request(RequestKind::Any).unwrap();
     loop_

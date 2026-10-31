@@ -1,7 +1,7 @@
-//! Immutable AgentSnapshot values, contextual Asset views, and shallow history records.
+//! Immutable AgentSnapshot values, contextual Conversation views, and shallow history records.
 //! Payload clones must have immutable value semantics. No core storage I/O.
 
-use crate::{LoopError, Message, Role, ToolCall, ToolSpec};
+use crate::{LoopError, MessageEnvelope, Role, ToolCall, ToolSpec};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
@@ -38,7 +38,7 @@ pub struct Observation<P> {
 /// Shared-path continuation followed by every environment reaching this endpoint.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UserContinuation<P> {
-    pub message: Message<P>,
+    pub message: MessageEnvelope<P>,
     pub continuation: NodeRef,
     /// Resolution provenance only, NOT an inheritance/selection predicate.
     pub resolved_env_id: Option<String>,
@@ -57,7 +57,7 @@ pub struct SubagentContract {
 /// External provider/grouping policy isolation is caller-owned.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentQuery<P> {
-    pub prompt: P,
+    pub initial_messages: Vec<MessageEnvelope<P>>,
     pub tools: Vec<ToolSpec>,
     pub subagents: Vec<SubagentContract>,
 }
@@ -68,7 +68,7 @@ type Resolver<P> =
 /// AgentResolver: caller-owned snapshot revision selection, using the RecordStore loader.
 pub struct AgentResolver<P> {
     pub(crate) resolve: Arc<Resolver<P>>,
-    pub(crate) prompt_eq: fn(&P, &P) -> bool,
+    pub(crate) initial_messages_eq: crate::InitialMessagesEq<P>,
 }
 impl<P: PartialEq> AgentResolver<P> {
     pub fn new(
@@ -79,7 +79,7 @@ impl<P: PartialEq> AgentResolver<P> {
     ) -> Self {
         Self {
             resolve: Arc::new(resolve),
-            prompt_eq: PartialEq::eq,
+            initial_messages_eq: PartialEq::eq,
         }
     }
 }
@@ -87,7 +87,7 @@ impl<P> Clone for AgentResolver<P> {
     fn clone(&self) -> Self {
         Self {
             resolve: self.resolve.clone(),
-            prompt_eq: self.prompt_eq,
+            initial_messages_eq: self.initial_messages_eq,
         }
     }
 }
@@ -101,14 +101,14 @@ impl<P> fmt::Debug for AgentResolver<P> {
 /// Attach a RecordStore to reconstruct a snapshot without eager loading.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentDescriptor<P> {
-    pub prompt: P,
+    pub initial_messages: Vec<MessageEnvelope<P>>,
     pub tools: Vec<ToolSpec>,
     pub root: NodeRef,
     pub subagents: Vec<SubagentContract>,
 }
 
 /// SubagentRecord: parent-call provenance, not the complete child snapshot itself.
-/// Use AgentSnapshot::child to inspect the child snapshot and its assets.
+/// Use AgentSnapshot::child to inspect the child snapshot and its conversations.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SubagentRecord<P> {
     pub call_id: String,
@@ -137,10 +137,10 @@ pub struct ChildAgentUpdate<P> {
     pub snapshot: AgentSnapshot<P>,
 }
 
-/// Shared prefix or historical endpoint; an Asset also needs its snapshot/path context.
+/// Shared prefix or historical endpoint; a Conversation also needs snapshot/path context.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HistoryNode<P> {
-    pub assistant: Option<Message<P>>,
+    pub assistant: Option<MessageEnvelope<P>>,
     pub env_ids: Vec<String>,
     pub observations: Vec<Observation<P>>,
     pub subagents: Vec<SubagentRecord<P>>,
@@ -361,7 +361,7 @@ impl<P> RecordStore<P> {
     }
 }
 
-/// Immutable prompt, structural configuration and accumulated conversation trie.
+/// Immutable initial messages, structural configuration and accumulated history trie.
 /// Persist the descriptor and records, not mutable Agent/AgentRun handles or views.
 /// Owned clones are independent values; shared records and payloads stay immutable.
 #[derive(Clone, Debug)]
@@ -381,8 +381,8 @@ pub(crate) enum PathStep {
 }
 
 impl<P> AgentSnapshot<P> {
-    pub fn prompt(&self) -> &P {
-        &self.descriptor.prompt
+    pub fn initial_messages(&self) -> &[MessageEnvelope<P>] {
+        &self.descriptor.initial_messages
     }
     pub fn root(&self) -> Arc<HistoryNode<P>> {
         self.load(&self.descriptor.root)
@@ -392,8 +392,8 @@ impl<P> AgentSnapshot<P> {
     }
     /// Lazy leaf inspection. Child agents are separate tries; use child(entry)
     /// to inspect them. This never executes tools or creates records.
-    pub fn assets(&self) -> Assets<'_, P> {
-        Assets {
+    pub fn conversations(&self) -> Conversations<'_, P> {
+        Conversations {
             snapshot: self,
             stack: vec![(self.descriptor.root.clone(), 0, None)],
             path: vec![],
@@ -414,7 +414,7 @@ impl<P> AgentSnapshot<P> {
 impl<P: Clone> AgentDescriptor<P> {
     pub fn query(&self) -> AgentQuery<P> {
         AgentQuery {
-            prompt: self.prompt.clone(),
+            initial_messages: self.initial_messages.clone(),
             tools: self.tools.clone(),
             subagents: self.subagents.clone(),
         }
@@ -472,11 +472,11 @@ impl<P> ChildAgentUpdate<P> {
     }
 }
 
-struct AssetStep<P> {
+struct ConversationStep<P> {
     node: Arc<HistoryNode<P>>,
     via: Option<PathStep>,
 }
-impl<P> Clone for AssetStep<P> {
+impl<P> Clone for ConversationStep<P> {
     fn clone(&self) -> Self {
         Self {
             node: self.node.clone(),
@@ -485,33 +485,33 @@ impl<P> Clone for AssetStep<P> {
     }
 }
 
-/// Read-only leaf investigation, in its snapshot/path context. No IDs, serialization
-/// or resume operation: feedback still requires a snapshot and environment replay.
-/// Asset equality is not defined by the published value.
-pub struct Asset<'a, P> {
+/// Read-only conversation path anchored in a snapshot. Not an asset wrapper:
+/// callers choose assets via the answer or final-tool-input accessors.
+/// No IDs, serialization or resume operation; feedback uses snapshot/environment replay.
+pub struct Conversation<'a, P> {
     snapshot: &'a AgentSnapshot<P>,
-    path: Vec<AssetStep<P>>,
+    path: Vec<ConversationStep<P>>,
 }
 
 /// Lazy depth-first inspection of one snapshot's leaves. Paths copy only record
 /// references once per yielded view; no payload cloning or eager subtree loading.
-pub struct Assets<'a, P> {
+pub struct Conversations<'a, P> {
     snapshot: &'a AgentSnapshot<P>,
     stack: Vec<(NodeRef, usize, Option<PathStep>)>,
-    path: Vec<AssetStep<P>>,
+    path: Vec<ConversationStep<P>>,
 }
-impl<'a, P> Iterator for Assets<'a, P> {
-    type Item = Asset<'a, P>;
+impl<'a, P> Iterator for Conversations<'a, P> {
+    type Item = Conversation<'a, P>;
     fn next(&mut self) -> Option<Self::Item> {
         while let Some((reference, depth, via)) = self.stack.pop() {
             self.path.truncate(depth);
             let node = self.snapshot.load(&reference);
-            self.path.push(AssetStep {
+            self.path.push(ConversationStep {
                 node: node.clone(),
                 via,
             });
             if node.observations.is_empty() && node.user_continuations.is_empty() {
-                return Some(Asset {
+                return Some(Conversation {
                     snapshot: self.snapshot,
                     path: self.path.clone(),
                 });
@@ -534,7 +534,7 @@ impl<'a, P> Iterator for Assets<'a, P> {
         None
     }
 }
-impl<P> Asset<'_, P> {
+impl<P> Conversation<'_, P> {
     pub fn snapshot(&self) -> &AgentSnapshot<P> {
         self.snapshot
     }
@@ -564,20 +564,36 @@ impl<P> Asset<'_, P> {
             .as_ref()
             .is_some_and(|m| m.role == Role::Assistant && m.tool_calls.is_empty())
     }
-    /// Latest terminal assistant reply, including an ancestor before open feedback work.
-    pub fn published_message(&self) -> Option<&Message<P>> {
+    /// Latest no-tool model response, including initial messages and ancestors
+    /// before open feedback work.
+    pub fn last_answer(&self) -> Option<&MessageEnvelope<P>> {
         self.path
             .iter()
             .rev()
             .filter_map(|step| step.node.assistant.as_ref())
+            .chain(self.snapshot.descriptor.initial_messages.iter().rev())
             .find(|m| m.role == Role::Assistant && m.tool_calls.is_empty())
     }
-    pub fn has_value(&self) -> bool {
-        self.published_message().is_some()
+    pub fn has_answer(&self) -> bool {
+        self.last_answer().is_some()
     }
-    /// None means no publication yet; Some(&None) is a real null optional payload.
-    pub fn value(&self) -> Option<&P> {
-        self.published_message().map(|m| &m.content)
+    /// None means no model answer yet; Some(&None) is a real null optional message.
+    pub fn get_last_answer_asset(&self) -> Option<&P> {
+        self.last_answer().map(|m| &m.content)
+    }
+    /// Latest input to the named tool, scanning turns and calls in reverse order.
+    /// This does not execute a tool or make a tool call terminal. Missing is None;
+    /// an actual JSON null input is Some(&Value::Null).
+    pub fn get_final_tool_input_asset(&self, tool_name: &str) -> Option<&serde_json::Value> {
+        self.path
+            .iter()
+            .rev()
+            .filter_map(|step| step.node.assistant.as_ref())
+            .chain(self.snapshot.descriptor.initial_messages.iter().rev())
+            .filter(|message| message.role == Role::Assistant)
+            .flat_map(|message| message.tool_calls.iter().rev())
+            .find(|call| call.name == tool_name)
+            .map(|call| &call.args)
     }
     /// Known path memberships, not a global/latest environment partition. The
     /// latest observation bounds membership; later node visits add evidence.
@@ -612,10 +628,10 @@ impl<P> Asset<'_, P> {
             .collect()
     }
 }
-impl<P: Clone> Asset<'_, P> {
+impl<P: Clone> Conversation<'_, P> {
     /// The model-visible conversation, using historical representatives.
-    pub fn messages(&self) -> Vec<Message<P>> {
-        let mut messages = vec![Message::user(self.snapshot.descriptor.prompt.clone())];
+    pub fn messages(&self) -> Vec<MessageEnvelope<P>> {
+        let mut messages = self.snapshot.descriptor.initial_messages.clone();
         for (i, step) in self.path.iter().enumerate() {
             match step.via {
                 Some(PathStep::Observation(edge)) => {
@@ -628,7 +644,10 @@ impl<P: Clone> Asset<'_, P> {
                     let outputs = &parent.observations[edge].representative;
                     assert_eq!(calls.len(), outputs.len(), "malformed observation tuple");
                     for (call, output) in calls.iter().zip(outputs) {
-                        messages.push(Message::tool(output.tool_output.clone(), call.id.clone()));
+                        messages.push(MessageEnvelope::tool(
+                            output.tool_output.clone(),
+                            call.id.clone(),
+                        ));
                     }
                 }
                 Some(PathStep::User(edge)) => messages.push(

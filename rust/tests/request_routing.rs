@@ -17,14 +17,21 @@ fn specs() -> Vec<ToolSpec> {
         .collect()
 }
 fn make_loop(env: &str, previous: Option<AgentSnapshot<String>>) -> BatchLoop<String> {
-    let config = LoopConfig::new("parent".into(), vec![env.into()], specs()).with_subagent(
-        SubagentTool::new(
-            specs()[0].clone(),
-            |args| args["prompt"].as_str().unwrap().into(),
-            |_| specs(),
-            2,
-        ),
-    );
+    let config = LoopConfig::new(
+        vec![lockstep_loop::MessageEnvelope::user("parent".into())],
+        vec![env.into()],
+        specs(),
+    )
+    .with_subagent(SubagentTool::new(
+        specs()[0].clone(),
+        |args| {
+            vec![lockstep_loop::MessageEnvelope::user(
+                args["prompt"].as_str().unwrap().into(),
+            )]
+        },
+        |_| specs(),
+        2,
+    ));
     let config = if let Some(snapshot) = previous {
         config.with_snapshot(snapshot)
     } else {

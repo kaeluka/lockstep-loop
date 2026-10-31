@@ -25,8 +25,11 @@ fn start(
     let agent = match previous {
         Some(snapshot) => Agent::from_snapshot(snapshot, AgentRuntime::default()),
         None => Agent::new(
-            AgentConfig::new(PROMPT.into(), specs())
-                .with_record_store(RecordStore::new("initial-writer")),
+            AgentConfig::new(
+                vec![lockstep_loop::MessageEnvelope::user(PROMPT.into())],
+                specs(),
+            )
+            .with_record_store(RecordStore::new("initial-writer")),
         ),
     }
     .unwrap();

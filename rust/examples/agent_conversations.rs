@@ -1,5 +1,5 @@
-//! cargo run -p lockstep-loop --example agent_assets
-//! An AgentSnapshot is prompt + structural configuration + accumulated trie. Assets are contextual leaf views.
+//! cargo run -p lockstep-loop --example agent_conversations
+//! An AgentSnapshot contains initial messages, structural configuration, and one history trie. Conversations are contextual leaf views.
 use lockstep_loop::{
     Agent, AgentConfig, AgentRun, AgentRuntime, AgentSnapshot, BatchResult, Completion,
     LlmCompletion, NodeRef, RecordStore, Request, RequestKind, Role, RunOptions, ToolCall,
@@ -13,7 +13,7 @@ const PROMPT: &str = "Inspect the repository";
 const NOTE: &str = "Also inspect /foo";
 fn config() -> AgentConfig<String> {
     AgentConfig::new(
-        PROMPT.into(),
+        vec![lockstep_loop::MessageEnvelope::user(PROMPT.into())],
         vec![
             ToolSpec::new("read", "Read entry", json!({})),
             ToolSpec::new("foo", "Inspect /foo", json!({})),
@@ -108,10 +108,16 @@ fn main() {
     let mut backend = Backend::new();
     let original_descriptor = persist(recorded.snapshot(), &mut backend);
     let original = restore(&original_descriptor, backend.clone(), "replay-writer");
-    let original_assets: Vec<_> = original.assets().collect();
-    assert_eq!(original_assets.len(), 2);
-    assert_eq!(original_assets[0].value(), original_assets[1].value());
-    assert_ne!(original_assets[0].messages(), original_assets[1].messages());
+    let original_conversations: Vec<_> = original.conversations().collect();
+    assert_eq!(original_conversations.len(), 2);
+    assert_eq!(
+        original_conversations[0].get_last_answer_asset(),
+        original_conversations[1].get_last_answer_asset()
+    );
+    assert_ne!(
+        original_conversations[0].messages(),
+        original_conversations[1].messages()
+    );
     let agent = Agent::from_snapshot(original.clone(), AgentRuntime::default()).unwrap();
     let (replayed, llms) = serve(
         agent
@@ -120,13 +126,19 @@ fn main() {
     );
     assert_eq!(llms, 0);
     let before = replayed.into_snapshot();
-    let old_asset = before.assets().next().unwrap();
-    assert_eq!(old_asset.env_ids(), ["A", "B", "C"]);
-    println!("AgentSnapshot prompt: {}", before.prompt());
-    println!("Asset known environments: {:?}", old_asset.env_ids());
-    println!("Asset conversation: {:?}", old_asset.messages());
+    let old_conversation = before.conversations().next().unwrap();
+    assert_eq!(old_conversation.env_ids(), ["A", "B", "C"]);
+    println!(
+        "AgentSnapshot first initial message: {}",
+        before.initial_messages()[0].content
+    );
+    println!(
+        "Conversation known environments: {:?}",
+        old_conversation.env_ids()
+    );
+    println!("Conversation messages: {:?}", old_conversation.messages());
 
-    // No Asset ID or endpoint is supplied: replay the agent + environment again.
+    // No Conversation ID or endpoint is supplied: replay the agent + environment again.
     let mut loop_ = agent
         .start(
             vec!["C".into()],
@@ -145,8 +157,8 @@ fn main() {
         }))
         .unwrap();
     let opened = loop_.snapshot();
-    let pending = opened.assets().next().unwrap();
-    assert!(!pending.is_complete() && pending.value().unwrap() == "no issues");
+    let pending = opened.conversations().next().unwrap();
+    assert!(!pending.is_complete() && pending.get_last_answer_asset().unwrap() == "no issues");
     let Request::Llm(request) = loop_.next_request(RequestKind::Any).unwrap() else {
         panic!()
     };
@@ -173,12 +185,15 @@ fn main() {
         )))
         .unwrap();
     let revised = loop_.result().unwrap().into_snapshot();
-    let revised_asset = revised.assets().next().unwrap();
-    assert!(revised_asset.is_complete());
-    assert_eq!(revised_asset.value(), old_asset.value());
-    assert!(revised_asset.messages().len() > old_asset.messages().len());
-    assert!(old_asset.node().user_continuations.is_empty());
-    let nodes = revised_asset.nodes();
+    let revised_conversation = revised.conversations().next().unwrap();
+    assert!(revised_conversation.is_complete());
+    assert_eq!(
+        revised_conversation.get_last_answer_asset(),
+        old_conversation.get_last_answer_asset()
+    );
+    assert!(revised_conversation.messages().len() > old_conversation.messages().len());
+    assert!(old_conversation.node().user_continuations.is_empty());
+    let nodes = revised_conversation.nodes();
     assert!(!nodes[nodes.len() - 3].user_continuations.is_empty()); // old endpoint is an ancestor
     assert!(!pending.is_complete());
 
@@ -194,8 +209,8 @@ fn main() {
             .unwrap(),
     );
     let agent = inherited.snapshot();
-    let assets: Vec<_> = agent.assets().collect();
-    assert_eq!(assets.len(), 3);
+    let conversations: Vec<_> = agent.conversations().collect();
+    assert_eq!(conversations.len(), 3);
     assert_eq!(inherited.results["B"], "found");
     persist(agent, &mut backend);
     let old_again = restore(&original_descriptor, backend, "old-reader");
@@ -208,11 +223,13 @@ fn main() {
     assert_eq!(llms, 0);
     assert_eq!(result.results["B"], "no issues");
     println!(
-        "Updated assets: {:?}",
-        assets
+        "Updated conversations: {:?}",
+        conversations
             .iter()
-            .map(|a| (a.env_ids(), a.value()))
+            .map(|a| (a.env_ids(), a.get_last_answer_asset()))
             .collect::<Vec<_>>()
     );
-    println!("Old, open, and updated agent snapshots remain independent; no asset IDs required");
+    println!(
+        "Old, open, and updated agent snapshots remain independent; no conversation IDs required"
+    );
 }

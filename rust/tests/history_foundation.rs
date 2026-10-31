@@ -1,7 +1,7 @@
 use lockstep_loop::{
     AgentDescriptor, AgentSnapshot, BatchLoop, BatchResult, Completion, HistoryNode, LlmCompletion,
-    LoopConfig, LoopError, Message, NodeRef, Observation, OutputRecord, RecordStore, Request,
-    RequestKind, SubagentTool, ToolCall, ToolCompletion, ToolSpec, UserContinuation,
+    LoopConfig, LoopError, MessageEnvelope, NodeRef, Observation, OutputRecord, RecordStore,
+    Request, RequestKind, SubagentTool, ToolCall, ToolCompletion, ToolSpec, UserContinuation,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -19,13 +19,17 @@ fn nested_config(
     depth: usize,
 ) -> LoopConfig<String> {
     let config = LoopConfig::new(
-        "main".into(),
+        vec![lockstep_loop::MessageEnvelope::user("main".into())],
         envs.iter().map(|s| (*s).into()).collect(),
         specs(),
     )
     .with_subagent(SubagentTool::new(
         specs()[2].clone(),
-        |a| a["question"].as_str().unwrap().into(),
+        |a| {
+            vec![lockstep_loop::MessageEnvelope::user(
+                a["question"].as_str().unwrap().into(),
+            )]
+        },
         |_| specs(),
         depth,
     ));
@@ -382,7 +386,7 @@ fn invalid_nested_completion_preserves_routes_and_snapshot() {
 
 fn simple(envs: &[&str], previous: Option<AgentSnapshot<String>>) -> BatchLoop<String> {
     let config = LoopConfig::new(
-        "inspect".into(),
+        vec![lockstep_loop::MessageEnvelope::user("inspect".into())],
         envs.iter().map(|s| (*s).into()).collect(),
         vec![specs()[0].clone()],
     );
@@ -502,7 +506,10 @@ fn user_continuations_belong_to_resolved_investigation_not_answer_value() {
     assert!(untouched.user_continuations.is_empty());
     let edge = &answered.user_continuations[0];
     assert_eq!(edge.resolved_env_id.as_deref(), Some("a"));
-    assert_eq!(edge.message, Message::user("Please check again".to_owned()));
+    assert_eq!(
+        edge.message,
+        MessageEnvelope::user("Please check again".to_owned())
+    );
     assert!(extended.load(&edge.continuation).assistant.is_none());
     assert!(
         old.load(&old.root().observations[0].continuation)
@@ -525,16 +532,16 @@ fn user_continuations_belong_to_resolved_investigation_not_answer_value() {
     let store = &extended.store;
     let open = store.put(HistoryNode::default());
     let same = store.put(HistoryNode {
-        assistant: Some(Message::assistant("same final".into(), vec![])),
+        assistant: Some(MessageEnvelope::assistant("same final".into(), vec![])),
         user_continuations: vec![UserContinuation {
-            message: Message::user("One more check".into()),
+            message: MessageEnvelope::user("One more check".into()),
             continuation: open,
             resolved_env_id: None,
         }],
         ..HistoryNode::default()
     });
     let investigate = store.put(HistoryNode {
-        assistant: Some(Message::assistant(
+        assistant: Some(MessageEnvelope::assistant(
             "checking".into(),
             vec![ToolCall::new("p", "probe", json!({}))],
         )),
@@ -600,9 +607,9 @@ impl std::hash::Hash for CollidingKey {
 }
 
 #[test]
-fn colliding_partition_labels_do_not_identify_or_drop_groups() {
+fn colliding_comparison_keys_do_not_identify_or_drop_groups() {
     let config = LoopConfig::new(
-        "inspect".into(),
+        vec![lockstep_loop::MessageEnvelope::user("inspect".into())],
         vec!["a".into(), "b".into()],
         vec![specs()[0].clone()],
     );
@@ -611,16 +618,22 @@ fn colliding_partition_labels_do_not_identify_or_drop_groups() {
             .unwrap();
     sequential(&mut loop_, &[("a", "A"), ("b", "B")], 1);
     let result = loop_.result().unwrap();
-    assert_eq!(result.tree.children.len(), 2);
-    assert_eq!(result.tree.children[0].group_key, "[same]");
-    assert_eq!(result.tree.children[1].group_key, "[same]");
+    assert_eq!(result.classes.len(), 2);
+    let root = result.snapshot.root();
+    assert_eq!(root.observations.len(), 2);
+    assert_ne!(
+        root.observations[0].continuation,
+        root.observations[1].continuation
+    );
+    assert_eq!(root.observations[0].representative[0].tool_output, "A");
+    assert_eq!(root.observations[1].representative[0].tool_output, "B");
     assert_ne!(result.classes[0].id, result.classes[1].id);
 }
 
 #[test]
-fn partition_labels_retain_meaning() {
+fn history_edges_retain_actual_outputs_not_partition_labels() {
     let mut loop_ = BatchLoop::new(LoopConfig::new(
-        "inspect".into(),
+        vec![lockstep_loop::MessageEnvelope::user("inspect".into())],
         vec!["a".into(), "b".into()],
         vec![specs()[0].clone()],
     ))
@@ -630,12 +643,13 @@ fn partition_labels_retain_meaning() {
     assert_eq!(result.snapshot().root().observations.len(), 2);
     assert_eq!(
         result
-            .tree
-            .children
+            .snapshot
+            .root()
+            .observations
             .iter()
-            .map(|e| e.group_key.as_str())
+            .map(|e| e.representative[0].tool_output.as_str())
             .collect::<Vec<_>>(),
-        ["[\"A\"]", "[\"B\"]"]
+        ["A", "B"]
     );
     assert_ne!(result.classes[0].id, result.classes[1].id);
 }

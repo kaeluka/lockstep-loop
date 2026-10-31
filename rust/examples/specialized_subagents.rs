@@ -1,5 +1,5 @@
 //! cargo run -p lockstep-loop --example specialized_subagents
-//! Caller metadata selection + ordinary RecordStore loading. Initial prompts use USER role.
+//! Caller metadata selection + ordinary RecordStore loading. Initial message roles are explicit.
 use lockstep_loop::{
     Agent, AgentConfig, AgentDescriptor, AgentResolver, BatchResult, Completion, LlmCompletion,
     LoopError, NodeRef, RecordStore, Request, RequestKind, RunOptions, SubagentTool, ToolCall,
@@ -17,17 +17,19 @@ fn schema() -> Value {
 fn read_spec() -> ToolSpec {
     ToolSpec::new("read_file", "Read without modifying.", schema())
 }
-fn imports_prompt(args: &Value) -> Result<String, LoopError> {
+fn imports_initial_messages(
+    args: &Value,
+) -> Result<Vec<lockstep_loop::MessageEnvelope<String>>, LoopError> {
     if args.as_object().is_none_or(|o| o.len() != 1) || !args["file_path"].is_string() {
         return Err(LoopError::InvalidSubagentArguments(
             "expected exactly one string file_path".into(),
         ));
     }
     // Caller-owned template. No global path normalization or fuzzy matching.
-    Ok(format!(
+    Ok(vec![lockstep_loop::MessageEnvelope::user(format!(
         "List imports in {:?}.",
         args["file_path"].as_str().unwrap()
-    ))
+    ))])
 }
 fn imports() -> SubagentTool<String> {
     SubagentTool::try_new(
@@ -36,7 +38,7 @@ fn imports() -> SubagentTool<String> {
             "List packages imported by a file.",
             schema(),
         ),
-        imports_prompt,
+        imports_initial_messages,
         |_| Ok(vec![read_spec()]),
         1,
     )
@@ -54,13 +56,20 @@ fn investigate(
         Arc::new(serde_json::from_slice(&read_backend.lock().unwrap()[reference]).unwrap())
     });
     let selected = cache.clone();
-    let config = AgentConfig::new(parent_prompt.into(), vec![])
-        .with_subagents(vec![imports()])
-        .with_record_store(store)
-        .with_agent_resolver(AgentResolver::new(move |query| {
-            // Fixed configuration in this example; core still checks full compatibility.
-            Ok(selected.lock().unwrap().get(&query.prompt).cloned())
-        }));
+    let config = AgentConfig::new(
+        vec![lockstep_loop::MessageEnvelope::user(parent_prompt.into())],
+        vec![],
+    )
+    .with_subagents(vec![imports()])
+    .with_record_store(store)
+    .with_agent_resolver(AgentResolver::new(move |query| {
+        // Fixed configuration in this example; core still checks full compatibility.
+        Ok(selected
+            .lock()
+            .unwrap()
+            .get(&query.initial_messages[0].content)
+            .cloned())
+    }));
     let agent = Agent::new(config).unwrap();
     let mut loop_ = agent
         .start(vec![env.into()], RunOptions::default())
@@ -94,8 +103,8 @@ fn investigate(
                 } else {
                     child_llms += 1;
                     assert_eq!(
-                        r.messages[0].content,
-                        imports_prompt(&json!({"file_path": "foo.py"})).unwrap()
+                        r.messages[..1],
+                        imports_initial_messages(&json!({"file_path": "foo.py"})).unwrap()
                     );
                     if r.messages.len() == 1 {
                         LlmCompletion {
@@ -162,10 +171,10 @@ fn main() {
     assert_eq!(counts, (2, 2, 1));
     let original = first.child_updates()[0].snapshot();
     let selected = publish(&first, &backend);
-    cache
-        .lock()
-        .unwrap()
-        .insert(selected.prompt.clone(), selected.clone());
+    cache.lock().unwrap().insert(
+        selected.initial_messages[0].content.clone(),
+        selected.clone(),
+    );
     let (second, counts) = investigate(
         "Parent B: a completely different parent prompt",
         "repo@commit-2",
@@ -187,6 +196,6 @@ fn main() {
     cache
         .lock()
         .unwrap()
-        .insert(updated.prompt.clone(), updated);
+        .insert(updated.initial_messages[0].content.clone(), updated);
     println!("Changed parent: 2 fresh parent LLM calls, 0 child LLM calls, 1 child tool rerun");
 }

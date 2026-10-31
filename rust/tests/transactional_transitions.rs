@@ -35,16 +35,18 @@ fn subagent(
     SubagentTool::new(
         specs()[1].clone(),
         move |args| {
-            let name = args["required"].as_str().unwrap();
-            prompt_calls.lock().unwrap().push(format!("prompt:{name}"));
-            if prompt_fault.load(Ordering::Relaxed)
-                && matches!(mismatch, Mismatch::Prompt)
-                && name == "bad"
-            {
-                "incompatible prompt".into()
-            } else {
-                name.into()
-            }
+            vec![lockstep_loop::MessageEnvelope::user({
+                let name = args["required"].as_str().unwrap();
+                prompt_calls.lock().unwrap().push(format!("prompt:{name}"));
+                if prompt_fault.load(Ordering::Relaxed)
+                    && matches!(mismatch, Mismatch::Prompt)
+                    && name == "bad"
+                {
+                    "incompatible prompt".into()
+                } else {
+                    name.into()
+                }
+            })]
         },
         move |_| {
             spec_calls.lock().unwrap().push("specs".into());
@@ -62,7 +64,12 @@ fn config(
     snapshot: Option<AgentSnapshot<String>>,
     env: &str,
 ) -> LoopConfig<String> {
-    let config = LoopConfig::new("parent".into(), vec![env.into()], specs()).with_subagent(sub);
+    let config = LoopConfig::new(
+        vec![lockstep_loop::MessageEnvelope::user("parent".into())],
+        vec![env.into()],
+        specs(),
+    )
+    .with_subagent(sub);
     if let Some(snapshot) = snapshot {
         config.with_snapshot(snapshot)
     } else {

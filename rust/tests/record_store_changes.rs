@@ -1,6 +1,6 @@
 use lockstep_loop::{
     Agent, AgentConfig, AgentRun, AgentSnapshot, Completion, CursorError, HistoryNode,
-    LlmCompletion, Message, NodeRef, RecordBatch, RecordStore, RequestKind, RunOptions,
+    LlmCompletion, MessageEnvelope, NodeRef, RecordBatch, RecordStore, RequestKind, RunOptions,
     SubagentTool, ToolCall, ToolSpec, WriteCursor,
 };
 use serde_json::json;
@@ -137,7 +137,7 @@ fn small_deltas_share_arcs_without_cloning_payloads_or_exporting_the_prefix() {
     let store = RecordStore::<Payload>::new("writer");
     for i in 0..4096 {
         store.put(HistoryNode {
-            assistant: Some(Message::assistant(Payload(i), vec![])),
+            assistant: Some(MessageEnvelope::assistant(Payload(i), vec![])),
             ..HistoryNode::default()
         });
     }
@@ -146,7 +146,7 @@ fn small_deltas_share_arcs_without_cloning_payloads_or_exporting_the_prefix() {
     let references_before = Arc::strong_count(first);
     let cursor = prefix.next_cursor;
     let last = store.clone().put(HistoryNode {
-        assistant: Some(Message::assistant(Payload(4096), vec![])),
+        assistant: Some(MessageEnvelope::assistant(Payload(4096), vec![])),
         ..HistoryNode::default()
     });
     for _ in 0..8 {
@@ -266,9 +266,14 @@ fn reachable(snapshot: &AgentSnapshot<String>) -> BTreeSet<NodeRef> {
 #[test]
 fn exports_orphans_other_runs_and_path_copy_ancestors_not_just_reachable_records() {
     let store = RecordStore::new("shared");
-    let agent =
-        Agent::new(AgentConfig::new("prompt".to_owned(), vec![]).with_record_store(store.clone()))
-            .unwrap();
+    let agent = Agent::new(
+        AgentConfig::new(
+            vec![lockstep_loop::MessageEnvelope::user("prompt".to_owned())],
+            vec![],
+        )
+        .with_record_store(store.clone()),
+    )
+    .unwrap();
     let initial = agent.snapshot();
     let cursor = store.changes_since(None).unwrap().next_cursor;
     let mut left = agent
@@ -304,14 +309,21 @@ fn exports_orphans_other_runs_and_path_copy_ancestors_not_just_reachable_records
 fn capture_snapshot_before_batch_includes_path_copies_and_child_records() {
     let store = RecordStore::new("nested");
     let agent = Agent::new(
-        AgentConfig::new("parent".to_owned(), vec![])
-            .with_record_store(store.clone())
-            .with_subagents(vec![SubagentTool::new(
-                ToolSpec::new("child", "", json!({})),
-                |_| "child prompt".to_owned(),
-                |_| vec![],
-                1,
-            )]),
+        AgentConfig::new(
+            vec![lockstep_loop::MessageEnvelope::user("parent".to_owned())],
+            vec![],
+        )
+        .with_record_store(store.clone())
+        .with_subagents(vec![SubagentTool::new(
+            ToolSpec::new("child", "", json!({})),
+            |_| {
+                vec![lockstep_loop::MessageEnvelope::user(
+                    "child prompt".to_owned(),
+                )]
+            },
+            |_| vec![],
+            1,
+        )]),
     )
     .unwrap();
     let mut run = agent
